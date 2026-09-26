@@ -280,19 +280,10 @@ if ($configContent -match "(?m)^\[agents\]") {
     $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $agentsSection.Trim() + "`r`n"
 }
 
-# Ensure [subagent_models] section is configured
-$subagentModelsSection = @"
-[subagent_models]
-default = "$DefaultModel"
-worker = "$WorkerModel"
-explorer = "$ExplorerModel"
-reviewer = "$ReviewerModel"
-"@
-$patternSubModels = "(?ms)\[subagent_models\].*?(?=\n\[|\z)"
+# Remove legacy [subagent_models] section if present (avoids codex config warning; role models live in ~/.codex/agents/*.toml)
+$patternSubModels = "(?ms)\r?\n?\[subagent_models\].*?(?=\r?\n\[|\z)"
 if ($configContent -match $patternSubModels) {
-    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternSubModels, $subagentModelsSection.Trim())
-} else {
-    $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $subagentModelsSection.Trim() + "`r`n"
+    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternSubModels, "")
 }
 
 # Link Role Manifests in config.toml
@@ -407,8 +398,14 @@ if (-not (Test-Path $releaseBinary)) {
 }
 Write-Host "[OK] Release binary ready ($((Get-Item $releaseBinary).Length) bytes)." -ForegroundColor Green
 
-# 6. Stop running codex processes before hooking
+# 6. Stop running codex processes and port 20129 listeners before hooking
 Write-Host "[*] Checking for running codex processes..." -ForegroundColor Gray
+Get-NetTCPConnection -LocalPort 20129 -ErrorAction SilentlyContinue | ForEach-Object {
+    $procId = $_.OwningProcess
+    if ($procId -gt 0 -and $procId -ne $PID) {
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    }
+}
 Get-Process -Name "*codex*" -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID } | ForEach-Object {
     Write-Host "    Stopping process $($_.Name) (PID $($_.Id))..." -ForegroundColor Gray
     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
@@ -450,6 +447,23 @@ function Safe-CopyExecutable {
     return $false
 }
 
+# Locate Microsoft Store package resources for companion helper binaries (codex-code-mode-host.exe, etc.)
+$storeResDir = $null
+$storePkg = Get-AppxPackage -Name "*OpenAI.Codex*" -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+if ($storePkg -and $storePkg.InstallLocation) {
+    $candidateRes = Join-Path $storePkg.InstallLocation "app\resources"
+    if (Test-Path $candidateRes) {
+        $storeResDir = $candidateRes
+    }
+}
+$companionHelpers = @(
+    "codex-code-mode-host.exe",
+    "codex-command-runner.exe",
+    "codex-windows-sandbox-service.exe",
+    "codex-windows-sandbox-setup.exe",
+    "rg.exe"
+)
+
 # 7. Hook Desktop App Binaries
 $localAppData = $env:LOCALAPPDATA
 $desktopBinRoot = Join-Path $localAppData "OpenAI\Codex\bin"
@@ -472,6 +486,15 @@ if (Test-Path $desktopBinRoot) {
             if (Safe-CopyExecutable -Source $releaseBinary -Destination $codexExe) {
                 Write-Host "[OK] Installed proxy hook to $codexExe" -ForegroundColor Green
                 $hookedCount++
+            }
+            if ($storeResDir) {
+                foreach ($helper in $companionHelpers) {
+                    $hSrc = Join-Path $storeResDir $helper
+                    $hDst = Join-Path $targetDir $helper
+                    if ((Test-Path $hSrc) -and -not (Test-Path $hDst)) {
+                        Copy-Item -Path $hSrc -Destination $hDst -Force -ErrorAction SilentlyContinue
+                    }
+                }
             }
         }
     }
@@ -510,6 +533,15 @@ $customShim = Join-Path $customDir "codex-9router-subagents.exe"
 if (Safe-CopyExecutable -Source $releaseBinary -Destination $customShim) {
     Write-Host "[OK] Deployed standalone shim to $customShim" -ForegroundColor Green
 }
+if ($storeResDir) {
+    foreach ($helper in $companionHelpers) {
+        $hSrc = Join-Path $storeResDir $helper
+        $hDst = Join-Path $customDir $helper
+        if ((Test-Path $hSrc) -and -not (Test-Path $hDst)) {
+            Copy-Item -Path $hSrc -Destination $hDst -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 
 # 10. Register Self-Healing Startup Hook
 $syncScriptPath = Join-Path $customDir "hook-sync.ps1"
@@ -517,6 +549,9 @@ $syncScript = @"
 `$ErrorActionPreference = 'SilentlyContinue'
 `$proxyPath = '$customShim'
 `$binRoot = Join-Path `$env:LOCALAPPDATA 'OpenAI\Codex\bin'
+`$pkg = Get-AppxPackage -Name '*OpenAI.Codex*' | Sort-Object Version -Descending | Select-Object -First 1
+`$resDir = if (`$pkg) { Join-Path `$pkg.InstallLocation 'app\resources' } else { `$null }
+`$helpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe', 'rg.exe')
 if (Test-Path `$binRoot -and Test-Path `$proxyPath) {
     Get-ChildItem -Path `$binRoot -Directory | ForEach-Object {
         `$c = Join-Path `$_.FullName 'codex.exe'
@@ -525,6 +560,15 @@ if (Test-Path `$binRoot -and Test-Path `$proxyPath) {
             if ((Get-Item `$c).Length -gt 10000000 -and -not (Test-Path `$o)) {
                 Copy-Item `$c `$o -Force
                 Copy-Item `$proxyPath `$c -Force
+            }
+            if (`$resDir -and (Test-Path `$resDir)) {
+                foreach (`$h in `$helpers) {
+                    `$hs = Join-Path `$resDir `$h
+                    `$hd = Join-Path `$_.FullName `$h
+                    if ((Test-Path `$hs) -and -not (Test-Path `$hd)) {
+                        Copy-Item `$hs `$hd -Force
+                    }
+                }
             }
         }
     }

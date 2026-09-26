@@ -41,19 +41,19 @@ When using the official OpenAI Codex Desktop App signed into a personal or Pro C
 │       * explorer -> explore                                     │
 │       * reviewer -> review                                      │
 │       * default  -> 9router-subagent                            │
-│   - Injects model_provider = "9router"                          │
-│   - Leaves parent turns on model_provider = "openai"            │
-│   [Layer 2: Embedded Loopback Reverse Proxy (127.0.0.1:20129)]  │
-│   - Intercepts chatgpt_base_url requests from codex.orig.exe    │
+│   [Layer 2: Embedded HTTPS/HTTP2 Reverse Proxy (:20129)]        │
+│   - Auto-generates self-signed TLS cert (CODEX_CA_CERTIFICATE)  │
+│   - Rejects wss:// upgrades with HTTP 426 (0ms HTTPS fallback)  │
+│   - Decompresses zstd request payloads from codex.orig.exe      │
 │   - Subagent responses -> 9Router (127.0.0.1:20128/v1/responses)│
 │   - Parent turns -> ChatGPT Upstream (https://chatgpt.com)      │
 └───────────────────────────────┬─────────────────────────────────┘
-                                │ launches with -c chatgpt_base_url="http://127.0.0.1:20129/backend-api/"
+                                │ launches with -c chatgpt_base_url="https://127.0.0.1:20129/backend-api/"
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                  Official codex.orig.exe                        │
-│   - Parent turns   -> Loopback :20129 -> https://chatgpt.com    │
-│   - Subagent turns -> Loopback :20129 -> 9Router :20128         │
+│   - Parent turns   -> HTTPS :20129 -> https://chatgpt.com       │
+│   - Subagent turns -> HTTPS :20129 -> 9Router :20128            │
 └───────────────────────────────┬─────────────────────────────────┘
                                 │ Native IPC Stream
                                 ▼
