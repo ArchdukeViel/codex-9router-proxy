@@ -1,0 +1,13 @@
+# Rust artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Local environment & secrets
+.env*
+*.key
+*.pem
+bridge.log
+
+# Backup binaries
+*.orig.exe

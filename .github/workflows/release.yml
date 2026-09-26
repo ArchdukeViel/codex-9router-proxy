@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build & Package Windows x86_64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run unit tests
+        run: cargo test --release
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package release archive
+        shell: pwsh
+        run: |
+          $dist = "codex-9router-proxy-windows-amd64"
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          Copy-Item -Path "target\release\codex-9router-proxy.exe" -Destination $dist -Force
+          Copy-Item -Path "install.ps1" -Destination $dist -Force
+          Copy-Item -Path "uninstall.ps1" -Destination $dist -Force
+          Copy-Item -Path "README.md" -Destination $dist -Force
+          Copy-Item -Path "LICENSE" -Destination $dist -Force
+          Compress-Archive -Path "$dist\*" -DestinationPath "$dist.zip" -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: codex-9router-proxy-windows-amd64.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true
