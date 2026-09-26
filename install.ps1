@@ -87,31 +87,49 @@ if ($Preset) {
             if (-not $Provider) { $Provider = "9router" }
             if (-not $Endpoint) { $Endpoint = "http://localhost:20128/v1" }
             if (-not $DefaultModel) { $DefaultModel = "9router-subagent" }
+            if (-not $WorkerModel) { $WorkerModel = "implement" }
+            if (-not $ExplorerModel) { $ExplorerModel = "explore" }
+            if (-not $ReviewerModel) { $ReviewerModel = "review" }
         }
         "ollama" {
             if (-not $Provider) { $Provider = "ollama" }
             if (-not $Endpoint) { $Endpoint = "http://localhost:11434/v1" }
             if (-not $DefaultModel) { $DefaultModel = "qwen2.5-coder:32b" }
+            if (-not $WorkerModel) { $WorkerModel = $DefaultModel }
+            if (-not $ExplorerModel) { $ExplorerModel = $DefaultModel }
+            if (-not $ReviewerModel) { $ReviewerModel = $DefaultModel }
         }
         "lmstudio" {
             if (-not $Provider) { $Provider = "lmstudio" }
             if (-not $Endpoint) { $Endpoint = "http://localhost:1234/v1" }
             if (-not $DefaultModel) { $DefaultModel = "local-model" }
+            if (-not $WorkerModel) { $WorkerModel = $DefaultModel }
+            if (-not $ExplorerModel) { $ExplorerModel = $DefaultModel }
+            if (-not $ReviewerModel) { $ReviewerModel = $DefaultModel }
         }
         "openrouter" {
             if (-not $Provider) { $Provider = "openrouter" }
             if (-not $Endpoint) { $Endpoint = "https://openrouter.ai/api/v1" }
             if (-not $DefaultModel) { $DefaultModel = "anthropic/claude-3.5-sonnet" }
+            if (-not $WorkerModel) { $WorkerModel = $DefaultModel }
+            if (-not $ExplorerModel) { $ExplorerModel = $DefaultModel }
+            if (-not $ReviewerModel) { $ReviewerModel = $DefaultModel }
         }
         "vllm" {
             if (-not $Provider) { $Provider = "vllm" }
             if (-not $Endpoint) { $Endpoint = "http://localhost:8000/v1" }
             if (-not $DefaultModel) { $DefaultModel = "default-model" }
+            if (-not $WorkerModel) { $WorkerModel = $DefaultModel }
+            if (-not $ExplorerModel) { $ExplorerModel = $DefaultModel }
+            if (-not $ReviewerModel) { $ReviewerModel = $DefaultModel }
         }
         "litellm" {
             if (-not $Provider) { $Provider = "litellm" }
             if (-not $Endpoint) { $Endpoint = "http://localhost:4000/v1" }
             if (-not $DefaultModel) { $DefaultModel = "default-model" }
+            if (-not $WorkerModel) { $WorkerModel = $DefaultModel }
+            if (-not $ExplorerModel) { $ExplorerModel = $DefaultModel }
+            if (-not $ReviewerModel) { $ReviewerModel = $DefaultModel }
         }
     }
 }
@@ -155,18 +173,21 @@ if (-not $NonInteractive) {
     }
 
     if (-not $WorkerModel) {
-        $wmInput = Read-Host "[?] Enter Worker Subagent Model [default: $DefaultModel]"
-        $WorkerModel = if ([string]::IsNullOrWhiteSpace($wmInput)) { $DefaultModel } else { $wmInput.Trim() }
+        $defaultWorker = if ($Provider -eq "9router") { "implement" } else { $DefaultModel }
+        $wmInput = Read-Host "[?] Enter Worker Subagent Model [default: $defaultWorker]"
+        $WorkerModel = if ([string]::IsNullOrWhiteSpace($wmInput)) { $defaultWorker } else { $wmInput.Trim() }
     }
 
     if (-not $ExplorerModel) {
-        $emInput = Read-Host "[?] Enter Explorer Subagent Model [default: $DefaultModel]"
-        $ExplorerModel = if ([string]::IsNullOrWhiteSpace($emInput)) { $DefaultModel } else { $emInput.Trim() }
+        $defaultExplorer = if ($Provider -eq "9router") { "explore" } else { $DefaultModel }
+        $emInput = Read-Host "[?] Enter Explorer Subagent Model [default: $defaultExplorer]"
+        $ExplorerModel = if ([string]::IsNullOrWhiteSpace($emInput)) { $defaultExplorer } else { $emInput.Trim() }
     }
 
     if (-not $ReviewerModel) {
-        $rmInput = Read-Host "[?] Enter Reviewer Subagent Model [default: $DefaultModel]"
-        $ReviewerModel = if ([string]::IsNullOrWhiteSpace($rmInput)) { $DefaultModel } else { $rmInput.Trim() }
+        $defaultReviewer = if ($Provider -eq "9router") { "review" } else { $DefaultModel }
+        $rmInput = Read-Host "[?] Enter Reviewer Subagent Model [default: $defaultReviewer]"
+        $ReviewerModel = if ([string]::IsNullOrWhiteSpace($rmInput)) { $defaultReviewer } else { $rmInput.Trim() }
     }
 } else {
     if (-not $Provider) { $Provider = "9router" }
@@ -175,9 +196,9 @@ if (-not $NonInteractive) {
         $ApiKey = [System.Environment]::GetEnvironmentVariable("NINEROUTER_KEY", "User")
     }
     if (-not $DefaultModel) { $DefaultModel = "9router-subagent" }
-    if (-not $WorkerModel) { $WorkerModel = $DefaultModel }
-    if (-not $ExplorerModel) { $ExplorerModel = $DefaultModel }
-    if (-not $ReviewerModel) { $ReviewerModel = $DefaultModel }
+    if (-not $WorkerModel) { $WorkerModel = if ($Provider -eq "9router") { "implement" } else { $DefaultModel } }
+    if (-not $ExplorerModel) { $ExplorerModel = if ($Provider -eq "9router") { "explore" } else { $DefaultModel } }
+    if (-not $ReviewerModel) { $ReviewerModel = if ($Provider -eq "9router") { "review" } else { $DefaultModel } }
 }
 
 $Endpoint = $Endpoint.TrimEnd('/')
@@ -370,17 +391,15 @@ except Exception as e:
 }
 
 # 5. Build Release Binary
-if (-not (Test-Path $releaseBinary)) {
-    Write-Host "[*] Compiling release binary with cargo..." -ForegroundColor Yellow
-    Push-Location $scriptDir
-    try {
-        & cargo build --release
-        if ($LASTEXITCODE -ne 0) {
-            throw "Cargo build failed with exit code $LASTEXITCODE"
-        }
-    } finally {
-        Pop-Location
+Write-Host "[*] Compiling release binary with cargo..." -ForegroundColor Yellow
+Push-Location $scriptDir
+try {
+    & cargo build --release
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cargo build failed with exit code $LASTEXITCODE"
     }
+} finally {
+    Pop-Location
 }
 
 if (-not (Test-Path $releaseBinary)) {

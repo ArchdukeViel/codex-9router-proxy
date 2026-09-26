@@ -34,22 +34,26 @@ When using the official OpenAI Codex Desktop App signed into a personal or Pro C
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    codex-9router-proxy.exe                      │
-│   - Detects subagents (role = worker/explorer or model = 9router)│
+│   [Layer 1: JSON-RPC IPC Interception]                          │
+│   - Detects subagents (role = worker/explorer, nickname, etc.)  │
 │   - Multi-tier dynamic model resolution:                        │
-│       * worker   -> configured model (default: 9router-subagent)│
-│       * explorer -> configured model (default: 9router-subagent)│
-│       * reviewer -> configured model (default: 9router-subagent)│
-│       * default  -> configured model (default: 9router-subagent)│
-│   - Injects model_provider = user-configured provider           │
-│   - Injects API key from Windows Registry (HKCU) / Env          │
+│       * worker   -> implement                                   │
+│       * explorer -> explore                                     │
+│       * reviewer -> review                                      │
+│       * default  -> 9router-subagent                            │
+│   - Injects model_provider = "9router"                          │
 │   - Leaves parent turns on model_provider = "openai"            │
+│   [Layer 2: Embedded Loopback Reverse Proxy (127.0.0.1:20129)]  │
+│   - Intercepts chatgpt_base_url requests from codex.orig.exe    │
+│   - Subagent responses -> 9Router (127.0.0.1:20128/v1/responses)│
+│   - Parent turns -> ChatGPT Upstream (https://chatgpt.com)      │
 └───────────────────────────────┬─────────────────────────────────┘
-                                │ Modified JSON-RPC
+                                │ launches with -c chatgpt_base_url="http://127.0.0.1:20129/backend-api/"
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                  Official codex.orig.exe                        │
-│   - Parent turns   -> https://chatgpt.com (ChatGPT Cloud)       │
-│   - Subagent turns -> User endpoint (e.g. 127.0.0.1:20128/v1)   │
+│   - Parent turns   -> Loopback :20129 -> https://chatgpt.com    │
+│   - Subagent turns -> Loopback :20129 -> 9Router :20128         │
 └───────────────────────────────┬─────────────────────────────────┘
                                 │ Native IPC Stream
                                 ▼
