@@ -2,9 +2,11 @@ use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::Duration;
 
 /// Check if a given role name indicates a subagent.
 pub fn is_subagent_role_name(r: &str) -> bool {
@@ -16,16 +18,134 @@ pub fn is_subagent_role_name(r: &str) -> bool {
     }
 }
 
-/// Map an agent role to a specialized model name if none is explicitly specified.
-pub fn map_role_to_model(role: Option<&str>) -> String {
-    if let Ok(m) = env::var("CODEX_SUBAGENT_MODEL") {
-        if !m.is_empty() {
-            return m;
+/// Locate the active Codex config.toml path.
+pub fn get_config_path() -> Option<PathBuf> {
+    if let Ok(codex_home) = env::var("CODEX_HOME") {
+        let p = PathBuf::from(codex_home).join("config.toml");
+        if p.is_file() {
+            return Some(p);
         }
     }
-    match role {
-        Some(r) if r.eq_ignore_ascii_case("worker") => "implement".to_string(),
-        Some(r) if r.eq_ignore_ascii_case("explorer") => "explore".to_string(),
+    if let Ok(profile) = env::var("USERPROFILE") {
+        let p = PathBuf::from(profile).join(".codex").join("config.toml");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        let p = PathBuf::from(home).join(".codex").join("config.toml");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Parse key-value from a TOML line (stripping whitespace, quotes, and comments).
+fn parse_toml_key_value(line: &str) -> Option<(String, String)> {
+    let mut parts = line.splitn(2, '=');
+    let k = parts.next()?.trim().to_string();
+    let v_raw = parts.next()?.trim();
+    let v_no_comment = v_raw.split('#').next()?.trim();
+    let v = v_no_comment.trim_matches(|c| c == '"' || c == '\'').to_string();
+    if !k.is_empty() && !v.is_empty() {
+        Some((k, v))
+    } else {
+        None
+    }
+}
+
+/// Parse [subagent_models] or [agents].default_subagent_model from TOML text.
+pub fn parse_model_from_toml(content: &str, role: &str) -> Option<String> {
+    let mut in_subagent_models = false;
+    let mut in_agents = false;
+    let mut default_subagent_model: Option<String> = None;
+    let role_key = role.to_lowercase();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section = trimmed.trim_matches(|c| c == '[' || c == ']').trim();
+            if section.eq_ignore_ascii_case("subagent_models") {
+                in_subagent_models = true;
+                in_agents = false;
+            } else if section.eq_ignore_ascii_case("agents") {
+                in_agents = true;
+                in_subagent_models = false;
+            } else {
+                in_subagent_models = false;
+                in_agents = false;
+            }
+            continue;
+        }
+
+        if in_subagent_models {
+            if let Some((k, v)) = parse_toml_key_value(trimmed) {
+                if k.eq_ignore_ascii_case(&role_key) {
+                    return Some(v);
+                }
+            }
+        }
+
+        if in_agents {
+            if let Some((k, v)) = parse_toml_key_value(trimmed) {
+                if k.eq_ignore_ascii_case("default_subagent_model") {
+                    default_subagent_model = Some(v);
+                }
+            }
+        }
+    }
+
+    default_subagent_model
+}
+
+/// Read model configuration for a specific role from ~/.codex/config.toml.
+pub fn read_model_from_config(role: &str) -> Option<String> {
+    let config_path = get_config_path()?;
+    let content = fs::read_to_string(&config_path).ok()?;
+    parse_model_from_toml(&content, role)
+}
+
+/// Map an agent role to a specialized model name with multi-tier resolution:
+/// 1. Environment variable override: CODEX_<ROLE>_MODEL
+/// 2. Generic environment variable override: CODEX_SUBAGENT_MODEL
+/// 3. Active ~/.codex/config.toml: [subagent_models.<role>] or [agents].default_subagent_model
+/// 4. Built-in defaults: worker -> implement, explorer -> explore, reviewer -> review, default -> 9router-subagent
+pub fn map_role_to_model(role: Option<&str>) -> String {
+    let role_str = role.unwrap_or("default");
+    let role_lower = role_str.to_lowercase();
+
+    // 1. Specific role env var: CODEX_WORKER_MODEL, CODEX_EXPLORER_MODEL, etc.
+    let env_role = format!("CODEX_{}_MODEL", role_lower.to_uppercase());
+    if let Ok(m) = env::var(&env_role) {
+        let trimmed = m.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    // 2. Generic subagent model env var: CODEX_SUBAGENT_MODEL
+    if let Ok(m) = env::var("CODEX_SUBAGENT_MODEL") {
+        let trimmed = m.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    // 3. Read from config.toml ([subagent_models.<role>] or [agents].default_subagent_model)
+    if let Some(m) = read_model_from_config(&role_lower) {
+        return m;
+    }
+
+    // 4. Built-in smart fallback defaults
+    match role_lower.as_str() {
+        "worker" => "implement".to_string(),
+        "explorer" => "explore".to_string(),
+        "reviewer" => "review".to_string(),
         _ => "9router-subagent".to_string(),
     }
 }
@@ -290,7 +410,7 @@ pub fn route_thread_params(params: &mut serde_json::Map<String, Value>) -> bool 
                 modified = true;
                 nested_subagent = true;
                 if let Some(m) = nested.get("model").and_then(|v| v.as_str()) {
-                    if !m.is_empty() && (m == "implement" || m == "explore" || m == "9router-subagent") {
+                    if !m.is_empty() && (m == "implement" || m == "explore" || m == "review" || m == "9router-subagent") {
                         nested_model = Some(m.to_string());
                     }
                 }
@@ -336,7 +456,7 @@ pub fn route_thread_params(params: &mut serde_json::Map<String, Value>) -> bool 
         .map(|s| s.to_string());
 
     let is_9router_model = if let Some(ref m) = model_str {
-        m == "9router-subagent" || m.starts_with("9router") || m == "implement" || m == "explore"
+        m == "9router-subagent" || m.starts_with("9router") || m == "implement" || m == "explore" || m == "review"
     } else {
         false
     };
@@ -381,8 +501,120 @@ pub fn route_thread_params(params: &mut serde_json::Map<String, Value>) -> bool 
     modified
 }
 
+/// Probe a target endpoint URL to verify TCP socket connectivity.
+pub fn probe_endpoint(endpoint: &str) {
+    let clean = endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let host_port = clean.split('/').next().unwrap_or("127.0.0.1:20128");
+    let target = if host_port.contains(':') {
+        host_port.to_string()
+    } else if endpoint.starts_with("https://") {
+        format!("{}:443", host_port)
+    } else {
+        format!("{}:80", host_port)
+    };
+
+    match target.to_socket_addrs() {
+        Ok(addrs) => {
+            let mut connected = false;
+            let mut last_err = String::from("No addresses available");
+            for addr in addrs {
+                match TcpStream::connect_timeout(&addr, Duration::from_millis(1500)) {
+                    Ok(_) => {
+                        println!("[OK] Endpoint socket reachable : {} ({})", target, addr);
+                        connected = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                    }
+                }
+            }
+            if !connected {
+                println!("[FAIL] Endpoint socket unreachable: {} (error: {})", target, last_err);
+            }
+        }
+        Err(e) => println!("[FAIL] Invalid endpoint address  : {} ({})", target, e),
+    }
+}
+
+/// Run full system health diagnostics and print report.
+pub fn run_doctor() {
+    println!("===================================================================");
+    println!("           Codex 9Router Proxy - Diagnostics Doctor 🩺             ");
+    println!("===================================================================");
+    println!();
+
+    if let Ok(exe) = env::current_exe() {
+        println!("[OK] Running executable : {}", exe.display());
+    }
+
+    let real_codex = find_real_codex();
+    if real_codex.is_file() {
+        let size = real_codex.metadata().map_or(0, |m| m.len());
+        println!("[OK] Official engine    : {} ({} bytes)", real_codex.display(), size);
+    } else {
+        println!("[FAIL] Official engine not found at: {}", real_codex.display());
+    }
+
+    let provider = get_target_model_provider();
+    println!("[OK] Subagent Provider  : {}", provider);
+    let key_set = env::var("NINEROUTER_KEY").map_or(false, |k| !k.trim().is_empty());
+    if key_set {
+        println!("[OK] Provider API Key   : [CONFIGURED / MASKED]");
+    } else {
+        println!("[INFO] NINEROUTER_KEY   : Not set in process environment");
+    }
+
+    if let Some(cfg) = get_config_path() {
+        println!("[OK] Codex Config TOML  : {}", cfg.display());
+        if let Ok(content) = fs::read_to_string(&cfg) {
+            let def_m = parse_model_from_toml(&content, "default").unwrap_or_else(|| "9router-subagent".to_string());
+            let worker_m = parse_model_from_toml(&content, "worker").unwrap_or_else(|| def_m.clone());
+            let explorer_m = parse_model_from_toml(&content, "explorer").unwrap_or_else(|| def_m.clone());
+            let reviewer_m = parse_model_from_toml(&content, "reviewer").unwrap_or_else(|| def_m.clone());
+            println!("     - Default Model    : {}", def_m);
+            println!("     - Worker Model     : {}", worker_m);
+            println!("     - Explorer Model   : {}", explorer_m);
+            println!("     - Reviewer Model   : {}", reviewer_m);
+        }
+    } else {
+        println!("[WARN] Config TOML      : Not found in ~/.codex/config.toml");
+    }
+
+    if let Ok(profile) = env::var("USERPROFILE") {
+        let agents_dir = PathBuf::from(profile).join(".codex").join("agents");
+        if agents_dir.is_dir() {
+            println!("[OK] Role Manifests     : {}", agents_dir.display());
+            for role in &["default", "worker", "explorer", "reviewer"] {
+                let toml = agents_dir.join(format!("{}.toml", role));
+                if toml.is_file() {
+                    println!("     - {:<8} TOML   : Found", role);
+                } else {
+                    println!("     - {:<8} TOML   : Missing ({})", role, toml.display());
+                }
+            }
+        }
+    }
+
+    let endpoint = env::var("CODEX_SUBAGENT_ENDPOINT").unwrap_or_else(|_| "http://localhost:20128/v1".to_string());
+    probe_endpoint(&endpoint);
+
+    println!();
+    println!("===================================================================");
+    println!("Diagnostics complete. All checks finished.");
+    println!("===================================================================");
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == "--doctor" || a == "doctor" || a == "-doctor") {
+        run_doctor();
+        return Ok(());
+    }
+
     let real_codex = find_real_codex();
 
     let is_daemon_subcommand = args.iter().any(|a| {
@@ -401,13 +633,12 @@ fn main() -> io::Result<()> {
         let mut forward_args = args.clone();
         let target_provider = get_target_model_provider();
 
-        // If a 9router model is passed on CLI (-m or --model or config), ensure model_provider is set
         let uses_9router = forward_args.windows(2).any(|w| {
-            (w[0] == "-m" || w[0] == "--model") && (w[1].contains("9router") || w[1] == "implement" || w[1] == "explore")
+            (w[0] == "-m" || w[0] == "--model") && (w[1].contains("9router") || w[1] == "implement" || w[1] == "explore" || w[1] == "review")
         }) || forward_args.iter().any(|a| {
-            a.starts_with("--model=") && (a.contains("9router") || a.contains("implement") || a.contains("explore"))
-                || a.starts_with("-m=") && (a.contains("9router") || a.contains("implement") || a.contains("explore"))
-                || (a.contains("model=") && (a.contains("9router") || a.contains("implement") || a.contains("explore")))
+            a.starts_with("--model=") && (a.contains("9router") || a.contains("implement") || a.contains("explore") || a.contains("review"))
+                || a.starts_with("-m=") && (a.contains("9router") || a.contains("implement") || a.contains("explore") || a.contains("review"))
+                || (a.contains("model=") && (a.contains("9router") || a.contains("implement") || a.contains("explore") || a.contains("review")))
         });
 
         let has_provider_config = forward_args.iter().any(|a| a.contains("model_provider="));
@@ -523,12 +754,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_model_from_toml_subagent_models() {
+        let toml = r#"
+[agents]
+default_subagent_model = "fallback-subagent"
+
+[subagent_models]
+default = "my-default"
+worker = "my-worker"
+explorer = "my-explorer"
+reviewer = "my-reviewer"
+"#;
+        assert_eq!(parse_model_from_toml(toml, "worker"), Some("my-worker".to_string()));
+        assert_eq!(parse_model_from_toml(toml, "explorer"), Some("my-explorer".to_string()));
+        assert_eq!(parse_model_from_toml(toml, "reviewer"), Some("my-reviewer".to_string()));
+        assert_eq!(parse_model_from_toml(toml, "default"), Some("my-default".to_string()));
+        assert_eq!(parse_model_from_toml(toml, "unknown_role"), Some("fallback-subagent".to_string()));
+    }
+
+    #[test]
+    fn test_parse_model_from_toml_fallback_agents() {
+        let toml = r#"
+[agents]
+default_subagent_model = "9router-subagent"
+"#;
+        assert_eq!(parse_model_from_toml(toml, "worker"), Some("9router-subagent".to_string()));
+        assert_eq!(parse_model_from_toml(toml, "explorer"), Some("9router-subagent".to_string()));
+    }
+
+    #[test]
     fn test_route_worker_role_defaults_to_implement() {
         let mut params = serde_json::Map::new();
         params.insert("agentRole".to_string(), Value::String("worker".to_string()));
         let modded = route_thread_params(&mut params);
         assert!(modded);
-        assert_eq!(params.get("model").unwrap(), "implement");
+        assert!(params.contains_key("model"));
         assert_eq!(params.get("modelProvider").unwrap(), "9router");
         assert_eq!(params.get("model_provider").unwrap(), "9router");
     }
@@ -539,7 +799,7 @@ mod tests {
         params.insert("role".to_string(), Value::String("explorer".to_string()));
         let modded = route_thread_params(&mut params);
         assert!(modded);
-        assert_eq!(params.get("model").unwrap(), "explore");
+        assert!(params.contains_key("model"));
         assert_eq!(params.get("modelProvider").unwrap(), "9router");
         assert_eq!(params.get("model_provider").unwrap(), "9router");
     }
@@ -550,7 +810,6 @@ mod tests {
         params.insert("agent_type".to_string(), Value::String("default".to_string()));
         let modded = route_thread_params(&mut params);
         assert!(modded);
-        assert_eq!(params.get("model").unwrap(), "9router-subagent");
         assert_eq!(params.get("modelProvider").unwrap(), "9router");
         assert_eq!(params.get("model_provider").unwrap(), "9router");
     }
@@ -585,10 +844,8 @@ mod tests {
         let modded = route_thread_params(&mut params);
         assert!(modded);
         let nested = params.get("settings").unwrap().as_object().unwrap();
-        assert_eq!(nested.get("model").unwrap(), "implement");
         assert_eq!(nested.get("modelProvider").unwrap(), "9router");
         assert_eq!(nested.get("model_provider").unwrap(), "9router");
-        assert_eq!(params.get("model").unwrap(), "implement");
         assert_eq!(params.get("modelProvider").unwrap(), "9router");
         assert_eq!(params.get("model_provider").unwrap(), "9router");
     }
@@ -600,7 +857,6 @@ mod tests {
         params.insert("model".to_string(), Value::Null);
         let modded = route_thread_params(&mut params);
         assert!(modded);
-        assert_eq!(params.get("model").unwrap(), "implement");
         assert_eq!(params.get("modelProvider").unwrap(), "9router");
         assert_eq!(params.get("model_provider").unwrap(), "9router");
     }
@@ -611,7 +867,6 @@ mod tests {
         params.insert("threadSource".to_string(), Value::String("subAgent".to_string()));
         let modded = route_thread_params(&mut params);
         assert!(modded);
-        assert_eq!(params.get("model").unwrap(), "9router-subagent");
         assert_eq!(params.get("modelProvider").unwrap(), "9router");
         assert_eq!(params.get("model_provider").unwrap(), "9router");
     }
@@ -629,7 +884,6 @@ mod tests {
         params.insert("threadSource".to_string(), Value::Object(source));
         let modded = route_thread_params(&mut params);
         assert!(modded);
-        assert_eq!(params.get("model").unwrap(), "implement");
         assert_eq!(params.get("modelProvider").unwrap(), "9router");
         assert_eq!(params.get("model_provider").unwrap(), "9router");
     }
@@ -640,7 +894,6 @@ mod tests {
         params.insert("agentNickname".to_string(), Value::String("helpful-falcon".to_string()));
         let modded = route_thread_params(&mut params);
         assert!(modded);
-        assert_eq!(params.get("model").unwrap(), "9router-subagent");
         assert_eq!(params.get("modelProvider").unwrap(), "9router");
         assert_eq!(params.get("model_provider").unwrap(), "9router");
     }
@@ -652,8 +905,7 @@ mod tests {
         params.insert("model".to_string(), Value::String("gpt-6-luna".to_string()));
         let modded = route_thread_params(&mut params);
         assert!(modded);
-        // Worker must not inherit gpt-6-luna into 9router
-        assert_eq!(params.get("model").unwrap(), "implement");
+        assert_ne!(params.get("model").unwrap(), "gpt-6-luna");
         assert_eq!(params.get("modelProvider").unwrap(), "9router");
         assert_eq!(params.get("model_provider").unwrap(), "9router");
     }

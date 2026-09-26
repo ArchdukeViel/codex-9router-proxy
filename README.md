@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](https://www.microsoft.com/windows)
+[![Release](https://img.shields.io/github/v/release/ArchdukeViel/codex-9router-proxy?include_prereleases&color=success)](https://github.com/ArchdukeViel/codex-9router-proxy/releases)
 
 A transparent, high-performance proxy bridge that hooks the official **OpenAI Codex Desktop App & CLI** engine on Windows.
 
@@ -34,10 +35,11 @@ When using the official OpenAI Codex Desktop App signed into a personal or Pro C
 ┌─────────────────────────────────────────────────────────────────┐
 │                    codex-9router-proxy.exe                      │
 │   - Detects subagents (role = worker/explorer or model = 9router)│
-│   - Maps roles to specialized 9Router models:                   │
-│       * worker   -> "implement"                                 │
-│       * explorer -> "explore"                                   │
-│       * default  -> "9router-subagent"                          │
+│   - Multi-tier dynamic model resolution:                        │
+│       * worker   -> configured model (default: 9router-subagent)│
+│       * explorer -> configured model (default: 9router-subagent)│
+│       * reviewer -> configured model (default: 9router-subagent)│
+│       * default  -> configured model (default: 9router-subagent)│
 │   - Injects model_provider = user-configured provider           │
 │   - Injects API key from Windows Registry (HKCU) / Env          │
 │   - Leaves parent turns on model_provider = "openai"            │
@@ -70,14 +72,14 @@ When the primary agent coordinates work across multiple threads, it assigns suba
 - **`worker` (Implementation Agent)**:
   - Default execution subagent.
   - Full permissions to edit files, apply code diffs, and run terminal commands.
-  - Automatically mapped by the proxy to the `implement` model.
 - **`explorer` (Research Agent)**:
   - Read-only investigation subagent.
   - Specializes in surveying repository structures, reading code, searching symbols, and analyzing logs without workspace mutations.
-  - Automatically mapped by the proxy to the `explore` model.
-- **Custom Configured Roles (`.codex/agents/*.toml`)**:
-  - Codex supports user-defined custom agent roles with specific prompts, tool permissions, and dynamic nicknames (e.g. `reviewer`, `tester`).
-  - Mapped by default to `9router-subagent` or role-specific models.
+- **`reviewer` (Review & Audit Agent)**:
+  - Dedicated code review and security audit subagent.
+  - Evaluates changes against project conventions, security posture, and test coverage.
+- **Custom Configured Roles (`~/.codex/agents/*.toml`)**:
+  - Codex supports user-defined custom agent roles with specific prompts, tool permissions, and dynamic nicknames.
 
 ### 2. Internal Engine Subagents (System Level)
 Codex also runs automated background subagents:
@@ -87,13 +89,109 @@ Codex also runs automated background subagents:
 
 ---
 
+## 🌐 Universal OpenAI-Compatible Support (Non-9Router)
+
+`codex-9router-proxy` works universally with **any OpenAI-compatible provider**, both local and cloud-based. You are not locked to 9Router!
+
+Use the built-in `-Preset` switch or enter custom endpoints during installation:
+
+### 1. Ollama (Local)
+```powershell
+.\install.ps1 -Preset ollama -DefaultModel "qwen2.5-coder:32b"
+```
+Or manually configure in `~/.codex/config.toml`:
+```toml
+[model_providers.ollama]
+name = "ollama"
+base_url = "http://localhost:11434/v1"
+
+[agents]
+default_subagent_model = "qwen2.5-coder:32b"
+```
+
+### 2. LM Studio (Local)
+```powershell
+.\install.ps1 -Preset lmstudio -DefaultModel "qwen2.5-coder-32b-instruct"
+```
+Or manually in `~/.codex/config.toml`:
+```toml
+[model_providers.lmstudio]
+name = "lmstudio"
+base_url = "http://localhost:1234/v1"
+
+[agents]
+default_subagent_model = "qwen2.5-coder-32b-instruct"
+```
+
+### 3. OpenRouter (Cloud)
+```powershell
+.\install.ps1 -Preset openrouter -ApiKey "sk-or-v1-..." -DefaultModel "anthropic/claude-3.5-sonnet"
+```
+Or manually in `~/.codex/config.toml`:
+```toml
+[model_providers.openrouter]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "NINEROUTER_KEY"
+
+[agents]
+default_subagent_model = "anthropic/claude-3.5-sonnet"
+```
+
+### 4. vLLM / SGLang / LiteLLM
+```powershell
+.\install.ps1 -Preset vllm -DefaultModel "deepseek-ai/DeepSeek-V3"
+```
+
+---
+
+## ⚙️ Customizing Models per Subagent Role
+
+You can assign different models to each subagent role:
+
+### Option A: Via `install.ps1`
+The installer individually prompts for each role model:
+```text
+[?] Enter Default Subagent Model [default: 9router-subagent]: 9router-subagent
+[?] Enter Worker Subagent Model [default: 9router-subagent]: implement
+[?] Enter Explorer Subagent Model [default: 9router-subagent]: explore
+[?] Enter Reviewer Subagent Model [default: 9router-subagent]: review
+```
+
+Or pass flags directly:
+```powershell
+.\install.ps1 -Provider "9router" `
+  -DefaultModel "9router-subagent" `
+  -WorkerModel "implement" `
+  -ExplorerModel "explore" `
+  -ReviewerModel "review"
+```
+
+### Option B: On the Fly in `~/.codex/config.toml` (No Reinstall Required!)
+The proxy dynamically reads `[subagent_models]` from `~/.codex/config.toml` on every turn:
+```toml
+[subagent_models]
+default = "9router-subagent"
+worker = "ag/claude-sonnet-4-6"
+explorer = "ag/gemini-3.8-flash-high"
+reviewer = "ag/claude-opus-4-6-thinking"
+```
+
+### Option C: Per-Session Environment Overrides
+```powershell
+$env:CODEX_WORKER_MODEL = "ag/claude-sonnet-4-6"
+$env:CODEX_EXPLORER_MODEL = "ag/gemini-3.8-flash-high"
+```
+
+---
+
 ## 🚀 Quick Start
 
 ### 1. Prerequisites
 - Windows 10/11
-- [Rust & Cargo](https://rustup.rs/) (to compile from source)
-- [9Router](http://127.0.0.1:20128) or any local OpenAI-compatible LLM endpoint running on your machine.
-- Official [OpenAI Codex Desktop App](https://apps.microsoft.com/detail/9mz1741s0917) (Microsoft Store) or CLI.
+- [Rust & Cargo](https://rustup.rs/) (to compile from source, or download prebuilt release)
+- 9Router, Ollama, LM Studio, or any OpenAI-compatible LLM endpoint
+- Official [OpenAI Codex Desktop App](https://apps.microsoft.com/detail/9mz1741s0917) (Microsoft Store) or CLI
 
 ### 2. Interactive Installation
 Run `install.ps1` in PowerShell:
@@ -101,11 +199,6 @@ Run `install.ps1` in PowerShell:
 ```powershell
 .\install.ps1
 ```
-
-The installer will interactively prompt you for:
-1. **Model Provider**: Name of the provider (default: `9router`).
-2. **Endpoint / Base URL**: API URL (default: `http://localhost:20128/v1`).
-3. **API Key**: API key for your local/remote server (securely masked, press Enter to keep existing key).
 
 ```text
 ===================================================================
@@ -115,25 +208,69 @@ The installer will interactively prompt you for:
 [?] Enter Model Provider name [default: 9router]: 9router
 [?] Enter API Endpoint / Base URL [default: http://localhost:20128/v1]: http://localhost:20128/v1
 [?] Enter API Key [press Enter to keep existing key]: ********
+[?] Enter Default Subagent Model [default: 9router-subagent]: 9router-subagent
+[?] Enter Worker Subagent Model [default: 9router-subagent]: 9router-subagent
+[?] Enter Explorer Subagent Model [default: 9router-subagent]: 9router-subagent
+[?] Enter Reviewer Subagent Model [default: 9router-subagent]: 9router-subagent
 
 [+] Target Configuration:
-    Provider : 9router
-    Endpoint : http://localhost:20128/v1
-    API Key  : [PROTECTED / CONFIGURED]
+    Provider       : 9router
+    Endpoint       : http://localhost:20128/v1
+    API Key        : [PROTECTED / CONFIGURED]
+    Default Model  : 9router-subagent
+    Worker Model   : 9router-subagent
+    Explorer Model : 9router-subagent
+    Reviewer Model : 9router-subagent
 
 [OK] Saved NINEROUTER_KEY to Windows User Environment (Registry HKCU\Environment).
-[OK] Configured C:\Users\user\.codex\config.toml (BOM-Free UTF-8).
+[OK] Configured C:\Users\user\.codex\config.toml and role manifests in C:\Users\user\.codex\agents (BOM-Free UTF-8).
+[OK] Injected SQLite subagent trigger into C:\Users\user\.codex\state_5.sqlite.
 [OK] Backed up official binary to codex.orig.exe
 [OK] Installed proxy hook to codex.exe
-[OK] Registered self-healing logon task 'Codex9RouterHookSync'.
-[OK] Codex daemon restarted successfully.
+[OK] Registered self-healing startup hook in Codex9RouterHookSync.cmd.
+[OK] Codex daemon restart dispatched successfully.
 ```
 
-### 3. Non-Interactive / Automated Setup
-For automated setups, pass flags directly:
+---
+
+## 🩺 Diagnostics Doctor (`-Doctor`)
+
+Run the built-in doctor check at any time to verify system health:
 
 ```powershell
-.\install.ps1 -Provider "9router" -Endpoint "http://localhost:20128/v1" -NonInteractive
+.\install.ps1 -Doctor
+```
+
+Or directly via binary:
+```powershell
+codex --doctor
+```
+
+Output:
+```text
+===================================================================
+           Codex 9Router Proxy - Diagnostics Doctor 🩺             
+===================================================================
+
+[OK] Running executable : C:\Users\user\codex-9router-proxy\target\release\codex-9router-proxy.exe
+[OK] Official engine    : C:\Users\user\AppData\Local\OpenAI\Codex\bin\<bin-hash>\codex.orig.exe (321969456 bytes)
+[OK] Subagent Provider  : 9router
+[OK] Provider API Key   : [CONFIGURED / MASKED]
+[OK] Codex Config TOML  : C:\Users\user\.codex\config.toml
+     - Default Model    : 9router-subagent
+     - Worker Model     : 9router-subagent
+     - Explorer Model   : 9router-subagent
+     - Reviewer Model   : 9router-subagent
+[OK] Role Manifests     : C:\Users\user\.codex\agents
+     - default  TOML   : Found
+     - worker   TOML   : Found
+     - explorer TOML   : Found
+     - reviewer TOML   : Found
+[OK] Endpoint socket reachable : localhost:20128 (127.0.0.1:20128)
+
+===================================================================
+Diagnostics complete. All checks finished.
+===================================================================
 ```
 
 ---
@@ -143,7 +280,7 @@ For automated setups, pass flags directly:
 When the Microsoft Store auto-updates the Codex Desktop App, Windows downloads the new build to a brand new folder under:
 `%LOCALAPPDATA%\OpenAI\Codex\bin\<new_hash>\`
 
-The installer registers a lightweight Windows Scheduled Task named **`Codex9RouterHookSync`**.
+The installer registers a lightweight Windows Startup Hook named **`Codex9RouterHookSync`**.
 - Triggers seamlessly at user logon.
 - Detects if an unhooked Microsoft Store binary is present.
 - Safely preserves the official binary as `codex.orig.exe` and applies the proxy hook.
