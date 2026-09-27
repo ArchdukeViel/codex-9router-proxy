@@ -35,6 +35,7 @@ jobs:
           Copy-Item -Path "install.ps1" -Destination $dist -Force
           Copy-Item -Path "uninstall.ps1" -Destination $dist -Force
           Copy-Item -Path "README.md" -Destination $dist -Force
+          Copy-Item -Path "CHANGELOG.md" -Destination $dist -Force
           Copy-Item -Path "LICENSE" -Destination $dist -Force
           Compress-Archive -Path "$dist\*" -DestinationPath "$dist.zip" -Force
 
