@@ -641,13 +641,17 @@ $syncScript = @"
 `$pkg = Get-AppxPackage -Name '*OpenAI.Codex*' | Sort-Object Version -Descending | Select-Object -First 1
 `$resDir = if (`$pkg) { Join-Path `$pkg.InstallLocation 'app\resources' } else { `$null }
 `$helpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe')
-if (Test-Path `$binRoot -and Test-Path `$proxyPath) {
+if ((Test-Path `$binRoot) -and (Test-Path `$proxyPath)) {
     Get-ChildItem -Path `$binRoot -Directory | ForEach-Object {
         `$c = Join-Path `$_.FullName 'codex.exe'
         `$o = Join-Path `$_.FullName 'codex.orig.exe'
         if (Test-Path `$c) {
-            if ((Get-Item `$c).Length -gt 10000000 -and -not (Test-Path `$o)) {
-                Copy-Item `$c `$o -Force
+            if ((Get-Item `$c).Length -gt 10000000) {
+                if (-not (Test-Path `$o)) {
+                    Copy-Item `$c `$o -Force
+                }
+                Copy-Item `$proxyPath `$c -Force
+            } elseif ((Test-Path `$o) -and ((Get-FileHash `$c).Hash -ne (Get-FileHash `$proxyPath).Hash)) {
                 Copy-Item `$proxyPath `$c -Force
             }
             if (`$resDir -and (Test-Path `$resDir)) {

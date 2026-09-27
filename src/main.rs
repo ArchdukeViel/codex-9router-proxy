@@ -503,6 +503,8 @@ pub fn find_agent_role(v: &Value) -> Option<String> {
                 let trimmed = r.trim();
                 if trimmed.eq_ignore_ascii_case("review") {
                     return Some("reviewer".to_string());
+                } else if is_subagent_role_name(trimmed) {
+                    return Some(trimmed.to_lowercase());
                 } else if !trimmed.is_empty() {
                     return Some("default".to_string());
                 }
@@ -822,22 +824,74 @@ pub fn decompress_if_needed(body: &[u8], headers: &HeaderMap) -> (Vec<u8>, bool)
 
 /// Sanitize incompatible OpenAI tool schemas (`"type": "namespace"`, `"type": "web_search"`,
 /// `"type": "custom"` for `apply_patch`, and `"type": "additional_tools"` in `"input"`)
-/// before forwarding a subagent request to 9Router.
+/// and normalize Multi-Agents V2 `"type": "agent_message"` items and `"role": "developer"`
+/// messages before forwarding a subagent request to 9Router.
 pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
     let Some(obj) = json.as_object_mut() else {
         return;
     };
 
-    // 1. Strip any "type": "additional_tools" items from "input" so 9Router never turns
-    // code_mode namespaces ("functions", "collaboration") into dummy {reason: string} tools.
+    // 1. In "input":
+    //    - Strip any "type": "additional_tools" items so 9Router never turns code_mode
+    //      namespaces ("functions", "collaboration") into dummy {reason: string} tools.
+    //    - Normalize Multi-Agents V2 "type": "agent_message" items into standard
+    //      "type": "message" with "role": "user" (stripping V2-only metadata fields
+    //      such as "author", "recipient", and "internal_chat_message_metadata_passthrough").
+    //    - Normalize "role": "developer" items into "role": "system" so 9Router and
+    //      downstream translators (Gemini / Claude / OpenAI) preserve developer prompts.
     if let Some(input_arr) = obj.get_mut("input").and_then(|v| v.as_array_mut()) {
         input_arr.retain(|item| {
             item.get("type").and_then(|t| t.as_str()) != Some("additional_tools")
         });
+        for item in input_arr.iter_mut() {
+            let Some(item_obj) = item.as_object_mut() else {
+                continue;
+            };
+            let is_agent_message = item_obj
+                .get("type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.eq_ignore_ascii_case("agent_message"));
+            if is_agent_message {
+                item_obj.insert("type".to_string(), Value::String("message".to_string()));
+                let normalized_role = match item_obj
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .map(|r| r.trim())
+                {
+                    None | Some("") => "user".to_string(),
+                    Some(r) if r.eq_ignore_ascii_case("agent") => "user".to_string(),
+                    Some(r) if r.eq_ignore_ascii_case("developer") => "system".to_string(),
+                    Some(r) => r.to_lowercase(),
+                };
+                item_obj.insert("role".to_string(), Value::String(normalized_role));
+                item_obj.remove("author");
+                item_obj.remove("recipient");
+            } else if item_obj
+                .get("role")
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| r.eq_ignore_ascii_case("developer"))
+            {
+                item_obj.insert("role".to_string(), Value::String("system".to_string()));
+            }
+            item_obj.remove("internal_chat_message_metadata_passthrough");
+        }
+    }
+
+    if let Some(messages_arr) = obj.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        for msg in messages_arr.iter_mut() {
+            if let Some(msg_obj) = msg.as_object_mut() {
+                if msg_obj
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .is_some_and(|r| r.eq_ignore_ascii_case("developer"))
+                {
+                    msg_obj.insert("role".to_string(), Value::String("system".to_string()));
+                }
+            }
+        }
     }
 
     // 2. Sanitize top-level "tools" array:
-    // 2. Sanitize "tools":
     //    - Filter out "type": "namespace", "type": "web_search", "type": "web_search_preview",
     //      and "type": "custom" (Freeform tools require custom_tool_call SSE responses which
     //      9Router does not emit; when codex.orig.exe uses our injected model metadata with
@@ -918,13 +972,20 @@ pub fn inspect_and_route_http_request_with_headers(
             .get("x-openai-subagent")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| {
-                if s.eq_ignore_ascii_case("review") {
-                    Some("reviewer")
+                let trimmed = s.trim();
+                if trimmed.eq_ignore_ascii_case("review") {
+                    Some("reviewer".to_string())
+                } else if is_subagent_role_name(trimmed) {
+                    Some(trimmed.to_lowercase())
                 } else {
                     None
                 }
             });
-        let effective_role = detected_role.as_deref().or(header_role);
+        let effective_role = match (detected_role.as_deref(), header_role.as_deref()) {
+            (Some("default"), Some(hr)) => Some(hr),
+            (Some(dr), _) => Some(dr),
+            (None, hr) => hr,
+        };
         let mapped_model = map_role_to_model(effective_role);
         if let Some(obj) = json.as_object_mut() {
             obj.insert("model".to_string(), Value::String(mapped_model));
@@ -2558,4 +2619,164 @@ default_subagent_model = "9router-subagent"
         let already_default = rewrite_body_model_to_fallback(&fallback);
         assert!(already_default.is_none());
     }
+
+    #[test]
+    fn test_sanitize_subagent_normalizes_agent_message_and_developer_role() {
+        let body = serde_json::json!({
+            "model": "9router-subagent",
+            "instructions": "You are Codex, a coding agent.",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "<permissions instructions>"}],
+                    "internal_chat_message_metadata_passthrough": "meta_dev"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<environment_context>"}],
+                    "internal_chat_message_metadata_passthrough": "meta_user"
+                },
+                {
+                    "role": "developer",
+                    "content": "You are an explorer sub-agent."
+                },
+                {
+                    "type": "agent_message",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Inspect Cargo.toml and summarize dependencies"
+                        }
+                    ],
+                    "author": {
+                        "agent_id": "019ac141-c9fd-7780-95b7-67f988bc83b6",
+                        "agent_path": "/root"
+                    },
+                    "recipient": {
+                        "agent_id": "019ac142-1111-2222-3333-444455556666",
+                        "agent_path": "/root/explorer_1"
+                    },
+                    "internal_chat_message_metadata_passthrough": "meta_agent_msg"
+                },
+                {
+                    "type": "agent_message",
+                    "role": "agent",
+                    "content": [{"type": "input_text", "text": "Agent role message"}]
+                },
+                {
+                    "type": "agent_message",
+                    "role": "  ",
+                    "content": [{"type": "input_text", "text": "Empty role message"}]
+                },
+                {
+                    "type": "agent_message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "Developer agent_message"}]
+                },
+                {
+                    "type": "agent_message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Prior assistant reply"}]
+                }
+            ],
+            "messages": [
+                {
+                    "role": "developer",
+                    "content": "Chat completions developer prompt"
+                }
+            ]
+        });
+
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let (is_subagent, routed_body) =
+            inspect_and_route_http_request("/backend-api/codex/responses", &body_bytes);
+        assert!(is_subagent);
+
+        let parsed: Value = serde_json::from_slice(&routed_body).unwrap();
+        let input_arr = parsed["input"].as_array().unwrap();
+        assert_eq!(input_arr.len(), 8);
+
+        // 1. First developer message normalized to system and metadata stripped
+        assert_eq!(input_arr[0]["type"], "message");
+        assert_eq!(input_arr[0]["role"], "system");
+        assert_eq!(
+            input_arr[0]["content"][0]["text"],
+            "<permissions instructions>"
+        );
+        assert!(input_arr[0]
+            .get("internal_chat_message_metadata_passthrough")
+            .is_none());
+
+        // 2. Environment context user message preserved and V2 passthrough metadata stripped
+        assert_eq!(input_arr[1]["type"], "message");
+        assert_eq!(input_arr[1]["role"], "user");
+        assert!(input_arr[1]
+            .get("internal_chat_message_metadata_passthrough")
+            .is_none());
+
+        // 3. Role-only developer message normalized to system
+        assert_eq!(input_arr[2]["role"], "system");
+        assert_eq!(input_arr[2]["content"], "You are an explorer sub-agent.");
+
+        // 4. Multi-Agents V2 agent_message normalized to message with role=user and V2 metadata stripped
+        assert_eq!(input_arr[3]["type"], "message");
+        assert_eq!(input_arr[3]["role"], "user");
+        assert_eq!(
+            input_arr[3]["content"][0]["text"],
+            "Inspect Cargo.toml and summarize dependencies"
+        );
+        assert!(input_arr[3].get("author").is_none());
+        assert!(input_arr[3].get("recipient").is_none());
+        assert!(input_arr[3]
+            .get("internal_chat_message_metadata_passthrough")
+            .is_none());
+
+        // 5. agent_message with role="agent" or whitespace normalized to role="user"
+        assert_eq!(input_arr[4]["type"], "message");
+        assert_eq!(input_arr[4]["role"], "user");
+        assert_eq!(input_arr[5]["type"], "message");
+        assert_eq!(input_arr[5]["role"], "user");
+
+        // 6. agent_message with role="developer" normalized to role="system"
+        assert_eq!(input_arr[6]["type"], "message");
+        assert_eq!(input_arr[6]["role"], "system");
+
+        // 7. agent_message with role="assistant" preserved as role="assistant"
+        assert_eq!(input_arr[7]["type"], "message");
+        assert_eq!(input_arr[7]["role"], "assistant");
+
+        // 8. Chat completions fallback messages array developer role normalized to system
+        let messages_arr = parsed["messages"].as_array().unwrap();
+        assert_eq!(messages_arr[0]["role"], "system");
+    }
+
+    #[test]
+    fn test_x_openai_subagent_header_preserves_role_name() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-openai-subagent", HeaderValue::from_static("explorer"));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-6-luna",
+            "input": [
+                {
+                    "type": "agent_message",
+                    "content": [{"type": "input_text", "text": "Explore repo"}]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let (is_subagent, routed_body) = inspect_and_route_http_request_with_headers(
+            "/backend-api/codex/responses",
+            &headers,
+            &body,
+        );
+        assert!(is_subagent);
+        let parsed: Value = serde_json::from_slice(&routed_body).unwrap();
+        assert_eq!(parsed["model"], map_role_to_model(Some("explorer")));
+        assert_eq!(parsed["input"][0]["type"], "message");
+        assert_eq!(parsed["input"][0]["role"], "user");
+    }
 }
+
