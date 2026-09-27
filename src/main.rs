@@ -25,13 +25,18 @@ use tokio_rustls::TlsAcceptor;
 use tower::Service;
 
 /// Check if a given role name indicates a subagent.
+/// Strictly excludes OpenAI message roles (`developer`, `user`, `assistant`, `system`, `tool`, `function`)
+/// and root/main thread names (`main`, `primary`, `root`, `/root`).
 pub fn is_subagent_role_name(r: &str) -> bool {
-    let lower = r.to_lowercase();
+    let lower = r.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
     match lower.as_str() {
-        "worker" | "explorer" | "default" | "subagent" | "sub-agent" | "sub_agent" | "reviewer" => {
-            true
-        }
-        "user" | "assistant" | "system" | "main" | "primary" => false,
+        "user" | "assistant" | "system" | "developer" | "tool" | "function" | "main"
+        | "primary" | "root" | "/root" => false,
+        "worker" | "explorer" | "default" | "subagent" | "sub-agent" | "sub_agent" | "reviewer"
+        | "collab_spawn" | "review" => true,
         _ => true,
     }
 }
@@ -170,20 +175,16 @@ pub fn read_model_from_config(role: &str) -> Option<String> {
 }
 
 /// Built-in default model name for a given role without consulting env/disk.
-pub fn builtin_role_model(role: &str) -> &'static str {
-    match role.to_lowercase().as_str() {
-        "worker" => "implement",
-        "explorer" => "explore",
-        "reviewer" => "review",
-        _ => "9router-subagent",
-    }
+/// All roles default to `"9router-subagent"` unless overridden by env or config.
+pub fn builtin_role_model(_role: &str) -> &'static str {
+    "9router-subagent"
 }
 
 /// Map an agent role to a specialized model name with multi-tier resolution:
 /// 1. Environment variable override: `CODEX_<ROLE>_MODEL`
 /// 2. Generic environment variable override: `CODEX_SUBAGENT_MODEL`
 /// 3. Active `~/.codex/agents/<role>.toml` or `~/.codex/config.toml`
-/// 4. Built-in defaults: worker -> implement, explorer -> explore, reviewer -> review, default -> 9router-subagent
+/// 4. Built-in default: `9router-subagent`
 pub fn map_role_to_model(role: Option<&str>) -> String {
     let role_str = role.unwrap_or("default");
     let role_lower = role_str.to_lowercase();
@@ -210,16 +211,32 @@ pub fn map_role_to_model(role: Option<&str>) -> String {
         return m;
     }
 
-    // 4. Built-in smart fallback defaults
+    // 4. Built-in default
     builtin_role_model(&role_lower).to_string()
 }
 
-/// Check if a JSON value contains markers indicating a subagent thread source.
+/// Check if HTTP headers indicate a spawned subagent request (`x-openai-subagent` or `x-codex-parent-thread-id`).
+pub fn is_subagent_http_headers(headers: &HeaderMap) -> bool {
+    for key in ["x-openai-subagent", "x-codex-parent-thread-id"] {
+        if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
+            if !val.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if a JSON value contains markers indicating a subagent thread source or subagent `client_metadata`.
 pub fn contains_subagent_source(v: &Value) -> bool {
     match v {
         Value::String(s) => {
             let lower = s.to_lowercase();
-            lower.contains("subagent") || lower.contains("sub_agent") || lower.contains("sub-agent")
+            lower.contains("subagent")
+                || lower.contains("sub_agent")
+                || lower.contains("sub-agent")
+                || lower.contains("thread_spawn")
+                || lower.contains("collab_spawn")
         }
         Value::Object(map) => {
             if map.contains_key("subAgent")
@@ -230,9 +247,27 @@ pub fn contains_subagent_source(v: &Value) -> bool {
             {
                 return true;
             }
+            for k in ["x-openai-subagent", "x-codex-parent-thread-id", "parent_turn_id"] {
+                if let Some(s) = map.get(k).and_then(|x| x.as_str()) {
+                    if !s.trim().is_empty() {
+                        return true;
+                    }
+                }
+            }
+            if let Some(turn_meta) = map.get("x-codex-turn-metadata").and_then(|x| x.as_str()) {
+                let lower = turn_meta.to_lowercase();
+                if lower.contains("\"thread_source\":\"subagent\"")
+                    || lower.contains("\"subagent_kind\":")
+                    || lower.contains("\"parent_thread_id\":")
+                {
+                    return true;
+                }
+            }
             if let Some(r) = map
                 .get("agent_role")
                 .or_else(|| map.get("agentRole"))
+                .or_else(|| map.get("agent_type"))
+                .or_else(|| map.get("agentType"))
                 .and_then(|x| x.as_str())
             {
                 if is_subagent_role_name(r) {
@@ -241,6 +276,11 @@ pub fn contains_subagent_source(v: &Value) -> bool {
             }
             if let Some(src) = map.get("threadSource").or_else(|| map.get("thread_source")) {
                 if contains_subagent_source(src) {
+                    return true;
+                }
+            }
+            if let Some(cm) = map.get("client_metadata").or_else(|| map.get("clientMetadata")) {
+                if contains_subagent_source(cm) {
                     return true;
                 }
             }
@@ -277,8 +317,26 @@ pub fn find_real_codex() -> PathBuf {
         }
     }
 
-    // 3. Scan bin/<hash> candidates in LOCALAPPDATA
+    // 3. Check custom directory and bin/<hash> candidates in LOCALAPPDATA
     if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
+        let custom_orig = Path::new(&local_app_data)
+            .join("OpenAI")
+            .join("Codex")
+            .join("custom")
+            .join("codex-9router-subagents.orig.exe");
+        if custom_orig.is_file() {
+            return custom_orig;
+        }
+
+        let custom_codex_orig = Path::new(&local_app_data)
+            .join("OpenAI")
+            .join("Codex")
+            .join("custom")
+            .join("codex.orig.exe");
+        if custom_codex_orig.is_file() {
+            return custom_codex_orig;
+        }
+
         let bin_dir = Path::new(&local_app_data)
             .join("OpenAI")
             .join("Codex")
@@ -315,24 +373,6 @@ pub fn find_real_codex() -> PathBuf {
             }
         }
 
-        let custom_orig = Path::new(&local_app_data)
-            .join("OpenAI")
-            .join("Codex")
-            .join("custom")
-            .join("codex-9router-subagents.orig.exe");
-        if custom_orig.is_file() {
-            return custom_orig;
-        }
-
-        let custom_codex_orig = Path::new(&local_app_data)
-            .join("OpenAI")
-            .join("Codex")
-            .join("custom")
-            .join("codex.orig.exe");
-        if custom_codex_orig.is_file() {
-            return custom_codex_orig;
-        }
-
         let app_bin = Path::new(&local_app_data)
             .join("Programs")
             .join("OpenAI")
@@ -364,10 +404,29 @@ pub fn find_real_codex() -> PathBuf {
     PathBuf::from("codex.orig.exe")
 }
 
-/// Reset any rate limit errors or spend control blocks in local UI responses.
+/// Reset any rate limit errors or spend control blocks in local UI responses,
+/// and rewrite loopback `backendOrigin` back to `https://chatgpt.com` so the Electron GUI
+/// (`AuthService` / `electron.net.fetch`) connects directly to ChatGPT with valid public TLS.
 pub fn sanitize_rate_limits(val: &mut Value) -> bool {
     let mut modified = false;
     if let Some(obj) = val.as_object_mut() {
+        for key in ["backendOrigin", "backend_origin"] {
+            if let Some(Value::String(origin)) = obj.get_mut(key) {
+                if origin.starts_with("https://127.0.0.1")
+                    || origin.starts_with("http://127.0.0.1")
+                    || origin.starts_with("https://localhost")
+                    || origin.starts_with("http://localhost")
+                {
+                    let upstream = get_chatgpt_upstream_base();
+                    let clean_origin = upstream
+                        .trim_end_matches('/')
+                        .trim_end_matches("/backend-api")
+                        .to_string();
+                    *origin = clean_origin;
+                    modified = true;
+                }
+            }
+        }
         if obj.contains_key("ordinaryUsageAllowed") {
             obj.insert("ordinaryUsageAllowed".to_string(), Value::Bool(true));
             modified = true;
@@ -421,22 +480,57 @@ pub fn sanitize_rate_limits(val: &mut Value) -> bool {
 }
 
 /// Recursively search for an agent role in a JSON structure.
+/// Never inspects chat message `"role"` fields or `"input"` / `"messages"` / `"instructions"` / `"tools"` arrays.
 pub fn find_agent_role(v: &Value) -> Option<String> {
     match v {
         Value::Object(map) => {
-            if let Some(r) = map
-                .get("agentRole")
-                .or_else(|| map.get("agent_role"))
-                .or_else(|| map.get("agentType"))
-                .or_else(|| map.get("agent_type"))
-                .or_else(|| map.get("role"))
-                .and_then(|x| x.as_str())
-            {
-                if !r.is_empty() {
-                    return Some(r.to_string());
+            for key in [
+                "agentRole",
+                "agent_role",
+                "agentType",
+                "agent_type",
+                "subagent_role",
+                "subagentRole",
+            ] {
+                if let Some(r) = map.get(key).and_then(|x| x.as_str()) {
+                    let trimmed = r.trim();
+                    if !trimmed.is_empty() && is_subagent_role_name(trimmed) {
+                        return Some(trimmed.to_string());
+                    }
                 }
             }
-            for (_, child) in map.iter() {
+            if let Some(r) = map.get("x-openai-subagent").and_then(|x| x.as_str()) {
+                let trimmed = r.trim();
+                if trimmed.eq_ignore_ascii_case("review") {
+                    return Some("reviewer".to_string());
+                } else if !trimmed.is_empty() {
+                    return Some("default".to_string());
+                }
+            }
+            // In JSON-RPC thread/start or turn/start params (where "input"/"messages" is not the parent),
+            // allow top-level "role" only if it is explicitly one of the known subagent roles.
+            if let Some(r) = map.get("role").and_then(|x| x.as_str()) {
+                let lower = r.trim().to_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "worker" | "explorer" | "reviewer" | "default" | "subagent"
+                ) {
+                    return Some(lower);
+                }
+            }
+            for (k, child) in map.iter() {
+                if matches!(
+                    k.as_str(),
+                    "input"
+                        | "messages"
+                        | "instructions"
+                        | "tools"
+                        | "functions"
+                        | "input_schema"
+                        | "parameters"
+                ) {
+                    continue;
+                }
                 if let Some(r) = find_agent_role(child) {
                     return Some(r);
                 }
@@ -665,6 +759,14 @@ pub fn is_responses_path(path: &str) -> bool {
         || clean_path.ends_with("/responses")
 }
 
+/// Check if a request path is the models catalog endpoint (`GET /backend-api/models`).
+pub fn is_models_path(path: &str) -> bool {
+    let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    clean_path == "/backend-api/models"
+        || clean_path == "/models"
+        || clean_path.ends_with("/backend-api/models")
+}
+
 /// Retrieve the configured loopback proxy port (default: 20129).
 pub fn get_proxy_port() -> String {
     env::var("CODEX_PROXY_PORT").unwrap_or_else(|_| "20129".to_string())
@@ -718,9 +820,51 @@ pub fn decompress_if_needed(body: &[u8], headers: &HeaderMap) -> (Vec<u8>, bool)
     (body.to_vec(), false)
 }
 
-/// Inspect and determine routing policy for an HTTP request to the loopback proxy:
-/// Returns (is_subagent, modified_or_original_body).
-pub fn inspect_and_route_http_request(path: &str, body: &[u8]) -> (bool, Vec<u8>) {
+/// Sanitize incompatible OpenAI tool schemas (`"type": "namespace"`, `"type": "web_search"`,
+/// `"type": "custom"` for `apply_patch`, and `"type": "additional_tools"` in `"input"`)
+/// before forwarding a subagent request to 9Router.
+pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
+    let Some(obj) = json.as_object_mut() else {
+        return;
+    };
+
+    // 1. Strip any "type": "additional_tools" items from "input" so 9Router never turns
+    // code_mode namespaces ("functions", "collaboration") into dummy {reason: string} tools.
+    if let Some(input_arr) = obj.get_mut("input").and_then(|v| v.as_array_mut()) {
+        input_arr.retain(|item| {
+            item.get("type").and_then(|t| t.as_str()) != Some("additional_tools")
+        });
+    }
+
+    // 2. Sanitize top-level "tools" array:
+    // 2. Sanitize "tools":
+    //    - Filter out "type": "namespace", "type": "web_search", "type": "web_search_preview",
+    //      and "type": "custom" (Freeform tools require custom_tool_call SSE responses which
+    //      9Router does not emit; when codex.orig.exe uses our injected model metadata with
+    //      apply_patch_tool_type = "function", it sends "type": "function", "name": "apply_patch"
+    //      which is preserved here and matches ToolPayload::Function).
+    if let Some(tools_arr) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
+        tools_arr.retain(|tool| {
+            let tool_type = tool
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            !matches!(
+                tool_type,
+                "namespace" | "web_search" | "web_search_preview" | "custom"
+            )
+        });
+    }
+}
+
+/// Inspect and determine routing policy for an HTTP request to the loopback proxy
+/// using both HTTP headers and JSON body.
+/// Returns `(is_subagent, modified_or_original_body)`.
+pub fn inspect_and_route_http_request_with_headers(
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> (bool, Vec<u8>) {
     if !is_responses_path(path) || body.is_empty() {
         return (false, body.to_vec());
     }
@@ -729,25 +873,36 @@ pub fn inspect_and_route_http_request(path: &str, body: &[u8]) -> (bool, Vec<u8>
         return (false, body.to_vec());
     };
 
-    let current_model = json.get("model").and_then(|m| m.as_str());
-    let model_is_subagent = current_model.map_or(false, is_subagent_model_name);
+    let header_is_subagent = is_subagent_http_headers(headers);
+    let current_model = json
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    let model_is_subagent = current_model
+        .as_deref()
+        .map_or(false, is_subagent_model_name);
     let has_subagent_marker = contains_subagent_source(&json);
     let detected_role = find_agent_role(&json);
-    let role_is_subagent = detected_role.as_deref().map_or(false, is_subagent_role_name);
+    let role_is_subagent = detected_role
+        .as_deref()
+        .map_or(false, is_subagent_role_name);
     let has_agent_nickname = json
         .get("agentNickname")
         .or_else(|| json.get("agent_nickname"))
         .and_then(|v| v.as_str())
         .map_or(false, |s| !s.is_empty());
 
-    let is_subagent =
-        model_is_subagent || has_subagent_marker || role_is_subagent || has_agent_nickname;
+    let is_subagent = header_is_subagent
+        || model_is_subagent
+        || has_subagent_marker
+        || role_is_subagent
+        || has_agent_nickname;
 
     if !is_subagent {
         return (false, body.to_vec());
     }
 
-    let needs_model_rewrite = match current_model {
+    let needs_model_rewrite = match current_model.as_deref() {
         None => true,
         Some(m) => {
             m.is_empty()
@@ -759,14 +914,149 @@ pub fn inspect_and_route_http_request(path: &str, body: &[u8]) -> (bool, Vec<u8>
     };
 
     if needs_model_rewrite {
-        let mapped_model = map_role_to_model(detected_role.as_deref());
+        let header_role = headers
+            .get("x-openai-subagent")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| {
+                if s.eq_ignore_ascii_case("review") {
+                    Some("reviewer")
+                } else {
+                    None
+                }
+            });
+        let effective_role = detected_role.as_deref().or(header_role);
+        let mapped_model = map_role_to_model(effective_role);
         if let Some(obj) = json.as_object_mut() {
             obj.insert("model".to_string(), Value::String(mapped_model));
         }
     }
 
+    sanitize_subagent_request_for_9router(&mut json);
+
     let out_body = serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec());
     (true, out_body)
+}
+
+/// Convenience wrapper for inspecting an HTTP request body without custom headers.
+pub fn inspect_and_route_http_request(path: &str, body: &[u8]) -> (bool, Vec<u8>) {
+    inspect_and_route_http_request_with_headers(path, &HeaderMap::new(), body)
+}
+
+/// Inject subagent model metadata descriptors (`9router-subagent`, `implement`, `explore`, `review`,
+/// and any configured role models) into the `/backend-api/models` JSON response so `codex.orig.exe`
+/// never logs `Model metadata for ... not found` and configures a 200k context window + function `apply_patch`.
+pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
+    let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+
+    let Some(obj) = json.as_object_mut() else {
+        return body.to_vec();
+    };
+
+    let models_key = if obj.contains_key("models") {
+        "models"
+    } else if obj.contains_key("data") {
+        "data"
+    } else {
+        return body.to_vec();
+    };
+
+    let Some(models_arr) = obj.get_mut(models_key).and_then(|v| v.as_array_mut()) else {
+        return body.to_vec();
+    };
+
+    let template = models_arr.first().cloned();
+
+    let mut slugs_to_ensure = vec![
+        "9router-subagent".to_string(),
+        "implement".to_string(),
+        "explore".to_string(),
+        "review".to_string(),
+    ];
+    for role in ["default", "worker", "explorer", "reviewer"] {
+        let m = map_role_to_model(Some(role));
+        if !m.is_empty() && !slugs_to_ensure.contains(&m) {
+            slugs_to_ensure.push(m);
+        }
+    }
+
+    for slug in slugs_to_ensure {
+        let already_exists = models_arr.iter().any(|item| {
+            item.get("slug")
+                .or_else(|| item.get("id"))
+                .and_then(|s| s.as_str())
+                .map_or(false, |s| s.eq_ignore_ascii_case(&slug))
+        });
+        if already_exists {
+            continue;
+        }
+
+        let mut entry = if let Some(ref tmpl) = template {
+            tmpl.clone()
+        } else {
+            serde_json::json!({
+                "slug": slug,
+                "display_name": format!("{} (9Router)", slug),
+                "description": "Subagent model routed via Codex 9Router Proxy",
+                "context_window": 200000,
+                "max_context_window": 200000,
+                "max_output_tokens": 64000,
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [
+                    {"effort": "low", "description": "Fast responses"},
+                    {"effort": "medium", "description": "Balanced reasoning"},
+                    {"effort": "high", "description": "Deep reasoning"}
+                ],
+                "shell_type": "shell_command",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 99,
+                "apply_patch_tool_type": "function",
+                "supports_parallel_tool_calls": true,
+                "supports_reasoning_summaries": true,
+                "supports_search_tool": false,
+                "experimental_supported_tools": [],
+                "input_modalities": ["text", "image"]
+            })
+        };
+
+        if let Some(entry_obj) = entry.as_object_mut() {
+            entry_obj.insert("slug".to_string(), Value::String(slug.clone()));
+            if entry_obj.contains_key("id") {
+                entry_obj.insert("id".to_string(), Value::String(slug.clone()));
+            }
+            entry_obj.insert(
+                "display_name".to_string(),
+                Value::String(format!("{} (9Router)", slug)),
+            );
+            entry_obj.insert(
+                "description".to_string(),
+                Value::String("Subagent model routed via Codex 9Router Proxy".to_string()),
+            );
+            entry_obj.insert("context_window".to_string(), serde_json::json!(200000));
+            entry_obj.insert("max_context_window".to_string(), serde_json::json!(200000));
+            entry_obj.insert(
+                "apply_patch_tool_type".to_string(),
+                Value::String("function".to_string()),
+            );
+            entry_obj.insert("visibility".to_string(), Value::String("list".to_string()));
+            entry_obj.insert("supported_in_api".to_string(), Value::Bool(true));
+            entry_obj.insert("supports_search_tool".to_string(), Value::Bool(false));
+            entry_obj.remove("tool_mode");
+            // Ensure code_mode is not forced on 9Router subagent models
+            if let Some(exp) = entry_obj
+                .get_mut("experimental_supported_tools")
+                .and_then(|v| v.as_array_mut())
+            {
+                exp.clear();
+            }
+        }
+
+        models_arr.push(entry);
+    }
+
+    serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec())
 }
 
 /// Resolve the forward target URL for a given path and routing classification.
@@ -1019,10 +1309,20 @@ pub async fn proxy_handler(
         return health_handler().await.into_response();
     }
 
+    let is_models_req = method == Method::GET && is_models_path(path);
     let (decompressed_body, _was_compressed) = decompress_if_needed(&body, &headers);
-    let (is_subagent, routed_body) = inspect_and_route_http_request(path, &decompressed_body);
+    let (is_subagent, routed_body) =
+        inspect_and_route_http_request_with_headers(path, &headers, &decompressed_body);
     let target_url = resolve_forward_url_with_query(path, query, is_subagent);
-    let forward_headers = build_forward_headers(&headers, is_subagent);
+    let mut forward_headers = build_forward_headers(&headers, is_subagent);
+
+    // For GET /backend-api/models, strip compression and conditional cache headers
+    // so ChatGPT returns plain 200 OK JSON that we can enrich with 9Router subagent models.
+    if is_models_req {
+        forward_headers.remove(header::ACCEPT_ENCODING);
+        forward_headers.remove(header::IF_NONE_MATCH);
+        forward_headers.remove(header::IF_MODIFIED_SINCE);
+    }
 
     let mut req_builder = state
         .http_client
@@ -1078,7 +1378,33 @@ pub async fn proxy_handler(
 
     let status = StatusCode::from_u16(upstream_res.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let clean_headers = filter_response_headers(upstream_res.headers());
+    let mut clean_headers = filter_response_headers(upstream_res.headers());
+
+    if is_models_req && status == StatusCode::OK {
+        return match upstream_res.bytes().await {
+            Ok(raw_bytes) => {
+                let enriched = inject_subagent_models_metadata(&raw_bytes);
+                clean_headers.remove(header::CONTENT_ENCODING);
+                clean_headers.remove(header::ETAG);
+                let mut response = Response::builder().status(status);
+                for (k, v) in clean_headers.iter() {
+                    response = response.header(k, v);
+                }
+                response.body(Body::from(enriched)).unwrap_or_else(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Internal error building models response: {}", e),
+                    )
+                        .into_response()
+                })
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Upstream error reading models body: {}", e),
+            )
+                .into_response(),
+        };
+    }
 
     let stream = upstream_res
         .bytes_stream()
@@ -1517,13 +1843,13 @@ mod tests {
         let toml = r#"
 name = "worker"
 description = "Implementation-focused subagent"
-model = "implement"
+model = "9router-subagent"
 model_provider = "9router"
 model_reasoning_effort = "high"
 "#;
         assert_eq!(
             parse_model_from_role_toml(toml),
-            Some("implement".to_string())
+            Some("9router-subagent".to_string())
         );
     }
 
@@ -1578,15 +1904,235 @@ default_subagent_model = "9router-subagent"
     }
 
     #[test]
-    fn test_builtin_role_model_defaults() {
-        assert_eq!(builtin_role_model("worker"), "implement");
-        assert_eq!(builtin_role_model("explorer"), "explore");
-        assert_eq!(builtin_role_model("reviewer"), "review");
+    fn test_builtin_role_model_defaults_all_to_9router_subagent() {
+        assert_eq!(builtin_role_model("worker"), "9router-subagent");
+        assert_eq!(builtin_role_model("explorer"), "9router-subagent");
+        assert_eq!(builtin_role_model("reviewer"), "9router-subagent");
         assert_eq!(builtin_role_model("default"), "9router-subagent");
     }
 
     #[test]
-    fn test_route_worker_role_defaults_to_implement() {
+    fn test_is_subagent_role_name_excludes_message_roles() {
+        assert!(!is_subagent_role_name("developer"));
+        assert!(!is_subagent_role_name("user"));
+        assert!(!is_subagent_role_name("assistant"));
+        assert!(!is_subagent_role_name("system"));
+        assert!(!is_subagent_role_name("tool"));
+        assert!(!is_subagent_role_name("function"));
+        assert!(!is_subagent_role_name("main"));
+        assert!(!is_subagent_role_name("primary"));
+        assert!(!is_subagent_role_name("root"));
+        assert!(!is_subagent_role_name("/root"));
+        assert!(is_subagent_role_name("worker"));
+        assert!(is_subagent_role_name("explorer"));
+        assert!(is_subagent_role_name("reviewer"));
+        assert!(is_subagent_role_name("default"));
+    }
+
+    #[test]
+    fn test_main_agent_with_developer_role_and_additional_tools_not_hijacked() {
+        let body = serde_json::json!({
+            "model": "gpt-6-luna",
+            "tools": [],
+            "input": [
+                {
+                    "id": "fc_123",
+                    "role": "developer",
+                    "type": "additional_tools",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "tools": [
+                                {"type": "function", "name": "exec"}
+                            ]
+                        },
+                        {
+                            "type": "namespace",
+                            "name": "collaboration",
+                            "tools": [
+                                {"type": "function", "name": "spawn_agent"}
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "role": "developer",
+                    "content": "System instructions"
+                },
+                {
+                    "role": "user",
+                    "content": "Run a PowerShell check and spawn 3 subagents"
+                }
+            ],
+            "client_metadata": {
+                "x-codex-turn-metadata": "{\"turn_id\":\"t1\",\"thread_source\":\"user\",\"agent_name\":\"/root\"}"
+            }
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let headers = HeaderMap::new();
+        let (is_subagent, routed_body) = inspect_and_route_http_request_with_headers(
+            "/backend-api/codex/responses",
+            &headers,
+            &body_bytes,
+        );
+        assert!(
+            !is_subagent,
+            "Main agent gpt-6-luna turn with developer role in input must NOT be classified as subagent!"
+        );
+        let parsed: Value = serde_json::from_slice(&routed_body).unwrap();
+        assert_eq!(parsed["model"], "gpt-6-luna");
+    }
+
+    #[test]
+    fn test_subagent_detected_via_http_headers_and_client_metadata() {
+        let body = serde_json::json!({
+            "model": "gpt-6-luna",
+            "input": [
+                {"role": "developer", "content": "You are a subagent"},
+                {"role": "user", "content": "Inspect Cargo.toml"}
+            ],
+            "client_metadata": {
+                "x-openai-subagent": "collab_spawn",
+                "x-codex-parent-thread-id": "019ac141-c9fd-7780-95b7-67f988bc83b6",
+                "x-codex-turn-metadata": "{\"thread_source\":\"subagent\",\"subagent_kind\":\"thread_spawn\"}"
+            }
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HeaderName::from_static("x-openai-subagent"),
+            HeaderValue::from_static("collab_spawn"),
+        );
+
+        let (is_subagent, routed_body) = inspect_and_route_http_request_with_headers(
+            "/backend-api/codex/responses",
+            &headers,
+            &body_bytes,
+        );
+        assert!(is_subagent);
+        let parsed: Value = serde_json::from_slice(&routed_body).unwrap();
+        assert_ne!(parsed["model"], "gpt-6-luna");
+    }
+
+    #[test]
+    fn test_sanitize_subagent_tools_for_9router() {
+        let body = serde_json::json!({
+            "model": "9router-subagent",
+            "input": [
+                {
+                    "role": "developer",
+                    "type": "additional_tools",
+                    "tools": [{"type": "namespace", "name": "functions"}]
+                },
+                {
+                    "role": "user",
+                    "content": "Edit file"
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+                },
+                {
+                    "type": "function",
+                    "name": "apply_patch",
+                    "parameters": {"type": "object", "properties": {"input": {"type": "string"}}}
+                },
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Freeform patch"
+                },
+                {
+                    "type": "namespace",
+                    "name": "mcp__codegraph",
+                    "tools": []
+                },
+                {
+                    "type": "web_search"
+                }
+            ]
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let (is_subagent, routed_body) =
+            inspect_and_route_http_request("/backend-api/codex/responses", &body_bytes);
+        assert!(is_subagent);
+        let parsed: Value = serde_json::from_slice(&routed_body).unwrap();
+
+        // additional_tools stripped from input
+        let input_arr = parsed["input"].as_array().unwrap();
+        assert_eq!(input_arr.len(), 1);
+        assert_eq!(input_arr[0]["role"], "user");
+
+        // tools array contains only function tools (exec_command and function apply_patch)
+        let tools_arr = parsed["tools"].as_array().unwrap();
+        assert_eq!(tools_arr.len(), 2);
+        assert_eq!(tools_arr[0]["name"], "exec_command");
+        assert_eq!(tools_arr[1]["name"], "apply_patch");
+        assert_eq!(tools_arr[1]["type"], "function");
+    }
+
+    #[test]
+    fn test_inject_subagent_models_metadata() {
+        let upstream_models = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-6-luna",
+                    "display_name": "GPT-6 Luna",
+                    "context_window": 400000,
+                    "apply_patch_tool_type": "freeform",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "experimental_supported_tools": ["code_mode"]
+                }
+            ]
+        });
+        let raw = serde_json::to_vec(&upstream_models).unwrap();
+        let enriched = inject_subagent_models_metadata(&raw);
+        let parsed: Value = serde_json::from_slice(&enriched).unwrap();
+        let arr = parsed["models"].as_array().unwrap();
+
+        let subagent_entry = arr
+            .iter()
+            .find(|m| m["slug"] == "9router-subagent")
+            .expect("9router-subagent should be injected into models list");
+        assert_eq!(subagent_entry["context_window"], 200000);
+        assert_eq!(subagent_entry["apply_patch_tool_type"], "function");
+        assert_eq!(
+            subagent_entry["experimental_supported_tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_sanitize_backend_origin_rewrites_loopback_to_chatgpt() {
+        let mut account_read_result = serde_json::json!({
+            "account": {
+                "type": "chatgpt",
+                "planType": "plus"
+            },
+            "workspaceRouting": {
+                "chatgptAccountId": "123",
+                "backendOrigin": "https://127.0.0.1:20129",
+                "accountRoutingOverride": "NO_CONSTRAINT"
+            }
+        });
+        let modded = sanitize_rate_limits(&mut account_read_result);
+        assert!(modded);
+        assert_eq!(
+            account_read_result["workspaceRouting"]["backendOrigin"],
+            "https://chatgpt.com"
+        );
+    }
+
+    #[test]
+    fn test_route_worker_role() {
         let mut params = serde_json::Map::new();
         params.insert("agentRole".to_string(), Value::String("worker".to_string()));
         let modded = route_thread_params(&mut params);
@@ -1597,7 +2143,7 @@ default_subagent_model = "9router-subagent"
     }
 
     #[test]
-    fn test_route_explorer_role_defaults_to_explore() {
+    fn test_route_explorer_role() {
         let mut params = serde_json::Map::new();
         params.insert("role".to_string(), Value::String("explorer".to_string()));
         let modded = route_thread_params(&mut params);
@@ -1791,7 +2337,7 @@ default_subagent_model = "9router-subagent"
     }
 
     #[test]
-    fn test_inspect_and_route_worker_role_rewrites_to_implement() {
+    fn test_inspect_and_route_worker_role_rewrites_model() {
         let body = serde_json::json!({
             "model": "gpt-6-luna",
             "agent_role": "worker",
@@ -1808,7 +2354,7 @@ default_subagent_model = "9router-subagent"
     }
 
     #[test]
-    fn test_inspect_and_route_explorer_role_rewrites_to_explore() {
+    fn test_inspect_and_route_explorer_role_rewrites_model() {
         let body = serde_json::json!({
             "model": "gpt-6-luna",
             "role": "explorer",
@@ -1825,7 +2371,7 @@ default_subagent_model = "9router-subagent"
     }
 
     #[test]
-    fn test_inspect_and_route_reviewer_role_rewrites_to_review() {
+    fn test_inspect_and_route_reviewer_role_rewrites_model() {
         let body = serde_json::json!({
             "agentRole": "reviewer",
             "messages": [{"role": "user", "content": "Review diff"}]

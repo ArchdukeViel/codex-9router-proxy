@@ -35,16 +35,15 @@ When using the official OpenAI Codex Desktop App signed into a personal or Pro C
 ┌─────────────────────────────────────────────────────────────────┐
 │                    codex-9router-proxy.exe                      │
 │   [Layer 1: JSON-RPC IPC Interception]                          │
-│   - Detects subagents (role = worker/explorer, nickname, etc.)  │
-│   - Multi-tier dynamic model resolution:                        │
-│       * worker   -> implement                                   │
-│       * explorer -> explore                                     │
-│       * reviewer -> review                                      │
-│       * default  -> 9router-subagent                            │
+│   - Detects subagents (agent_role, subagent_source, nickname)   │
+│   - Multi-tier dynamic model resolution (default: 9router-subagent)│
+│   - Rewrites workspaceRouting.backendOrigin -> https://chatgpt.com│
+│     so Electron Usage & Billing UI and Plus badge work natively │
 │   [Layer 2: Embedded HTTPS/HTTP2 Reverse Proxy (:20129)]        │
 │   - Auto-generates self-signed TLS cert (CODEX_CA_CERTIFICATE)  │
 │   - Rejects wss:// upgrades with HTTP 426 (0ms HTTPS fallback)  │
-│   - Decompresses zstd request payloads from codex.orig.exe      │
+│   - Injects subagent model metadata into GET /backend-api/models│
+│   - Sanitizes namespace/custom tools for 9Router compatibility  │
 │   - Subagent responses -> 9Router (127.0.0.1:20128/v1/responses)│
 │   - Parent turns -> ChatGPT Upstream (https://chatgpt.com)      │
 └───────────────────────────────┬─────────────────────────────────┘
@@ -64,6 +63,22 @@ When using the official OpenAI Codex Desktop App signed into a personal or Pro C
 │   ⚡ Live streaming thoughts, tool calls, and file diffs        │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 🖥️ Tested Environment & Version Compatibility Matrix
+
+`codex-9router-proxy` `v0.2.3` is developed and verified against the following environment:
+
+| Component | Verified Version | Notes |
+| :--- | :--- | :--- |
+| **Operating System** | **Windows 11 Pro** (`10.0.26200` / Build `26200`) | Compatible with Windows 10 & Windows 11 (`x86_64`) |
+| **OpenAI Codex Desktop App** | **`26.924.1866.0`** ([Microsoft Store `OpenAI.Codex`](https://apps.microsoft.com/detail/9mz1741s0917)) | Auto-heals across Microsoft Store app updates |
+| **OpenAI Codex CLI Engine** | **`codex-cli 0.158.0-alpha.2`** | Bundled Desktop engine & standalone CLI (`app-server` & `exec`) |
+| **Primary ChatGPT Session** | **`gpt-6-luna`** (ChatGPT Plus / Pro Account) | Direct pass-through to `https://chatgpt.com` |
+| **9Router** | **`0.5.91`** (`npm i -g 9router@latest`) | Default subagent endpoint (`http://localhost:20128/v1`) |
+| **PowerShell** | **PowerShell `7.6.6`** & **Windows PowerShell `5.1`** | Both `pwsh.exe` and built-in `powershell.exe` supported |
+| **Rust Toolchain** *(Optional)* | **`rustc 1.98.1`** | **Not required** when installing from the prebuilt Release `.zip` |
 
 ---
 
@@ -157,22 +172,22 @@ You can assign different models to each subagent role:
 The installer individually prompts for each role model:
 ```text
 [?] Enter Default Subagent Model [default: 9router-subagent]: 9router-subagent
-[?] Enter Worker Subagent Model [default: 9router-subagent]: implement
-[?] Enter Explorer Subagent Model [default: 9router-subagent]: explore
-[?] Enter Reviewer Subagent Model [default: 9router-subagent]: review
+[?] Enter Worker Subagent Model [default: 9router-subagent]: 9router-subagent
+[?] Enter Explorer Subagent Model [default: 9router-subagent]: 9router-subagent
+[?] Enter Reviewer Subagent Model [default: 9router-subagent]: 9router-subagent
 ```
 
 Or pass flags directly:
 ```powershell
 .\install.ps1 -Provider "9router" `
   -DefaultModel "9router-subagent" `
-  -WorkerModel "implement" `
-  -ExplorerModel "explore" `
-  -ReviewerModel "review"
+  -WorkerModel "9router-subagent" `
+  -ExplorerModel "9router-subagent" `
+  -ReviewerModel "9router-subagent"
 ```
 
 ### Option B: On the Fly in `~/.codex/config.toml` (No Reinstall Required!)
-The proxy dynamically reads `[subagent_models]` from `~/.codex/config.toml` on every turn:
+The proxy dynamically reads `~/.codex/agents/*.toml` (or `[subagent_models]`) on every turn:
 ```toml
 [subagent_models]
 default = "9router-subagent"
@@ -189,21 +204,65 @@ $env:CODEX_EXPLORER_MODEL = "ag/gemini-3.8-flash-high"
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Easy Step-by-Step Installation Guide (No Coding Required!)
 
-### 1. Prerequisites
-- Windows 10/11
-- [Rust & Cargo](https://rustup.rs/) (to compile from source, or download prebuilt release)
-- 9Router, Ollama, LM Studio, or any OpenAI-compatible LLM endpoint
-- Official [OpenAI Codex Desktop App](https://apps.microsoft.com/detail/9mz1741s0917) (Microsoft Store) or CLI
+You do **not** need to know how to code or install Rust to use `codex-9router-proxy`.
 
-### 2. Interactive Installation
-Run `install.ps1` in PowerShell:
+### Before You Begin (What You Need)
+1. **Windows 10 or Windows 11** (64-bit).
+2. The official **[OpenAI Codex Desktop App](https://apps.microsoft.com/detail/9mz1741s0917)** installed from the Microsoft Store and signed into your ChatGPT account.
+3. **9Router** running locally on your PC (or another local/remote provider such as Ollama, LM Studio, or OpenRouter).
+   - *If you use 9Router, make sure you have created a model/combo named **`9router-subagent`** (or your preferred model name) in your 9Router dashboard (`http://localhost:20128`).*
+
+---
+
+### Method 1: 1-Line PowerShell Quick Install (Easiest)
+1. Press the **Windows Key**, type **`PowerShell`**, and click **Open**.
+2. Copy and paste the following command into the PowerShell window and press **Enter**:
 
 ```powershell
-.\install.ps1
+$zip = "$env:TEMP\codex-9router-proxy.zip"; $dir = "$env:TEMP\codex-9router-proxy"; Invoke-RestMethod "https://github.com/ArchdukeViel/codex-9router-proxy/releases/latest/download/codex-9router-proxy-windows-amd64.zip" -OutFile $zip; Expand-Archive $zip -DestinationPath $dir -Force; powershell -ExecutionPolicy Bypass -File "$dir\install.ps1"
 ```
 
+3. Press **Enter** at each prompt to accept the default settings (or type your API key when asked).
+
+---
+
+### Method 2: Download the `.zip` File (3 Simple Steps — No Rust Needed)
+
+#### Step 1: Download & Extract
+1. Go to the **[Releases Page](https://github.com/ArchdukeViel/codex-9router-proxy/releases/latest)**.
+2. Click on **`codex-9router-proxy-windows-amd64.zip`** to download it.
+3. Open your **Downloads** folder, **right-click** `codex-9router-proxy-windows-amd64.zip`, and click **Extract All...** $\rightarrow$ **Extract**.
+
+#### Step 2: Open PowerShell in the Extracted Folder
+1. Open the extracted `codex-9router-proxy-windows-amd64` folder (you will see `codex-9router-proxy.exe` and `install.ps1` inside).
+2. **Right-click** on an empty space inside that folder and select **Open in Terminal** (or click the folder address bar at the top, type `powershell`, and press **Enter**).
+
+#### Step 3: Run the Installer
+1. Copy and paste this command into the window and press **Enter**:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\install.ps1
+   ```
+2. The installer will ask a few simple questions. **You can just press `Enter` on every question to use the recommended defaults**:
+   - **Model Provider name**: Press **Enter** (uses `9router`).
+   - **API Endpoint / Base URL**: Press **Enter** (uses `http://localhost:20128/v1`).
+   - **API Key**: Paste your 9Router API key if you use one, or press **Enter** to keep your existing key.
+   - **Default / Worker / Explorer / Reviewer Subagent Model**: Press **Enter** on each (uses `9router-subagent`).
+3. Close and reopen the **Codex Desktop App** — you're done!
+
+---
+
+### Method 3: Build from Source (For Developers)
+If you have [Git](https://git-scm.com/) and [Rust (`cargo`)](https://rustup.rs/) installed and prefer compiling from source:
+
+```powershell
+git clone https://github.com/ArchdukeViel/codex-9router-proxy.git
+cd codex-9router-proxy
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Sample installer output:
 ```text
 ===================================================================
          Codex 9Router Proxy - Native GUI Subagents Installer      
@@ -256,10 +315,15 @@ Output:
            Codex 9Router Proxy - Diagnostics Doctor 🩺             
 ===================================================================
 
-[OK] Running executable : C:\Users\user\codex-9router-proxy\target\release\codex-9router-proxy.exe
-[OK] Official engine    : C:\Users\user\AppData\Local\OpenAI\Codex\bin\<bin-hash>\codex.orig.exe (321969456 bytes)
+[OK] Running executable : C:\Users\user\codex-9router-proxy\codex-9router-proxy.exe
+[OK] Official engine    : C:\Users\user\AppData\Local\OpenAI\Codex\custom\codex-9router-subagents.orig.exe (321969456 bytes)
 [OK] Subagent Provider  : 9router
 [OK] Provider API Key   : [CONFIGURED / MASKED]
+[OK] Loopback TLS Cert  : Ready (C:\Users\user\AppData\Local\OpenAI\Codex\custom\bridge-cert.pem)
+[OK] Reverse Proxy Port : 127.0.0.1:20129 (Port active / in use)
+     - Loopback URL     : https://127.0.0.1:20129/backend-api/
+     - Subagent Route   : Strict -> http://localhost:20128/v1/responses
+     - Parent Route     : Upstream -> https://chatgpt.com/backend-api/
 [OK] Codex Config TOML  : C:\Users\user\.codex\config.toml
      - Default Model    : 9router-subagent
      - Worker Model     : 9router-subagent
@@ -272,7 +336,7 @@ Output:
      - reviewer TOML   : Found
 [OK] Endpoint socket reachable : localhost:20128 (127.0.0.1:20128)
 
-===================================================================
+==================================================================
 Diagnostics complete. All checks finished.
 ===================================================================
 ```
@@ -316,6 +380,16 @@ codex --version
    - The purple diamond banner: **`◆ Subagent started working`** appears in the conversation.
    - A clickable child session thread appears in the left sidebar.
    - Click into the thread to watch live streaming thoughts, tool calls, and diffs!
+
+---
+
+## 📦 What's New in `v0.2.3`
+
+- **Main Agent Tool Preservation (`functions` & `collaboration`)**: Excluded message-level roles (`developer`, `user`, `assistant`, `system`, `tool`, `function`) and stopped recursing into `"input"` / `"messages"` / `"tools"` during role detection so Main Agent (`gpt-6-luna`) turns carrying `"type": "additional_tools"` are never misclassified as subagents.
+- **Subagent Tool Sanitization (`9Router` Compatibility)**: Strips unsupported `"type": "additional_tools"` input items and `"type": "namespace"` / `"type": "web_search"` / `"type": "custom"` (`Freeform`) tool definitions before forwarding subagent turns to 9Router.
+- **Automatic Model Metadata Injection (`GET /backend-api/models`)**: Injects model metadata descriptors for `9router-subagent` (and configured role models) with a `200,000` token context window and `apply_patch_tool_type = "function"`, eliminating `Model metadata for ... not found` warnings and `apply_patch` payload mismatches.
+- **Desktop Usage & Billing UI + `Plus` Badge**: Rewrites `workspaceRouting.backendOrigin` in `account/read` JSON-RPC responses from `https://127.0.0.1:20129` back to `https://chatgpt.com` so the Electron Desktop App's `AuthService` (`electron.net.fetch`) loads `/wham/usage` and subscription details directly from `https://chatgpt.com`.
+- **Safe Windows Runtime Helper Sync**: Separates `OpenAI\Codex\bin\<hash>` helpers from `rg.exe` so Electron's ripgrep hash cleanup (`Tn`) never purges `codex-code-mode-host.exe`.
 
 ---
 

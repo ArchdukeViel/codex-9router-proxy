@@ -58,7 +58,9 @@ param(
 $ErrorActionPreference = "Stop"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$releaseBinary = Join-Path $scriptDir "target\release\codex-9router-proxy.exe"
+$targetBinary = Join-Path $scriptDir "target\release\codex-9router-proxy.exe"
+$bundledBinary = Join-Path $scriptDir "codex-9router-proxy.exe"
+$releaseBinary = if (Test-Path $targetBinary) { $targetBinary } elseif (Test-Path $bundledBinary) { $bundledBinary } else { $targetBinary }
 
 # If -Doctor requested, run diagnostic check immediately
 if ($Doctor) {
@@ -69,7 +71,7 @@ if ($Doctor) {
         if (Test-Path $customShim) {
             & $customShim --doctor
         } else {
-            Write-Error "No compiled codex-9router-proxy binary found. Run .\install.ps1 first to build and install."
+            Write-Error "No compiled codex-9router-proxy binary found. Run .\install.ps1 first to install."
         }
     }
     return
@@ -87,9 +89,9 @@ if ($Preset) {
             if (-not $Provider) { $Provider = "9router" }
             if (-not $Endpoint) { $Endpoint = "http://localhost:20128/v1" }
             if (-not $DefaultModel) { $DefaultModel = "9router-subagent" }
-            if (-not $WorkerModel) { $WorkerModel = "implement" }
-            if (-not $ExplorerModel) { $ExplorerModel = "explore" }
-            if (-not $ReviewerModel) { $ReviewerModel = "review" }
+            if (-not $WorkerModel) { $WorkerModel = $DefaultModel }
+            if (-not $ExplorerModel) { $ExplorerModel = $DefaultModel }
+            if (-not $ReviewerModel) { $ReviewerModel = $DefaultModel }
         }
         "ollama" {
             if (-not $Provider) { $Provider = "ollama" }
@@ -173,19 +175,19 @@ if (-not $NonInteractive) {
     }
 
     if (-not $WorkerModel) {
-        $defaultWorker = if ($Provider -eq "9router") { "implement" } else { $DefaultModel }
+        $defaultWorker = $DefaultModel
         $wmInput = Read-Host "[?] Enter Worker Subagent Model [default: $defaultWorker]"
         $WorkerModel = if ([string]::IsNullOrWhiteSpace($wmInput)) { $defaultWorker } else { $wmInput.Trim() }
     }
 
     if (-not $ExplorerModel) {
-        $defaultExplorer = if ($Provider -eq "9router") { "explore" } else { $DefaultModel }
+        $defaultExplorer = $DefaultModel
         $emInput = Read-Host "[?] Enter Explorer Subagent Model [default: $defaultExplorer]"
         $ExplorerModel = if ([string]::IsNullOrWhiteSpace($emInput)) { $defaultExplorer } else { $emInput.Trim() }
     }
 
     if (-not $ReviewerModel) {
-        $defaultReviewer = if ($Provider -eq "9router") { "review" } else { $DefaultModel }
+        $defaultReviewer = $DefaultModel
         $rmInput = Read-Host "[?] Enter Reviewer Subagent Model [default: $defaultReviewer]"
         $ReviewerModel = if ([string]::IsNullOrWhiteSpace($rmInput)) { $defaultReviewer } else { $rmInput.Trim() }
     }
@@ -196,9 +198,9 @@ if (-not $NonInteractive) {
         $ApiKey = [System.Environment]::GetEnvironmentVariable("NINEROUTER_KEY", "User")
     }
     if (-not $DefaultModel) { $DefaultModel = "9router-subagent" }
-    if (-not $WorkerModel) { $WorkerModel = if ($Provider -eq "9router") { "implement" } else { $DefaultModel } }
-    if (-not $ExplorerModel) { $ExplorerModel = if ($Provider -eq "9router") { "explore" } else { $DefaultModel } }
-    if (-not $ReviewerModel) { $ReviewerModel = if ($Provider -eq "9router") { "review" } else { $DefaultModel } }
+    if (-not $WorkerModel) { $WorkerModel = $DefaultModel }
+    if (-not $ExplorerModel) { $ExplorerModel = $DefaultModel }
+    if (-not $ReviewerModel) { $ReviewerModel = $DefaultModel }
 }
 
 $Endpoint = $Endpoint.TrimEnd('/')
@@ -284,6 +286,12 @@ if ($configContent -match "(?m)^\[agents\]") {
 $patternSubModels = "(?ms)\r?\n?\[subagent_models\].*?(?=\r?\n\[|\z)"
 if ($configContent -match $patternSubModels) {
     $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternSubModels, "")
+}
+
+# Remove legacy [mcp_servers.subagent_9router] section if present (superseded by native GUI subagents via collaboration.spawn_agent)
+$patternMcpSubagent = "(?ms)\r?\n?\[mcp_servers\.subagent_9router\].*?(?=\r?\n\[|\z)"
+if ($configContent -match $patternMcpSubagent) {
+    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternMcpSubagent, "")
 }
 
 # Link Role Manifests in config.toml
@@ -381,16 +389,29 @@ except Exception as e:
     Write-Host "[i] Python not detected; SQLite trigger injection skipped (handled by proxy layer)." -ForegroundColor Gray
 }
 
-# 5. Build Release Binary
-Write-Host "[*] Compiling release binary with cargo..." -ForegroundColor Yellow
-Push-Location $scriptDir
-try {
-    & cargo build --release
-    if ($LASTEXITCODE -ne 0) {
-        throw "Cargo build failed with exit code $LASTEXITCODE"
+# 5. Locate Prebuilt Release Binary or Compile from Source
+$cargoToml = Join-Path $scriptDir "Cargo.toml"
+$hasCargo = [bool](Get-Command cargo -ErrorAction SilentlyContinue)
+if ((Test-Path $cargoToml) -and $hasCargo) {
+    Write-Host "[*] Compiling release binary with cargo..." -ForegroundColor Yellow
+    Push-Location $scriptDir
+    try {
+        & cargo build --release
+        if ($LASTEXITCODE -ne 0) {
+            throw "Cargo build failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        Pop-Location
     }
-} finally {
-    Pop-Location
+    $releaseBinary = $targetBinary
+} elseif (Test-Path $bundledBinary) {
+    $releaseBinary = $bundledBinary
+    Write-Host "[OK] Found prebuilt release binary ($bundledBinary)." -ForegroundColor Green
+} elseif (Test-Path $targetBinary) {
+    $releaseBinary = $targetBinary
+    Write-Host "[OK] Found compiled release binary ($targetBinary)." -ForegroundColor Green
+} else {
+    throw "No prebuilt codex-9router-proxy.exe found in $scriptDir, and Rust/Cargo is not installed to build from source."
 }
 
 if (-not (Test-Path $releaseBinary)) {
@@ -456,7 +477,16 @@ if ($storePkg -and $storePkg.InstallLocation) {
         $storeResDir = $candidateRes
     }
 }
-$companionHelpers = @(
+# IMPORTANT: Do NOT include rg.exe in $binHelpers for OpenAI\Codex\bin\<hash>!
+# Electron's ripgrep relocation (an -> Tn) deletes any 16-hex-char directory under OpenAI\Codex\bin
+# whose name != rg's hash if that directory contains rg.exe.
+$binHelpers = @(
+    "codex-code-mode-host.exe",
+    "codex-command-runner.exe",
+    "codex-windows-sandbox-service.exe",
+    "codex-windows-sandbox-setup.exe"
+)
+$customHelpers = @(
     "codex-code-mode-host.exe",
     "codex-command-runner.exe",
     "codex-windows-sandbox-service.exe",
@@ -468,6 +498,44 @@ $companionHelpers = @(
 $localAppData = $env:LOCALAPPDATA
 $desktopBinRoot = Join-Path $localAppData "OpenAI\Codex\bin"
 $hookedCount = 0
+
+if ($storeResDir) {
+    $hashTargets = @(
+        "codex.exe",
+        "codex-code-mode-host.exe",
+        "codex-windows-sandbox-setup.exe",
+        "codex-command-runner.exe"
+    )
+    $allPresent = $true
+    foreach ($ht in $hashTargets) {
+        if (-not (Test-Path (Join-Path $storeResDir $ht))) {
+            $allPresent = $false
+            break
+        }
+    }
+    if ($allPresent) {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $combinedStream = New-Object System.IO.MemoryStream
+        foreach ($ht in $hashTargets) {
+            $fileBytes = [System.IO.File]::ReadAllBytes((Join-Path $storeResDir $ht))
+            $fileDigest = ($sha256.ComputeHash($fileBytes) | ForEach-Object { $_.ToString("x2") }) -join ""
+            $nameBytes = [System.Text.Encoding]::UTF8.GetBytes("$ht`0$fileDigest`0")
+            $combinedStream.Write($nameBytes, 0, $nameBytes.Length)
+        }
+        $combinedHash = (($sha256.ComputeHash($combinedStream.ToArray()) | ForEach-Object { $_.ToString("x2") }) -join "").Substring(0, 16)
+        $combinedStream.Dispose()
+        $sha256.Dispose()
+
+        $defaultBinHashDir = Join-Path $desktopBinRoot $combinedHash
+        if (-not (Test-Path $defaultBinHashDir)) {
+            New-Item -ItemType Directory -Path $defaultBinHashDir -Force | Out-Null
+            $storeCodex = Join-Path $storeResDir "codex.exe"
+            if (Test-Path $storeCodex) {
+                Copy-Item -Path $storeCodex -Destination (Join-Path $defaultBinHashDir "codex.orig.exe") -Force
+            }
+        }
+    }
+}
 
 if (Test-Path $desktopBinRoot) {
     Get-ChildItem -Path $desktopBinRoot -Directory | ForEach-Object {
@@ -487,8 +555,13 @@ if (Test-Path $desktopBinRoot) {
                 Write-Host "[OK] Installed proxy hook to $codexExe" -ForegroundColor Green
                 $hookedCount++
             }
+            # Remove any accidental rg.exe in a codex.exe hash directory so Electron's Tn() never purges it
+            $strayRg = Join-Path $targetDir "rg.exe"
+            if (Test-Path $strayRg) {
+                Remove-Item -Path $strayRg -Force -ErrorAction SilentlyContinue
+            }
             if ($storeResDir) {
-                foreach ($helper in $companionHelpers) {
+                foreach ($helper in $binHelpers) {
                     $hSrc = Join-Path $storeResDir $helper
                     $hDst = Join-Path $targetDir $helper
                     if ((Test-Path $hSrc) -and -not (Test-Path $hDst)) {
@@ -534,13 +607,29 @@ if (Safe-CopyExecutable -Source $releaseBinary -Destination $customShim) {
     Write-Host "[OK] Deployed standalone shim to $customShim" -ForegroundColor Green
 }
 if ($storeResDir) {
-    foreach ($helper in $companionHelpers) {
+    $storeCodex = Join-Path $storeResDir "codex.exe"
+    if (Test-Path $storeCodex) {
+        foreach ($origName in @("codex-9router-subagents.orig.exe", "codex.orig.exe")) {
+            $origDst = Join-Path $customDir $origName
+            if (-not (Test-Path $origDst)) {
+                Copy-Item -Path $storeCodex -Destination $origDst -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    foreach ($helper in $customHelpers) {
         $hSrc = Join-Path $storeResDir $helper
         $hDst = Join-Path $customDir $helper
         if ((Test-Path $hSrc) -and -not (Test-Path $hDst)) {
             Copy-Item -Path $hSrc -Destination $hDst -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+# Clear stale ~/.codex/models_cache.json so codex.orig.exe refreshes /backend-api/models with injected 9router-subagent metadata
+$modelsCache = Join-Path $codexDir "models_cache.json"
+if (Test-Path $modelsCache) {
+    Remove-Item -Path $modelsCache -Force -ErrorAction SilentlyContinue
+    Write-Host "[OK] Cleared stale $modelsCache so subagent model metadata refreshes immediately." -ForegroundColor Green
 }
 
 # 10. Register Self-Healing Startup Hook
@@ -551,7 +640,7 @@ $syncScript = @"
 `$binRoot = Join-Path `$env:LOCALAPPDATA 'OpenAI\Codex\bin'
 `$pkg = Get-AppxPackage -Name '*OpenAI.Codex*' | Sort-Object Version -Descending | Select-Object -First 1
 `$resDir = if (`$pkg) { Join-Path `$pkg.InstallLocation 'app\resources' } else { `$null }
-`$helpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe', 'rg.exe')
+`$helpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe')
 if (Test-Path `$binRoot -and Test-Path `$proxyPath) {
     Get-ChildItem -Path `$binRoot -Directory | ForEach-Object {
         `$c = Join-Path `$_.FullName 'codex.exe'
@@ -582,7 +671,20 @@ $cmdContent = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -W
 [System.IO.File]::WriteAllText($startupCmd, $cmdContent, [System.Text.Encoding]::ASCII)
 Write-Host "[OK] Registered self-healing startup hook in $startupCmd." -ForegroundColor Green
 
-# 11. Restart Daemon if available
+# 11. Terminate any stale .old.* processes that respawned during copy and clean up .old.* files
+Get-NetTCPConnection -LocalPort 20129 -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
+    $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+    if ($p -and $p.Name -like "*.old.*") {
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*.old.*" } | ForEach-Object {
+    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+}
+Start-Sleep -Milliseconds 500
+Get-ChildItem "$desktopBinRoot\*\*.old.*", "$customDir\*.old.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+
+# 12. Restart Daemon if available
 Write-Host "[*] Restarting app-server daemon..." -ForegroundColor Gray
 try {
     Start-Process -FilePath $customShim -ArgumentList "app-server", "daemon", "restart" -WindowStyle Hidden
