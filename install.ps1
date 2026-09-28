@@ -935,6 +935,13 @@ if (-not (Get-Process -Name 'ChatGPT*')) {
         "`$env:LOCALAPPDATA\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Roaming\Codex\web\Codex\lockfile"
     ) | Where-Object { Test-Path `$_ } | Remove-Item -Force
 }
+
+if (Test-Path `$proxyPath) {
+    & `$proxyPath --doctor 2>&1 | Out-Null
+    if (-not (Get-NetTCPConnection -LocalPort 20129 -State Listen -ErrorAction SilentlyContinue)) {
+        Start-Process -FilePath `$proxyPath -ArgumentList "--proxy-daemon" -WindowStyle Hidden
+    }
+}
 "@
 [System.IO.File]::WriteAllText($syncScriptPath, $syncScript, $utf8NoBom)
 
@@ -955,11 +962,15 @@ Get-Process -Name "*.old*" -ErrorAction SilentlyContinue | Stop-Process -Force -
 Start-Sleep -Milliseconds 600
 Get-ChildItem "$desktopBinRoot\*\*.old.*", "$customDir\*.old.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-# 12. Restart Daemon if available
-Write-Host "[*] Restarting app-server daemon..." -ForegroundColor Gray
+# 12. Ensure background reverse-proxy listener (:20129) and app-server daemon are running
+Write-Host "[*] Ensuring reverse proxy listener on 127.0.0.1:20129..." -ForegroundColor Gray
 try {
+    if (-not (Get-NetTCPConnection -LocalPort 20129 -State Listen -ErrorAction SilentlyContinue)) {
+        Start-Process -FilePath $customShim -ArgumentList "--proxy-daemon" -WindowStyle Hidden
+        Start-Sleep -Milliseconds 500
+    }
     Start-Process -FilePath $customShim -ArgumentList "app-server", "daemon", "restart" -WindowStyle Hidden
-    Write-Host "[OK] Codex daemon restart dispatched successfully." -ForegroundColor Green
+    Write-Host "[OK] Codex reverse-proxy listener and daemon restart dispatched successfully." -ForegroundColor Green
 } catch {
     Write-Host "[i] Daemon restart skipped (will initialize on next Codex launch)." -ForegroundColor Gray
 }

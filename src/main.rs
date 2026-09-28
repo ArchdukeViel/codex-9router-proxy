@@ -830,12 +830,16 @@ pub fn is_responses_path(path: &str) -> bool {
         || clean_path.ends_with("/responses")
 }
 
-/// Check if a request path is the models catalog endpoint (`GET /backend-api/models`).
+/// Check if a request path is the models catalog endpoint (`GET /backend-api/codex/models` or `GET /backend-api/models`).
 pub fn is_models_path(path: &str) -> bool {
     let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
-    clean_path == "/backend-api/models"
+    clean_path == "/backend-api/codex/models"
+        || clean_path == "/backend-api/models"
+        || clean_path == "/codex/models"
         || clean_path == "/models"
+        || clean_path.ends_with("/codex/models")
         || clean_path.ends_with("/backend-api/models")
+        || clean_path.ends_with("/models")
 }
 
 /// Retrieve the configured loopback proxy port (default: 20129).
@@ -928,25 +932,39 @@ fn extract_compaction_item_text(item_obj: &serde_json::Map<String, Value>) -> St
             _ => {}
         }
     }
+    if let Some(content_val) = item_obj.get("content") {
+        if let Some(text) = extract_text_from_content_value(content_val) {
+            return text;
+        }
+    }
+    if let Some(text) = item_obj.get("text").and_then(|v| v.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
     String::new()
 }
 
 /// Sanitize incompatible OpenAI tool schemas (`"type": "namespace"`, `"type": "web_search"`,
-/// `"type": "custom"` for `apply_patch`, and `"type": "additional_tools"` in `"input"`),
-/// rehydrate `"type": "compaction"` items into standard `"type": "message"` (`"role": "user"`)
-/// items, and normalize Multi-Agents V2 `"type": "agent_message"` items and `"role": "developer"`
-/// messages before forwarding a subagent request to 9Router.
+/// `"type": "custom"` for `apply_patch`, and `"type": "additional_tools"` / `"compaction_trigger"` /
+/// `"configuration_update"` in `"input"`), rehydrate `"type": "compaction"` / `"context_compaction"`
+/// items into standard `"type": "message"` (`"role": "user"`) items, convert forked
+/// `"custom_tool_call"` / `"custom_tool_call_output"` / `"tool_search_call"` / `"tool_search_output"`
+/// items into standard `"type": "message"` items, and normalize Multi-Agents V2 `"type": "agent_message"`
+/// items and `"role": "developer"` messages before forwarding a subagent request to 9Router.
 pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
     let Some(obj) = json.as_object_mut() else {
         return;
     };
 
     // 1. In "input":
-    //    - Strip any "type": "additional_tools" items so 9Router never turns code_mode
-    //      namespaces ("functions", "collaboration") into dummy {reason: string} tools.
-    //    - Rehydrate any "type": "compaction" items into standard "type": "message"
-    //      ("role": "user") items with "[Compacted Conversation Summary]\n<encrypted_content>",
-    //      stripping "encrypted_content" and "summary".
+    //    - Strip internal marker items ("additional_tools", "compaction_trigger", "configuration_update").
+    //    - Rehydrate any "type": "compaction" / "compaction_summary" / "context_compaction" items into
+    //      standard "type": "message" ("role": "user") items with "[Compacted Conversation Summary]\n<text>".
+    //    - Convert forked "custom_tool_call" / "custom_tool_call_output" / "tool_search_call" /
+    //      "tool_search_output" items into standard "type": "message" items so 9Router never fails on
+    //      parent gpt-6-luna freeform/code_mode history items.
     //    - Normalize Multi-Agents V2 "type": "agent_message" items into standard
     //      "type": "message" with "role": "user" (stripping V2-only metadata fields
     //      such as "author", "recipient", and "internal_chat_message_metadata_passthrough").
@@ -954,20 +972,27 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
     //      downstream translators (Gemini / Claude / OpenAI) preserve developer prompts.
     if let Some(input_arr) = obj.get_mut("input").and_then(|v| v.as_array_mut()) {
         input_arr.retain(|item| {
-            item.get("type").and_then(|t| t.as_str()) != Some("additional_tools")
+            let Some(t) = item.get("type").and_then(|t| t.as_str()) else {
+                return true;
+            };
+            !t.eq_ignore_ascii_case("additional_tools")
+                && !t.eq_ignore_ascii_case("compaction_trigger")
+                && !t.eq_ignore_ascii_case("configuration_update")
         });
         for item in input_arr.iter_mut() {
             let Some(item_obj) = item.as_object_mut() else {
                 continue;
             };
-            let is_compaction = item_obj
+            let item_type = item_obj
                 .get("type")
                 .and_then(|t| t.as_str())
-                .is_some_and(|t| {
-                    t.eq_ignore_ascii_case("compaction")
-                        || t.eq_ignore_ascii_case("compaction_summary")
-                });
-            if is_compaction {
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            if matches!(
+                item_type.as_str(),
+                "compaction" | "compaction_summary" | "context_compaction"
+            ) {
                 let raw_summary = extract_compaction_item_text(item_obj);
                 let summary_text = if raw_summary.is_empty() {
                     "[Compacted Conversation Summary]".to_string()
@@ -976,6 +1001,7 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
                 } else {
                     format!("[Compacted Conversation Summary]\n{}", raw_summary)
                 };
+                item_obj.clear();
                 item_obj.insert("type".to_string(), Value::String("message".to_string()));
                 item_obj.insert("role".to_string(), Value::String("user".to_string()));
                 item_obj.insert(
@@ -987,17 +1013,93 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
                         }
                     ]),
                 );
-                item_obj.remove("encrypted_content");
-                item_obj.remove("summary");
-                item_obj.remove("internal_chat_message_metadata_passthrough");
                 continue;
             }
 
-            let is_agent_message = item_obj
-                .get("type")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t.eq_ignore_ascii_case("agent_message"));
-            if is_agent_message {
+            if item_type == "custom_tool_call" {
+                let name = item_obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("custom_tool")
+                    .to_string();
+                let call_input = item_obj
+                    .get("input")
+                    .or_else(|| item_obj.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let text = if call_input.trim().is_empty() {
+                    format!("[Tool Call: {}]", name)
+                } else {
+                    format!("[Tool Call: {}]\n{}", name, call_input)
+                };
+                item_obj.clear();
+                item_obj.insert("type".to_string(), Value::String("message".to_string()));
+                item_obj.insert("role".to_string(), Value::String("assistant".to_string()));
+                item_obj.insert(
+                    "content".to_string(),
+                    serde_json::json!([
+                        {
+                            "type": "output_text",
+                            "text": text
+                        }
+                    ]),
+                );
+                continue;
+            }
+
+            if item_type == "custom_tool_call_output" || item_type == "tool_search_output" {
+                let out_text = item_obj
+                    .get("output")
+                    .and_then(extract_text_from_content_value)
+                    .unwrap_or_default();
+                let text = if out_text.trim().is_empty() {
+                    "[Tool Output]".to_string()
+                } else {
+                    format!("[Tool Output]\n{}", out_text)
+                };
+                item_obj.clear();
+                item_obj.insert("type".to_string(), Value::String("message".to_string()));
+                item_obj.insert("role".to_string(), Value::String("user".to_string()));
+                item_obj.insert(
+                    "content".to_string(),
+                    serde_json::json!([
+                        {
+                            "type": "input_text",
+                            "text": text
+                        }
+                    ]),
+                );
+                continue;
+            }
+
+            if item_type == "tool_search_call" {
+                let query_text = item_obj
+                    .get("arguments")
+                    .or_else(|| item_obj.get("query"))
+                    .and_then(extract_text_from_content_value)
+                    .unwrap_or_default();
+                let text = if query_text.trim().is_empty() {
+                    "[Tool Search]".to_string()
+                } else {
+                    format!("[Tool Search]\n{}", query_text)
+                };
+                item_obj.clear();
+                item_obj.insert("type".to_string(), Value::String("message".to_string()));
+                item_obj.insert("role".to_string(), Value::String("assistant".to_string()));
+                item_obj.insert(
+                    "content".to_string(),
+                    serde_json::json!([
+                        {
+                            "type": "output_text",
+                            "text": text
+                        }
+                    ]),
+                );
+                continue;
+            }
+
+            if item_type == "agent_message" {
                 item_obj.insert("type".to_string(), Value::String("message".to_string()));
                 let normalized_role = match item_obj
                     .get("role")
@@ -1165,8 +1267,10 @@ fn apply_subagent_model_metadata_fields(
         "description".to_string(),
         Value::String("Subagent model routed via Codex 9Router Proxy".to_string()),
     );
+    entry_obj.insert("prefer_websockets".to_string(), Value::Bool(false));
     entry_obj.insert("context_window".to_string(), serde_json::json!(272000));
     entry_obj.insert("max_context_window".to_string(), serde_json::json!(872000));
+    entry_obj.insert("auto_compact_token_limit".to_string(), Value::Null);
     entry_obj.insert(
         "effective_context_window_percent".to_string(),
         serde_json::json!(95),
@@ -1182,12 +1286,43 @@ fn apply_subagent_model_metadata_fields(
     entry_obj.insert("visibility".to_string(), Value::String("list".to_string()));
     entry_obj.insert("supported_in_api".to_string(), Value::Bool(true));
     entry_obj.insert("supports_search_tool".to_string(), Value::Bool(false));
+    entry_obj.insert(
+        "supports_experimental_context".to_string(),
+        Value::Bool(false),
+    );
+    entry_obj.insert("use_responses_lite".to_string(), Value::Bool(true));
     entry_obj.remove("tool_mode");
     // Ensure code_mode is not forced on 9Router subagent models
     entry_obj.insert(
         "experimental_supported_tools".to_string(),
         serde_json::json!([]),
     );
+
+    // codex.orig.exe (model-provider/src/models_endpoint.rs) rejects any ModelInfo entry missing
+    // both `base_instructions` and `model_messages.instructions_template`.
+    let has_base_instructions = entry_obj
+        .get("base_instructions")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_instructions_template = entry_obj
+        .get("model_messages")
+        .and_then(|v| v.get("instructions_template"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty());
+    if !has_base_instructions && !has_instructions_template {
+        let default_instructions =
+            "You are Codex, an AI coding subagent. Complete your assigned task accurately and concisely.";
+        entry_obj.insert(
+            "base_instructions".to_string(),
+            Value::String(default_instructions.to_string()),
+        );
+        entry_obj.insert(
+            "model_messages".to_string(),
+            serde_json::json!({
+                "instructions_template": default_instructions
+            }),
+        );
+    }
 }
 
 /// Inject subagent model metadata descriptors (`9router-subagent`, `implement`, `explore`, `review`,
@@ -1268,8 +1403,10 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
                 "slug": slug,
                 "display_name": format!("{} (9Router)", slug),
                 "description": "Subagent model routed via Codex 9Router Proxy",
+                "prefer_websockets": false,
                 "context_window": 272000,
                 "max_context_window": 872000,
+                "auto_compact_token_limit": null,
                 "effective_context_window_percent": 95,
                 "comp_hash": "3000",
                 "max_output_tokens": 64000,
@@ -1277,16 +1414,24 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
                 "supported_reasoning_levels": [
                     {"effort": "low", "description": "Fast responses"},
                     {"effort": "medium", "description": "Balanced reasoning"},
-                    {"effort": "high", "description": "Deep reasoning"}
+                    {"effort": "high", "description": "Deep reasoning"},
+                    {"effort": "xhigh", "description": "Extra high reasoning depth"},
+                    {"effort": "max", "description": "Maximum reasoning depth"}
                 ],
                 "shell_type": "shell_command",
                 "visibility": "list",
                 "supported_in_api": true,
                 "priority": 99,
                 "apply_patch_tool_type": "function",
+                "truncation_policy": {
+                    "mode": "tokens",
+                    "limit": 10000
+                },
                 "supports_parallel_tool_calls": true,
                 "supports_reasoning_summaries": true,
                 "supports_search_tool": false,
+                "supports_experimental_context": false,
+                "use_responses_lite": true,
                 "experimental_supported_tools": [],
                 "input_modalities": ["text", "image"]
             })
@@ -1342,7 +1487,9 @@ pub fn is_compaction_request(body: &[u8]) -> bool {
 
 /// Transform a subagent `"generate": false` compaction request into a 9Router summarization request:
 /// - Ensures subagent model rewrite and input sanitization (`sanitize_subagent_request_for_9router`)
-/// - Removes `"generate"`, `"tools"`, `"tool_choice"`, and `"parallel_tool_calls"`
+/// - Removes `"generate"`, `"tools"`, `"tool_choice"`, `"parallel_tool_calls"`, `"include"`, and `"service_tier"`
+/// - Converts tool-call/output and reasoning history items in `"input"` into plain `"type": "message"` items
+///   so tool-less summarization requests are never rejected by downstream providers
 /// - Appends a summarization instruction user message to `"input"`
 pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
     let mut json = serde_json::from_slice::<Value>(body).ok()?;
@@ -1369,6 +1516,8 @@ pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
     obj.remove("tools");
     obj.remove("tool_choice");
     obj.remove("parallel_tool_calls");
+    obj.remove("include");
+    obj.remove("service_tier");
 
     let instruction_item = serde_json::json!({
         "type": "message",
@@ -1383,7 +1532,78 @@ pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
 
     match obj.get_mut("input") {
         Some(Value::Array(arr)) => {
-            arr.push(instruction_item);
+            let mut normalized_items = Vec::with_capacity(arr.len() + 1);
+            for item in arr.drain(..) {
+                let Some(mut item_obj) = item.as_object().cloned() else {
+                    normalized_items.push(item);
+                    continue;
+                };
+                let item_type = item_obj
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("message")
+                    .to_ascii_lowercase();
+                match item_type.as_str() {
+                    "function_call" | "local_shell_call" | "web_search_call" => {
+                        let name = item_obj
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(item_type.as_str())
+                            .to_string();
+                        let args = item_obj
+                            .get("arguments")
+                            .or_else(|| item_obj.get("input"))
+                            .and_then(extract_text_from_content_value)
+                            .unwrap_or_default();
+                        let text = if args.trim().is_empty() {
+                            format!("[Tool Call: {}]", name)
+                        } else {
+                            format!("[Tool Call: {}]\n{}", name, args)
+                        };
+                        normalized_items.push(serde_json::json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}]
+                        }));
+                    }
+                    "function_call_output" => {
+                        let out_text = item_obj
+                            .get("output")
+                            .and_then(extract_text_from_content_value)
+                            .unwrap_or_default();
+                        let text = if out_text.trim().is_empty() {
+                            "[Tool Output]".to_string()
+                        } else {
+                            format!("[Tool Output]\n{}", out_text)
+                        };
+                        normalized_items.push(serde_json::json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": text}]
+                        }));
+                    }
+                    "reasoning" => {
+                        if let Some(summary_val) = item_obj.get("summary") {
+                            if let Some(summary_text) = extract_text_from_content_value(summary_val)
+                            {
+                                if !summary_text.trim().is_empty() {
+                                    normalized_items.push(serde_json::json!({
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": summary_text}]
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        item_obj.remove("internal_chat_message_metadata_passthrough");
+                        normalized_items.push(Value::Object(item_obj));
+                    }
+                }
+            }
+            normalized_items.push(instruction_item);
+            *arr = normalized_items;
         }
         Some(Value::String(s)) => {
             let prev = s.clone();
@@ -3191,6 +3411,33 @@ pub fn inject_loopback_base_url(args: &[String], port: &str) -> Vec<String> {
     out
 }
 
+/// Determine whether CLI arguments represent a non-API / lightweight command (e.g. `--version`, `--help`, `login`, `logout`)
+/// that should not spawn the embedded reverse proxy or inject `-c chatgpt_base_url=...`.
+/// Interactive `codex` invocations (`args.is_empty()`) are NOT lightweight and MUST receive proxy injection.
+pub fn is_lightweight_cli_invocation(args: &[String]) -> bool {
+    if args.iter().any(|a| {
+        a == "--version" || a == "-V" || a == "--help" || a == "-h" || a == "help"
+    }) {
+        return true;
+    }
+    if let Some(first) = args.first().map(|s| s.as_str()) {
+        if matches!(
+            first,
+            "version" | "login" | "logout" | "completion" | "features"
+        ) {
+            return true;
+        }
+    }
+    if args.iter().any(|a| a == "daemon")
+        && args
+            .iter()
+            .any(|a| matches!(a.as_str(), "stop" | "status" | "version"))
+    {
+        return true;
+    }
+    false
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
 
@@ -3204,26 +3451,28 @@ fn main() -> io::Result<()> {
     }
 
     let _ = sync_codex_models_cache();
+
+    if args.iter().any(|a| a.eq_ignore_ascii_case("--proxy-daemon")) {
+        let port = get_proxy_port();
+        let bind_addr = format!("127.0.0.1:{}", port);
+        let _ = spawn_embedded_reverse_proxy(&bind_addr)?;
+        loop {
+            thread::park();
+        }
+    }
+
     let real_codex = find_real_codex();
+    let is_lightweight_command = is_lightweight_cli_invocation(&args);
 
-    let is_lightweight_command = args.is_empty()
-        || args.iter().any(|a| {
-            a == "--version"
-                || a == "-V"
-                || a == "version"
-                || a == "help"
-                || a == "-h"
-                || a == "--help"
-                || a == "daemon"
-                || a == "status"
-                || a == "stop"
-                || a == "restart"
-                || a == "start"
-                || a == "login"
-                || a == "logout"
-        });
-
-    let is_app_server = args.iter().any(|a| a == "app-server") && !is_lightweight_command;
+    let is_app_server_subcommand = args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "daemon" | "proxy" | "generate-ts" | "generate-json-schema"
+        )
+    });
+    let is_app_server = args.iter().any(|a| a == "app-server")
+        && !is_app_server_subcommand
+        && !is_lightweight_command;
 
     if !is_app_server {
         let mut forward_args = args.clone();
@@ -5064,5 +5313,254 @@ default_subagent_model = "9router-subagent"
         assert!(fb_text.contains("Audit repository security rules"));
         assert!(fb_text.contains("event: response.completed"));
     }
-}
 
+    #[tokio::test]
+    async fn test_is_models_path_and_proxy_handler_codex_models_injection() {
+        use axum::body::to_bytes;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::ServiceExt;
+
+        assert!(is_models_path(
+            "/backend-api/codex/models?client_version=0.158.0-alpha.2"
+        ));
+        assert!(is_models_path("/backend-api/codex/models"));
+        assert!(is_models_path("/codex/models"));
+        assert!(is_models_path("/backend-api/models"));
+        assert!(is_models_path("/models"));
+        assert!(!is_models_path("/backend-api/codex/responses"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                assert!(
+                    !req_str.contains("if-none-match"),
+                    "If-None-Match must be stripped on /backend-api/codex/models"
+                );
+                let body = r#"{"models":[]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let state = Arc::new(ProxyAppState {
+            http_client: build_upstream_http_client(),
+        });
+        let app = create_router(state);
+        let test_upstream = format!("http://{}/backend-api/codex/models?client_version=0.158.0-alpha.2", addr);
+
+        let req = axum::extract::Request::builder()
+            .uri("/backend-api/codex/models?client_version=0.158.0-alpha.2")
+            .method("GET")
+            .header("if-none-match", "\"v1\"")
+            .header("accept-encoding", "zstd, gzip")
+            .header("x-codex-test-upstream", &test_upstream)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::ETAG).is_none());
+
+        let resp_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&resp_bytes).unwrap();
+        let models = parsed["models"].as_array().unwrap();
+        for slug in ["9router-subagent", "explore", "review", "implement"] {
+            let entry = models
+                .iter()
+                .find(|m| m["slug"] == slug)
+                .unwrap_or_else(|| panic!("missing injected model {}", slug));
+            assert_eq!(entry["context_window"], 272000);
+            assert_eq!(entry["max_context_window"], 872000);
+            assert_eq!(entry["effective_context_window_percent"], 95);
+            assert_eq!(entry["comp_hash"], "3000");
+            assert_eq!(entry["prefer_websockets"], false);
+            assert_eq!(entry["use_responses_lite"], true);
+            assert!(
+                entry["base_instructions"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+                    || entry["model_messages"]["instructions_template"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty()),
+                "injected entry must have non-empty base_instructions or model_messages.instructions_template"
+            );
+        }
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_sanitize_subagent_request_strips_v2_markers_and_converts_custom_tool_calls() {
+        let mut req = serde_json::json!({
+            "model": "9router-subagent",
+            "input": [
+                {"type": "compaction_trigger", "reason": "auto"},
+                {"type": "configuration_update", "model": "gpt-6-luna"},
+                {"type": "context_compaction", "encrypted_content": "Context compacted summary v2"},
+                {"type": "custom_tool_call", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"},
+                {"type": "custom_tool_call_output", "output": "Done"},
+                {"type": "tool_search_call", "query": " collaboration "},
+                {"type": "tool_search_output", "output": "spawn_agent"}
+            ]
+        });
+
+        sanitize_subagent_request_for_9router(&mut req);
+        let input = req["input"].as_array().unwrap();
+        assert_eq!(input.len(), 5);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert!(input[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Context compacted summary v2"));
+
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+        assert!(input[1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[Tool Call: apply_patch]"));
+
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[2]["role"], "user");
+        assert!(input[2]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Done"));
+
+        assert_eq!(input[3]["type"], "message");
+        assert_eq!(input[3]["role"], "assistant");
+        assert!(input[3]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[Tool Search]"));
+
+        assert_eq!(input[4]["type"], "message");
+        assert_eq!(input[4]["role"], "user");
+        assert!(input[4]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("spawn_agent"));
+    }
+
+    #[tokio::test]
+    async fn test_compaction_request_normalizes_tool_calls_reasoning_and_zstd_payload() {
+        use axum::body::to_bytes;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::ServiceExt;
+
+        let raw_req = serde_json::json!({
+            "model": "gpt-6-luna",
+            "generate": false,
+            "include": ["reasoning.encrypted_content"],
+            "service_tier": "priority",
+            "tools": [{"type": "function", "name": "shell_command"}],
+            "input": [
+                {"type": "reasoning", "encrypted_content": "gAAAA_opaque_blob", "summary": []},
+                {"type": "reasoning", "encrypted_content": "gAAAA_2", "summary": [{"type": "summary_text", "text": "Planned audit steps"}]},
+                {"type": "function_call", "name": "shell_command", "arguments": "{\"command\":\"cargo test\"}", "call_id": "call_1"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "58 passed"}
+            ]
+        });
+
+        let sum_bytes =
+            build_9router_compaction_request_body(&serde_json::to_vec(&raw_req).unwrap()).unwrap();
+        let sum_json: Value = serde_json::from_slice(&sum_bytes).unwrap();
+        assert!(sum_json.get("include").is_none());
+        assert!(sum_json.get("service_tier").is_none());
+        assert!(sum_json.get("tools").is_none());
+
+        let sum_input = sum_json["input"].as_array().unwrap();
+        // Opaque reasoning dropped; summary reasoning + function_call + function_call_output + instruction = 4 message items
+        assert_eq!(sum_input.len(), 4);
+        for item in sum_input {
+            assert_eq!(item["type"], "message");
+        }
+
+        // Now verify zstd-compressed compaction request through proxy_handler
+        let compressed = zstd::encode_all(serde_json::to_vec(&raw_req).unwrap().as_slice(), 3).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await.unwrap_or(0);
+                let body = r#"{"id":"resp_zstd","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Zstd compaction summary."}]}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let state = Arc::new(ProxyAppState {
+            http_client: build_upstream_http_client(),
+        });
+        let app = create_router(state);
+        let test_upstream = format!("http://{}/v1/responses", addr);
+
+        let req = axum::extract::Request::builder()
+            .uri("/backend-api/codex/responses")
+            .method("POST")
+            .header("x-openai-subagent", "reviewer")
+            .header("content-encoding", "zstd")
+            .header("x-codex-test-upstream", &test_upstream)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(compressed))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let resp_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let sse_text = String::from_utf8_lossy(&resp_bytes);
+        assert!(sse_text.contains("\"encrypted_content\":\"Zstd compaction summary.\""));
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_is_lightweight_cli_invocation_interactive_codex_is_not_lightweight() {
+        // Interactive `codex` (empty args) MUST NOT be lightweight so it gets `:20129` proxy + chatgpt_base_url
+        assert!(!is_lightweight_cli_invocation(&[]));
+        assert!(!is_lightweight_cli_invocation(&[
+            "exec".to_string(),
+            "check git status".to_string()
+        ]));
+        assert!(!is_lightweight_cli_invocation(&[
+            "resume".to_string(),
+            "--last".to_string()
+        ]));
+        assert!(!is_lightweight_cli_invocation(&[
+            "app-server".to_string(),
+            "daemon".to_string(),
+            "start".to_string()
+        ]));
+        assert!(!is_lightweight_cli_invocation(&[
+            "app-server".to_string(),
+            "daemon".to_string(),
+            "restart".to_string()
+        ]));
+
+        // True lightweight commands
+        assert!(is_lightweight_cli_invocation(&["--version".to_string()]));
+        assert!(is_lightweight_cli_invocation(&["-h".to_string()]));
+        assert!(is_lightweight_cli_invocation(&["login".to_string()]));
+        assert!(is_lightweight_cli_invocation(&[
+            "app-server".to_string(),
+            "daemon".to_string(),
+            "stop".to_string()
+        ]));
+    }
+}
