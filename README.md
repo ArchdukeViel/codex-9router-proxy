@@ -68,12 +68,12 @@ When using the official OpenAI Codex Desktop App signed into a personal or Pro C
 
 ## 🖥️ Tested Environment & Version Compatibility Matrix
 
-`codex-9router-proxy` `v0.2.3` is developed and verified against the following environment:
+`codex-9router-proxy` `v0.2.4` is developed and verified against the following environment:
 
 | Component | Verified Version | Notes |
 | :--- | :--- | :--- |
 | **Operating System** | **Windows 11 Pro** (`10.0.26200` / Build `26200`) | Compatible with Windows 10 & Windows 11 (`x86_64`) |
-| **OpenAI Codex Desktop App** | **`26.924.1866.0`** ([Microsoft Store `OpenAI.Codex`](https://apps.microsoft.com/detail/9mz1741s0917)) | Auto-heals across Microsoft Store app updates |
+| **OpenAI Codex Desktop App** | **`26.924.1866.0`** ([Microsoft Store `OpenAI.Codex`](https://apps.microsoft.com/detail/9mz1741s0917)) | Uses `CODEX_CLI_PATH` override; auto-syncs across Store updates |
 | **OpenAI Codex CLI Engine** | **`codex-cli 0.158.0-alpha.2`** | Bundled Desktop engine & standalone CLI (`app-server` & `exec`) |
 | **Primary ChatGPT Session** | **`gpt-6-luna`** (ChatGPT Plus / Pro Account) | Direct pass-through to `https://chatgpt.com` |
 | **9Router** | **`0.5.91`** (`npm i -g 9router@latest`) | Default subagent endpoint (`http://localhost:20128/v1`) |
@@ -286,10 +286,11 @@ Sample installer output:
     Reviewer Model : 9router-subagent
 
 [OK] Saved NINEROUTER_KEY to Windows User Environment (Registry HKCU\Environment).
+[OK] Saved CODEX_CLI_PATH -> C:\Users\user\AppData\Local\OpenAI\Codex\custom\codex-9router-subagents.exe (User Environment).
 [OK] Configured C:\Users\user\.codex\config.toml and role manifests in C:\Users\user\.codex\agents (BOM-Free UTF-8).
 [OK] Injected SQLite subagent trigger into C:\Users\user\.codex\state_5.sqlite.
-[OK] Backed up official binary to codex.orig.exe
-[OK] Installed proxy hook to codex.exe
+[OK] Deployed standalone shim to C:\Users\user\AppData\Local\OpenAI\Codex\custom\codex-9router-subagents.exe
+[OK] Deployed standalone proxy copy to C:\Users\user\AppData\Local\OpenAI\Codex\custom\codex.exe
 [OK] Registered self-healing startup hook in Codex9RouterHookSync.cmd.
 [OK] Codex daemon restart dispatched successfully.
 ```
@@ -317,6 +318,8 @@ Output:
 
 [OK] Running executable : C:\Users\user\codex-9router-proxy\codex-9router-proxy.exe
 [OK] Official engine    : C:\Users\user\AppData\Local\OpenAI\Codex\custom\codex-9router-subagents.orig.exe (321969456 bytes)
+[OK] Custom Shim Binary : C:\Users\user\AppData\Local\OpenAI\Codex\custom\codex-9router-subagents.exe (6220288 bytes)
+[OK] CODEX_CLI_PATH     : C:\Users\user\AppData\Local\OpenAI\Codex\custom\codex-9router-subagents.exe (Verified)
 [OK] Subagent Provider  : 9router
 [OK] Provider API Key   : [CONFIGURED / MASKED]
 [OK] Loopback TLS Cert  : Ready (C:\Users\user\AppData\Local\OpenAI\Codex\custom\bridge-cert.pem)
@@ -336,7 +339,7 @@ Output:
      - reviewer TOML   : Found
 [OK] Endpoint socket reachable : localhost:20128 (127.0.0.1:20128)
 
-==================================================================
+===================================================================
 Diagnostics complete. All checks finished.
 ===================================================================
 ```
@@ -345,14 +348,9 @@ Diagnostics complete. All checks finished.
 
 ## 🔄 Self-Healing Microsoft Store Updates
 
-When the Microsoft Store auto-updates the Codex Desktop App, Windows downloads the new build to a brand new folder under:
-`%LOCALAPPDATA%\OpenAI\Codex\bin\<new_hash>\`
-
-The installer registers a lightweight Windows Startup Hook named **`Codex9RouterHookSync`**.
-- Triggers seamlessly at user logon.
-- Detects if an unhooked Microsoft Store binary is present.
-- Safely preserves the official binary as `codex.orig.exe` and applies the proxy hook.
-- You never have to manually re-run the installer after Store updates.
+Because `OpenAI.Codex` (`26.924.1866.0` `app.asar`) checks the exact byte size and SHA-256 of `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe` and deletes `bin\<hash>` if modified—while checking `process.env.CODEX_CLI_PATH` (`source=override`) first:
+- `install.ps1` sets `CODEX_CLI_PATH = "%LOCALAPPDATA%\OpenAI\Codex\custom\codex-9router-subagents.exe"` in your Windows User environment (`HKCU\Environment`) and leaves `bin\<hash>\codex.exe` completely untouched as the stock Microsoft Store binary.
+- The installer registers a lightweight Windows Startup Hook (`Codex9RouterHookSync.cmd` $\rightarrow$ `%LOCALAPPDATA%\OpenAI\Codex\custom\hook-sync.ps1`) that runs at logon and automatically refreshes `custom\codex.orig.exe`, `custom\codex-9router-subagents.orig.exe`, and companion helpers (`codex-command-runner.exe`, `codex-windows-sandbox-setup.exe`, `codex-windows-sandbox-service.exe`, `codex-code-mode-host.exe`, `rg.exe`) whenever the Microsoft Store `OpenAI.Codex` package updates in `C:\Program Files\WindowsApps\OpenAI.Codex*\app\resources`.
 
 ---
 
@@ -383,14 +381,13 @@ codex --version
 
 ---
 
-## 📦 What's New in `v0.2.3`
+## 📦 What's New in `v0.2.4`
 
-- **Main Agent Tool Preservation (`functions` & `collaboration`)**: Excluded message-level roles (`developer`, `user`, `assistant`, `system`, `tool`, `function`) and stopped recursing into `"input"` / `"messages"` / `"tools"` during role detection so Main Agent (`gpt-6-luna`) turns carrying `"type": "additional_tools"` are never misclassified as subagents.
-- **Multi-Agents V2 Input Normalization (`agent_message` & `developer`)**: Normalizes Codex `multi_agents_v2` `"type": "agent_message"` items in `/v1/responses` `"input"` into `"type": "message"` with `"role": "user"` (stripping V2-only `author`, `recipient`, and `internal_chat_message_metadata_passthrough` fields) and normalizes `"role": "developer"` items into `"role": "system"` so 9Router and downstream Gemini/Claude/OpenAI translators always receive the delegated task prompt and role instructions.
-- **Subagent Tool Sanitization (`9Router` Compatibility)**: Strips unsupported `"type": "additional_tools"` input items and `"type": "namespace"` / `"type": "web_search"` / `"type": "custom"` (`Freeform`) tool definitions before forwarding subagent turns to 9Router.
-- **Automatic Model Metadata Injection (`GET /backend-api/models`)**: Injects model metadata descriptors for `9router-subagent` (and configured role models) with a `200,000` token context window and `apply_patch_tool_type = "function"`, eliminating `Model metadata for ... not found` warnings and `apply_patch` payload mismatches.
-- **Desktop Usage & Billing UI + `Plus` Badge**: Rewrites `workspaceRouting.backendOrigin` in `account/read` JSON-RPC responses from `https://127.0.0.1:20129` back to `https://chatgpt.com` so the Electron Desktop App's `AuthService` (`electron.net.fetch`) loads `/wham/usage` and subscription details directly from `https://chatgpt.com`.
-- **Safe Windows Runtime Helper Sync**: Separates `OpenAI\Codex\bin\<hash>` helpers from `rg.exe` so Electron's ripgrep hash cleanup (`Tn`) never purges `codex-code-mode-host.exe`.
+- **Upstream Connection Resilience & Automatic Retry**: Added a 10-second connect timeout (`.connect_timeout(Duration::from_secs(10))`) to the upstream `reqwest::Client` and a single automatic retry (`send_upstream_with_retry`) when `send().await` fails with a transient connection/request error (`err.is_connect() || err.is_request()`), recovering seamlessly from stale pooled HTTP/2 or TLS sockets after sleep/wake or network transitions.
+- **Full `Error::source()` Diagnostic Chain & Hints (`502 Bad Gateway`)**: Walks the full `std::error::Error::source()` chain (`format_error_chain` / `format_reqwest_upstream_error`) and appends connection/timeout/DNS classifications (`[connect]`, `[timeout]`, `[dns]`) and actionable hints so local DNS/network blackouts (such as Windows `os error 11001`) are immediately self-explanatory in the Codex UI.
+- **`CODEX_CLI_PATH` Override Persistence & Stock `bin\<hash>` Preservation**: Persists `CODEX_CLI_PATH = "%LOCALAPPDATA%\OpenAI\Codex\custom\codex-9router-subagents.exe"` in the Windows User environment while preserving `bin\<hash>\codex.exe` as the unmodified Microsoft Store binary so Electron's SHA-256 integrity check never deletes `bin\<hash>`.
+- **Automatic Microsoft Store Update Sync (`hook-sync.ps1`)**: Automatically refreshes `custom\codex.orig.exe`, `custom\codex-9router-subagents.orig.exe`, and companion helpers (`codex-command-runner.exe`, `codex-windows-sandbox-setup.exe`, `codex-windows-sandbox-service.exe`, `codex-code-mode-host.exe`, `rg.exe`) whenever the Microsoft Store `OpenAI.Codex` package updates.
+- **Enhanced `--doctor` Diagnostics**: Reports `Custom Shim Binary` (`custom\codex-9router-subagents.exe`) and `CODEX_CLI_PATH` status during `codex --doctor`.
 
 ---
 

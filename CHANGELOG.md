@@ -1,3 +1,15 @@
+# v0.2.4 (2026-09-28)
+
+## Features
+- **Upstream Connection Resilience & Automatic Retry**: add `.connect_timeout(Duration::from_secs(10))` to the shared upstream `reqwest::Client` (`build_upstream_http_client`) and perform a single automatic retry (`send_upstream_with_retry`) in `proxy_handler` when `send().await` fails with a transient connection/request error (`err.is_connect() || err.is_request()`), recovering transparently from stale pooled HTTP/2 or TLS sockets after sleep/wake or network transitions
+- **Full `Error::source()` Diagnostic Chain & Hints (`502 Bad Gateway`)**: walk the full `std::error::Error::source()` hierarchy (`format_error_chain` / `format_reqwest_upstream_error`) when formatting `502 Bad Gateway` JSON responses and include connection/timeout/DNS classifications and hints so local network/DNS blackouts (e.g. Windows `os error 11001`) are immediately self-explanatory in the Codex UI
+- **`CODEX_CLI_PATH` Override Persistence**: persist `CODEX_CLI_PATH = "%LOCALAPPDATA%\OpenAI\Codex\custom\codex-9router-subagents.exe"` in Windows User environment variables (`install.ps1` & `hook-sync.ps1`) so `OpenAI.Codex` (`26.924.1866.0` `app.asar` `source=override`) launches the custom proxy shim directly, and clean up `CODEX_CLI_PATH` in `uninstall.ps1`
+- **Automatic Microsoft Store Binary & Helper Sync**: update `install.ps1` and `%LOCALAPPDATA%\OpenAI\Codex\custom\hook-sync.ps1` to automatically refresh `custom\codex.orig.exe`, `custom\codex-9router-subagents.orig.exe`, and companion helpers (`codex-command-runner.exe`, `codex-windows-sandbox-setup.exe`, `codex-windows-sandbox-service.exe`, `codex-code-mode-host.exe`, `rg.exe`) from `WindowsApps\OpenAI.Codex*\app\resources` whenever the Microsoft Store `OpenAI.Codex` package updates
+- **Diagnostics Doctor (`--doctor`)**: report `Custom Shim Binary` (`custom\codex-9router-subagents.exe`) and `CODEX_CLI_PATH` verification status in `run_doctor`
+
+## Fixes
+- **Preserve Stock `bin\<hash>\codex.exe` Integrity**: stop overwriting `bin\<hash>\codex.exe` with the 6.2 MB proxy binary and restore any previously replaced `bin\<hash>\codex.exe` from `codex.orig.exe` or Microsoft Store `app\resources\codex.exe`, preventing Electron's runtime byte-size and SHA-256 verification from deleting `bin\<hash>`
+
 # v0.2.3 (2026-09-27)
 
 ## Features

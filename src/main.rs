@@ -357,7 +357,7 @@ pub fn find_real_codex() -> PathBuf {
                                 }
                             }
                         }
-                        if p.metadata().map_or(false, |m| m.len() > 10_000_000) {
+                        if p.metadata().is_ok_and(|m| m.len() > 10_000_000) {
                             candidates.push(p);
                         }
                     }
@@ -379,7 +379,7 @@ pub fn find_real_codex() -> PathBuf {
             .join("Codex")
             .join("bin")
             .join("codex.exe");
-        if app_bin.is_file() && app_bin.metadata().map_or(false, |m| m.len() > 10_000_000) {
+        if app_bin.is_file() && app_bin.metadata().is_ok_and(|m| m.len() > 10_000_000) {
             return app_bin;
         }
     }
@@ -586,7 +586,7 @@ pub fn route_thread_params(params: &mut serde_json::Map<String, Value>) -> bool 
     }
 
     if let Some(m) = nested_model {
-        if !params.contains_key("model") || params.get("model").map_or(true, |v| v.is_null()) {
+        if !params.contains_key("model") || params.get("model").is_none_or(|v| v.is_null()) {
             params.insert("model".to_string(), Value::String(m));
             modified = true;
         }
@@ -607,13 +607,13 @@ pub fn route_thread_params(params: &mut serde_json::Map<String, Value>) -> bool 
         .get("agentNickname")
         .or_else(|| params.get("agent_nickname"))
         .and_then(|v| v.as_str())
-        .map_or(false, |s| !s.is_empty());
+        .is_some_and(|s| !s.is_empty());
 
     // Check threadSource
     let source_is_subagent = params
         .get("threadSource")
         .or_else(|| params.get("thread_source"))
-        .map_or(false, |v| contains_subagent_source(v));
+        .is_some_and(contains_subagent_source);
 
     let is_subagent =
         role_is_subagent || has_agent_nickname || source_is_subagent || nested_subagent;
@@ -934,17 +934,17 @@ pub fn inspect_and_route_http_request_with_headers(
         .map(|s| s.to_string());
     let model_is_subagent = current_model
         .as_deref()
-        .map_or(false, is_subagent_model_name);
+        .is_some_and(is_subagent_model_name);
     let has_subagent_marker = contains_subagent_source(&json);
     let detected_role = find_agent_role(&json);
     let role_is_subagent = detected_role
         .as_deref()
-        .map_or(false, is_subagent_role_name);
+        .is_some_and(is_subagent_role_name);
     let has_agent_nickname = json
         .get("agentNickname")
         .or_else(|| json.get("agent_nickname"))
         .and_then(|v| v.as_str())
-        .map_or(false, |s| !s.is_empty());
+        .is_some_and(|s| !s.is_empty());
 
     let is_subagent = header_is_subagent
         || model_is_subagent
@@ -1047,7 +1047,7 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
             item.get("slug")
                 .or_else(|| item.get("id"))
                 .and_then(|s| s.as_str())
-                .map_or(false, |s| s.eq_ignore_ascii_case(&slug))
+                .is_some_and(|s| s.eq_ignore_ascii_case(&slug))
         });
         if already_exists {
             continue;
@@ -1290,7 +1290,7 @@ pub fn create_tls_acceptor(
     }
 
     let key = rustls_pemfile::private_key(&mut &key_pem[..])?
-        .ok_or_else(|| "No private key found in key file")?;
+        .ok_or("No private key found in key file")?;
 
     let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
@@ -1303,6 +1303,117 @@ pub fn create_tls_acceptor(
 #[derive(Clone)]
 pub struct ProxyAppState {
     pub http_client: reqwest::Client,
+}
+
+/// Build the shared upstream `reqwest::Client` with a 10-second connect timeout,
+/// 60-second TCP keepalive, and 90-second connection pool idle timeout.
+pub fn build_upstream_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(60))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Walk the full `std::error::Error::source()` chain to expose all underlying causes
+/// (such as hyper client errors, TLS handshake errors, or OS socket/DNS error codes like `os error 11001`).
+pub fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = vec![err.to_string()];
+    let mut current = err.source();
+    while let Some(source) = current {
+        let msg = source.to_string();
+        let trimmed = msg.trim();
+        if !trimmed.is_empty() && chain.last().is_none_or(|last| !last.contains(trimmed)) {
+            chain.push(trimmed.to_string());
+        }
+        current = source.source();
+    }
+    chain.join(" -> ")
+}
+
+/// Format a `reqwest::Error` with its full `std::error::Error::source()` cause chain and
+/// diagnostic connection/timeout/DNS hints for `502 Bad Gateway` responses.
+pub fn format_reqwest_upstream_error(target_url: &str, err: &reqwest::Error) -> String {
+    let chain = format_error_chain(err);
+    let lower = chain.to_lowercase();
+    let mut categories = Vec::new();
+
+    if err.is_timeout() || lower.contains("timed out") || lower.contains("timeout") {
+        categories.push("timeout");
+    }
+    if err.is_connect() {
+        categories.push("connect");
+    }
+    if lower.contains("dns")
+        || lower.contains("11001")
+        || lower.contains("no such host")
+        || lower.contains("lookup")
+        || lower.contains("getaddrinfo")
+    {
+        categories.push("dns");
+    }
+    if err.is_request() && categories.is_empty() {
+        categories.push("request");
+    }
+
+    let hint = if categories.contains(&"dns") {
+        " [hint: DNS lookup failed (e.g. os error 11001); check local internet/DNS connectivity]"
+    } else if categories.contains(&"timeout") {
+        " [hint: upstream connection timed out; check network stability or firewall]"
+    } else if categories.contains(&"connect") {
+        " [hint: TCP/TLS connection failed; verify upstream endpoint is reachable]"
+    } else if !categories.is_empty() {
+        " [hint: transient upstream request/socket error; retried automatically]"
+    } else {
+        ""
+    };
+
+    let tag = if categories.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", categories.join("/"))
+    };
+
+    format!(
+        "Codex 9Router Proxy upstream connection error to {}: {}{}{}",
+        target_url, chain, tag, hint
+    )
+}
+
+/// Send an HTTP request upstream with a single automatic retry when `send().await` fails
+/// with a transient connection or request error (`err.is_connect() || err.is_request()`)
+/// to recover from stale pooled HTTP/2 or TLS sockets after sleep/wake or network transitions.
+pub async fn send_upstream_with_retry(
+    client: &reqwest::Client,
+    method: Method,
+    target_url: &str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(reqwest::Response, usize), reqwest::Error> {
+    let build_req = || {
+        let mut req = client
+            .request(method.clone(), target_url)
+            .headers(headers.clone());
+        if !body.is_empty() {
+            req = req.body(body.clone());
+        }
+        req
+    };
+
+    match build_req().send().await {
+        Ok(res) => Ok((res, 1)),
+        Err(first_err) => {
+            if first_err.is_connect() || first_err.is_request() {
+                match build_req().send().await {
+                    Ok(res) => Ok((res, 2)),
+                    Err(retry_err) => Err(retry_err),
+                }
+            } else {
+                Err(first_err)
+            }
+        }
+    }
 }
 
 /// Health check endpoint (`GET /health`).
@@ -1374,6 +1485,13 @@ pub async fn proxy_handler(
     let (decompressed_body, _was_compressed) = decompress_if_needed(&body, &headers);
     let (is_subagent, routed_body) =
         inspect_and_route_http_request_with_headers(path, &headers, &decompressed_body);
+    #[cfg(test)]
+    let target_url = headers
+        .get("x-codex-test-upstream")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| resolve_forward_url_with_query(path, query, is_subagent));
+    #[cfg(not(test))]
     let target_url = resolve_forward_url_with_query(path, query, is_subagent);
     let mut forward_headers = build_forward_headers(&headers, is_subagent);
 
@@ -1385,22 +1503,21 @@ pub async fn proxy_handler(
         forward_headers.remove(header::IF_MODIFIED_SINCE);
     }
 
-    let mut req_builder = state
-        .http_client
-        .request(method.clone(), &target_url)
-        .headers(forward_headers.clone());
-
     let body_to_send = if is_subagent {
         Bytes::from(routed_body.clone())
     } else {
         body
     };
 
-    if !body_to_send.is_empty() {
-        req_builder = req_builder.body(body_to_send);
-    }
-
-    let mut upstream_res = match req_builder.send().await {
+    let (mut upstream_res, _attempts) = match send_upstream_with_retry(
+        &state.http_client,
+        method.clone(),
+        &target_url,
+        forward_headers.clone(),
+        body_to_send,
+    )
+    .await
+    {
         Ok(res) => res,
         Err(err) => {
             return (
@@ -1408,7 +1525,7 @@ pub async fn proxy_handler(
                 [(header::CONTENT_TYPE, "application/json")],
                 serde_json::json!({
                     "error": {
-                        "message": format!("Codex 9Router Proxy upstream connection error to {}: {}", target_url, err),
+                        "message": format_reqwest_upstream_error(&target_url, &err),
                         "type": "proxy_gateway_error",
                         "code": 502
                     }
@@ -1469,7 +1586,7 @@ pub async fn proxy_handler(
 
     let stream = upstream_res
         .bytes_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        .map_err(std::io::Error::other);
 
     let mut response = Response::builder().status(status);
     for (k, v) in clean_headers.iter() {
@@ -1516,7 +1633,7 @@ pub fn create_router(state: Arc<ProxyAppState>) -> Router {
 pub fn spawn_embedded_reverse_proxy(bind_addr: &str) -> io::Result<PathBuf> {
     let (cert_path, key_path) = default_cert_paths();
     let tls_acceptor = create_tls_acceptor(&cert_path, &key_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let std_listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
@@ -1546,14 +1663,7 @@ pub fn spawn_embedded_reverse_proxy(bind_addr: &str) -> io::Result<PathBuf> {
                 Err(_) => return,
             };
 
-            let http_client = match reqwest::Client::builder()
-                .tcp_keepalive(Duration::from_secs(60))
-                .pool_idle_timeout(Duration::from_secs(90))
-                .build()
-            {
-                Ok(c) => c,
-                Err(_) => reqwest::Client::new(),
-            };
+            let http_client = build_upstream_http_client();
 
             let state = Arc::new(ProxyAppState { http_client });
             let app = create_router(state);
@@ -1634,9 +1744,47 @@ pub fn run_doctor() {
         println!("[FAIL] Official engine not found at: {}", real_codex.display());
     }
 
+    if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
+        let custom_shim = Path::new(&local_app_data)
+            .join("OpenAI")
+            .join("Codex")
+            .join("custom")
+            .join("codex-9router-subagents.exe");
+        if custom_shim.is_file() {
+            let size = custom_shim.metadata().map_or(0, |m| m.len());
+            println!(
+                "[OK] Custom Shim Binary : {} ({} bytes)",
+                custom_shim.display(),
+                size
+            );
+        } else {
+            println!(
+                "[WARN] Custom Shim      : Not found at {}",
+                custom_shim.display()
+            );
+        }
+    }
+
+    match env::var("CODEX_CLI_PATH") {
+        Ok(val) if !val.trim().is_empty() => {
+            let p = PathBuf::from(val.trim());
+            if p.is_file() {
+                println!("[OK] CODEX_CLI_PATH     : {} (Verified)", p.display());
+            } else {
+                println!(
+                    "[WARN] CODEX_CLI_PATH   : {} (Target file missing)",
+                    p.display()
+                );
+            }
+        }
+        _ => {
+            println!("[WARN] CODEX_CLI_PATH   : Not set in process environment");
+        }
+    }
+
     let provider = get_target_model_provider();
     println!("[OK] Subagent Provider  : {}", provider);
-    let key_set = env::var("NINEROUTER_KEY").map_or(false, |k| !k.trim().is_empty());
+    let key_set = env::var("NINEROUTER_KEY").is_ok_and(|k| !k.trim().is_empty());
     if key_set {
         println!("[OK] Provider API Key   : [CONFIGURED / MASKED]");
     } else {
@@ -1812,22 +1960,18 @@ fn main() -> io::Result<()> {
             if let Ok(mut json) = serde_json::from_str::<Value>(&line) {
                 let mut modified = false;
 
-                if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
-                    match method {
-                        "thread/start"
-                        | "thread/fork"
-                        | "thread/resume"
-                        | "thread/settings/update"
-                        | "turn/start" => {
-                            if let Some(params) =
-                                json.get_mut("params").and_then(|p| p.as_object_mut())
-                            {
-                                if route_thread_params(params) {
-                                    modified = true;
-                                }
-                            }
+                if let Some(
+                    "thread/start"
+                    | "thread/fork"
+                    | "thread/resume"
+                    | "thread/settings/update"
+                    | "turn/start",
+                ) = json.get("method").and_then(|m| m.as_str())
+                {
+                    if let Some(params) = json.get_mut("params").and_then(|p| p.as_object_mut()) {
+                        if route_thread_params(params) {
+                            modified = true;
                         }
-                        _ => {}
                     }
                 }
 
@@ -2777,6 +2921,271 @@ default_subagent_model = "9router-subagent"
         assert_eq!(parsed["model"], map_role_to_model(Some("explorer")));
         assert_eq!(parsed["input"][0]["type"], "message");
         assert_eq!(parsed["input"][0]["role"], "user");
+    }
+
+    #[derive(Debug)]
+    struct TestNestedError {
+        msg: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    }
+
+    impl std::fmt::Display for TestNestedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.msg)
+        }
+    }
+
+    impl std::error::Error for TestNestedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_ref()
+                .map(|b| b.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn test_format_error_chain_walks_full_source_hierarchy() {
+        let leaf = io::Error::from_raw_os_error(11001);
+        let mid = TestNestedError {
+            msg: "dns error".to_string(),
+            source: Some(Box::new(leaf)),
+        };
+        let outer = TestNestedError {
+            msg: "client error (Connect)".to_string(),
+            source: Some(Box::new(mid)),
+        };
+        let top = TestNestedError {
+            msg: "error sending request for url (https://chatgpt.com/backend-api/codex/responses)"
+                .to_string(),
+            source: Some(Box::new(outer)),
+        };
+
+        let formatted = format_error_chain(&top);
+        assert!(formatted.contains("error sending request for url"));
+        assert!(formatted.contains("client error (Connect)"));
+        assert!(formatted.contains("dns error"));
+        assert!(formatted.contains("11001"));
+    }
+
+    #[tokio::test]
+    async fn test_format_reqwest_upstream_error_includes_source_chain_and_hints() {
+        // Bind and immediately drop a TcpListener to obtain an unused ephemeral port
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let url = format!("http://{}/backend-api/codex/responses", closed_addr);
+        let client = build_upstream_http_client();
+        let err = client.get(&url).send().await.unwrap_err();
+
+        let formatted = format_reqwest_upstream_error(&url, &err);
+        assert!(
+            formatted.contains("Codex 9Router Proxy upstream connection error to"),
+            "unexpected formatted error: {}",
+            formatted
+        );
+        assert!(
+            formatted.contains(" -> "),
+            "expected full source chain separator ' -> ' in: {}",
+            formatted
+        );
+        assert!(
+            formatted.contains("[connect]") || formatted.contains("[timeout]"),
+            "expected classification tag in: {}",
+            formatted
+        );
+        assert!(
+            formatted.contains("[hint:"),
+            "expected diagnostic hint in: {}",
+            formatted
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_upstream_with_retry_recovers_on_second_attempt() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            // 1st attempt: accept and immediately drop socket after reading a byte to simulate stale socket reset/EOF
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf).await;
+                drop(stream);
+            }
+
+            // 2nd attempt: accept and return valid HTTP 200 OK JSON
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
+                let _ = stream.write_all(resp).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let client = build_upstream_http_client();
+        let target_url = format!("http://{}/backend-api/codex/responses", addr);
+        let (res, attempts) = send_upstream_with_retry(
+            &client,
+            Method::POST,
+            &target_url,
+            HeaderMap::new(),
+            Bytes::from_static(b"{\"model\":\"gpt-6-luna\"}"),
+        )
+        .await
+        .expect("second attempt should succeed after transient socket drop");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+        let body_text = res.text().await.unwrap();
+        assert_eq!(body_text, "{\"status\":\"ok\"}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_proxy_handler_retries_and_returns_502_with_full_chain_when_exhausted() {
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncReadExt;
+        use tower::ServiceExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let accept_count_clone = accept_count.clone();
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    accept_count_clone.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0u8; 64];
+                    let _ = stream.read(&mut buf).await;
+                    drop(stream);
+                }
+            }
+        });
+
+        let state = Arc::new(ProxyAppState {
+            http_client: build_upstream_http_client(),
+        });
+        let app = create_router(state);
+
+        let test_upstream = format!("http://{}/backend-api/codex/responses", addr);
+        let req = axum::extract::Request::builder()
+            .uri("/backend-api/codex/responses")
+            .method("POST")
+            .header("x-codex-test-upstream", &test_upstream)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"model":"gpt-6-luna","input":"hi"}"#))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "proxy_handler should have attempted initial request + 1 retry"
+        );
+
+        let resp_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let resp_json: Value = serde_json::from_slice(&resp_bytes).unwrap();
+        let err_msg = resp_json["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            err_msg.contains("Codex 9Router Proxy upstream connection error to"),
+            "unexpected 502 message: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains(" -> "),
+            "expected full Error::source() chain in 502 message: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("[hint:"),
+            "expected diagnostic hint in 502 message: {}",
+            err_msg
+        );
+
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_format_error_chain_single_and_duplicate_causes() {
+        let single = TestNestedError {
+            msg: "standalone error".to_string(),
+            source: None,
+        };
+        assert_eq!(format_error_chain(&single), "standalone error");
+
+        let dup_leaf = TestNestedError {
+            msg: "os error 11001".to_string(),
+            source: None,
+        };
+        let dup_top = TestNestedError {
+            msg: "dns failure: os error 11001".to_string(),
+            source: Some(Box::new(dup_leaf)),
+        };
+        // Duplicate substring in immediate child should not be repeated
+        assert_eq!(format_error_chain(&dup_top), "dns failure: os error 11001");
+    }
+
+    #[tokio::test]
+    async fn test_proxy_handler_retries_and_recovers_with_200_ok() {
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::ServiceExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let accept_count_clone = accept_count.clone();
+
+        let server_task = tokio::spawn(async move {
+            // 1st connection: drop immediately after read
+            if let Ok((mut stream, _)) = listener.accept().await {
+                accept_count_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf).await;
+                drop(stream);
+            }
+            // 2nd connection: respond 200 OK
+            if let Ok((mut stream, _)) = listener.accept().await {
+                accept_count_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 19\r\nConnection: close\r\n\r\n{\"recovered\":true}\n";
+                let _ = stream.write_all(resp).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let state = Arc::new(ProxyAppState {
+            http_client: build_upstream_http_client(),
+        });
+        let app = create_router(state);
+
+        let test_upstream = format!("http://{}/backend-api/codex/responses", addr);
+        let req = axum::extract::Request::builder()
+            .uri("/backend-api/codex/responses")
+            .method("POST")
+            .header("x-codex-test-upstream", &test_upstream)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"model":"gpt-6-luna","input":"hi"}"#))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(accept_count.load(Ordering::SeqCst), 2);
+
+        let resp_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let resp_json: Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(resp_json["recovered"], true);
+
+        let _ = server_task.await;
     }
 }
 
