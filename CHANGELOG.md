@@ -1,3 +1,11 @@
+# v0.2.5 (2026-09-28)
+
+## Features
+- **Subagent Remote-Compaction via 9Router + Deterministic Local Fallback (`"generate": false`)**: intercept subagent `/responses` remote-compaction requests (`"generate": false`), transform them into 9Router summarization requests (stripping `"generate"`, `"tools"`, `"tool_choice"`, and `"parallel_tool_calls"`, and appending a summarization instruction), extract the assistant summary from 9Router (or fall back to a deterministic local summary constructed from `"input"`), and return a valid Responses API `text/event-stream` SSE sequence (`response.created`, `response.output_item.done` with `"type": "compaction"` and `"encrypted_content"`, and `response.completed`) strictly without routing subagent requests to ChatGPT
+- **Compaction Checkpoint Rehydration (`"type": "compaction"`)**: rehydrate `"type": "compaction"` / `"compaction_summary"` items in `"input"` into standard `"type": "message"` (`"role": "user"`) items prefixed with `[Compacted Conversation Summary]` inside `sanitize_subagent_request_for_9router` so 9Router preserves compacted conversation state on all subsequent turns
+- **`gpt-6-luna` Metadata Alignment & `models_cache.json` In-Place Sync**: update `inject_subagent_models_metadata` to prefer `"gpt-6-luna"` as the base template, configure `"context_window": 272000`, `"max_context_window": 872000`, `"effective_context_window_percent": 95`, and `"comp_hash": "3000"`, update existing subagent entries in place, and synchronize `~/.codex/models_cache.json` at startup, `--doctor`, and installation (`sync_codex_models_cache` / `sync_models_cache_file`) so subagents forked from `gpt-6-luna` never trigger spurious `model_downshift` or `comp_hash_changed` pre-sampling compactions
+- **Hidden-Desktop (`exebox-*`) GUI Self-Healing**: detect and terminate `ChatGPT.exe` instances stranded on hidden sandbox desktops (`exebox-*`) while preserving active `WinSta0\Default` windows and cleaning stale singleton lockfiles during `app-server` startup, `codex --doctor`, `install.ps1`, and `hook-sync.ps1`
+
 # v0.2.4 (2026-09-28)
 
 ## Features

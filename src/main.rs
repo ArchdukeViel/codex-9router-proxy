@@ -891,9 +891,50 @@ pub fn decompress_if_needed(body: &[u8], headers: &HeaderMap) -> (Vec<u8>, bool)
     (body.to_vec(), false)
 }
 
+fn extract_compaction_item_text(item_obj: &serde_json::Map<String, Value>) -> String {
+    if let Some(enc) = item_obj.get("encrypted_content").and_then(|v| v.as_str()) {
+        let trimmed = enc.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Some(sum_val) = item_obj.get("summary") {
+        match sum_val {
+            Value::String(s) => {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+            Value::Array(arr) => {
+                let mut parts = Vec::new();
+                for part in arr {
+                    if let Some(t) = part
+                        .get("text")
+                        .or_else(|| part.get("summary_text"))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| part.as_str())
+                    {
+                        let trimmed = t.trim();
+                        if !trimmed.is_empty() {
+                            parts.push(trimmed.to_string());
+                        }
+                    }
+                }
+                if !parts.is_empty() {
+                    return parts.join("\n");
+                }
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
 /// Sanitize incompatible OpenAI tool schemas (`"type": "namespace"`, `"type": "web_search"`,
-/// `"type": "custom"` for `apply_patch`, and `"type": "additional_tools"` in `"input"`)
-/// and normalize Multi-Agents V2 `"type": "agent_message"` items and `"role": "developer"`
+/// `"type": "custom"` for `apply_patch`, and `"type": "additional_tools"` in `"input"`),
+/// rehydrate `"type": "compaction"` items into standard `"type": "message"` (`"role": "user"`)
+/// items, and normalize Multi-Agents V2 `"type": "agent_message"` items and `"role": "developer"`
 /// messages before forwarding a subagent request to 9Router.
 pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
     let Some(obj) = json.as_object_mut() else {
@@ -903,6 +944,9 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
     // 1. In "input":
     //    - Strip any "type": "additional_tools" items so 9Router never turns code_mode
     //      namespaces ("functions", "collaboration") into dummy {reason: string} tools.
+    //    - Rehydrate any "type": "compaction" items into standard "type": "message"
+    //      ("role": "user") items with "[Compacted Conversation Summary]\n<encrypted_content>",
+    //      stripping "encrypted_content" and "summary".
     //    - Normalize Multi-Agents V2 "type": "agent_message" items into standard
     //      "type": "message" with "role": "user" (stripping V2-only metadata fields
     //      such as "author", "recipient", and "internal_chat_message_metadata_passthrough").
@@ -916,6 +960,39 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
             let Some(item_obj) = item.as_object_mut() else {
                 continue;
             };
+            let is_compaction = item_obj
+                .get("type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| {
+                    t.eq_ignore_ascii_case("compaction")
+                        || t.eq_ignore_ascii_case("compaction_summary")
+                });
+            if is_compaction {
+                let raw_summary = extract_compaction_item_text(item_obj);
+                let summary_text = if raw_summary.is_empty() {
+                    "[Compacted Conversation Summary]".to_string()
+                } else if raw_summary.starts_with("[Compacted Conversation Summary]") {
+                    raw_summary
+                } else {
+                    format!("[Compacted Conversation Summary]\n{}", raw_summary)
+                };
+                item_obj.insert("type".to_string(), Value::String("message".to_string()));
+                item_obj.insert("role".to_string(), Value::String("user".to_string()));
+                item_obj.insert(
+                    "content".to_string(),
+                    serde_json::json!([
+                        {
+                            "type": "input_text",
+                            "text": summary_text
+                        }
+                    ]),
+                );
+                item_obj.remove("encrypted_content");
+                item_obj.remove("summary");
+                item_obj.remove("internal_chat_message_metadata_passthrough");
+                continue;
+            }
+
             let is_agent_message = item_obj
                 .get("type")
                 .and_then(|t| t.as_str())
@@ -1072,9 +1149,52 @@ pub fn inspect_and_route_http_request(path: &str, body: &[u8]) -> (bool, Vec<u8>
     inspect_and_route_http_request_with_headers(path, &HeaderMap::new(), body)
 }
 
+fn apply_subagent_model_metadata_fields(
+    entry_obj: &mut serde_json::Map<String, Value>,
+    slug: &str,
+) {
+    entry_obj.insert("slug".to_string(), Value::String(slug.to_string()));
+    if entry_obj.contains_key("id") {
+        entry_obj.insert("id".to_string(), Value::String(slug.to_string()));
+    }
+    entry_obj.insert(
+        "display_name".to_string(),
+        Value::String(format!("{} (9Router)", slug)),
+    );
+    entry_obj.insert(
+        "description".to_string(),
+        Value::String("Subagent model routed via Codex 9Router Proxy".to_string()),
+    );
+    entry_obj.insert("context_window".to_string(), serde_json::json!(272000));
+    entry_obj.insert("max_context_window".to_string(), serde_json::json!(872000));
+    entry_obj.insert(
+        "effective_context_window_percent".to_string(),
+        serde_json::json!(95),
+    );
+    entry_obj.insert(
+        "comp_hash".to_string(),
+        Value::String("3000".to_string()),
+    );
+    entry_obj.insert(
+        "apply_patch_tool_type".to_string(),
+        Value::String("function".to_string()),
+    );
+    entry_obj.insert("visibility".to_string(), Value::String("list".to_string()));
+    entry_obj.insert("supported_in_api".to_string(), Value::Bool(true));
+    entry_obj.insert("supports_search_tool".to_string(), Value::Bool(false));
+    entry_obj.remove("tool_mode");
+    // Ensure code_mode is not forced on 9Router subagent models
+    entry_obj.insert(
+        "experimental_supported_tools".to_string(),
+        serde_json::json!([]),
+    );
+}
+
 /// Inject subagent model metadata descriptors (`9router-subagent`, `implement`, `explore`, `review`,
-/// and any configured role models) into the `/backend-api/models` JSON response so `codex.orig.exe`
-/// never logs `Model metadata for ... not found` and configures a 200k context window + function `apply_patch`.
+/// and any configured role models) into the `/backend-api/models` or `models_cache.json` JSON payload
+/// so `codex.orig.exe` never logs `Model metadata for ... not found`, aligns subagent context metadata
+/// with `gpt-6-luna` (`context_window: 272000`, `max_context_window: 872000`,
+/// `effective_context_window_percent: 95`, `comp_hash: "3000"`), and configures function `apply_patch`.
 pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
     let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
         return body.to_vec();
@@ -1096,7 +1216,17 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
         return body.to_vec();
     };
 
-    let template = models_arr.first().cloned();
+    // Prefer "gpt-6-luna" in models_arr as the base template, falling back to models_arr.first()
+    let template = models_arr
+        .iter()
+        .find(|item| {
+            item.get("slug")
+                .or_else(|| item.get("id"))
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("gpt-6-luna"))
+        })
+        .or_else(|| models_arr.first())
+        .cloned();
 
     let mut slugs_to_ensure = vec![
         "9router-subagent".to_string(),
@@ -1112,13 +1242,22 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
     }
 
     for slug in slugs_to_ensure {
-        let already_exists = models_arr.iter().any(|item| {
+        if let Some(existing_item) = models_arr.iter_mut().find(|item| {
             item.get("slug")
                 .or_else(|| item.get("id"))
                 .and_then(|s| s.as_str())
                 .is_some_and(|s| s.eq_ignore_ascii_case(&slug))
-        });
-        if already_exists {
+        }) {
+            if let Some(entry_obj) = existing_item.as_object_mut() {
+                if let Some(ref tmpl) = template {
+                    if let Some(tmpl_obj) = tmpl.as_object() {
+                        for (k, v) in tmpl_obj {
+                            entry_obj.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+                apply_subagent_model_metadata_fields(entry_obj, &slug);
+            }
             continue;
         }
 
@@ -1129,8 +1268,10 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
                 "slug": slug,
                 "display_name": format!("{} (9Router)", slug),
                 "description": "Subagent model routed via Codex 9Router Proxy",
-                "context_window": 200000,
-                "max_context_window": 200000,
+                "context_window": 272000,
+                "max_context_window": 872000,
+                "effective_context_window_percent": 95,
+                "comp_hash": "3000",
                 "max_output_tokens": 64000,
                 "default_reasoning_level": "high",
                 "supported_reasoning_levels": [
@@ -1152,41 +1293,567 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
         };
 
         if let Some(entry_obj) = entry.as_object_mut() {
-            entry_obj.insert("slug".to_string(), Value::String(slug.clone()));
-            if entry_obj.contains_key("id") {
-                entry_obj.insert("id".to_string(), Value::String(slug.clone()));
-            }
-            entry_obj.insert(
-                "display_name".to_string(),
-                Value::String(format!("{} (9Router)", slug)),
-            );
-            entry_obj.insert(
-                "description".to_string(),
-                Value::String("Subagent model routed via Codex 9Router Proxy".to_string()),
-            );
-            entry_obj.insert("context_window".to_string(), serde_json::json!(200000));
-            entry_obj.insert("max_context_window".to_string(), serde_json::json!(200000));
-            entry_obj.insert(
-                "apply_patch_tool_type".to_string(),
-                Value::String("function".to_string()),
-            );
-            entry_obj.insert("visibility".to_string(), Value::String("list".to_string()));
-            entry_obj.insert("supported_in_api".to_string(), Value::Bool(true));
-            entry_obj.insert("supports_search_tool".to_string(), Value::Bool(false));
-            entry_obj.remove("tool_mode");
-            // Ensure code_mode is not forced on 9Router subagent models
-            if let Some(exp) = entry_obj
-                .get_mut("experimental_supported_tools")
-                .and_then(|v| v.as_array_mut())
-            {
-                exp.clear();
-            }
+            apply_subagent_model_metadata_fields(entry_obj, &slug);
         }
 
         models_arr.push(entry);
     }
 
     serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec())
+}
+
+/// Apply `inject_subagent_models_metadata` to a `models_cache.json` file on disk if present.
+/// Never logs or exposes file contents.
+pub fn sync_models_cache_file(cache_path: &Path) -> io::Result<bool> {
+    if !cache_path.is_file() {
+        return Ok(false);
+    }
+    let raw = fs::read(cache_path)?;
+    let enriched = inject_subagent_models_metadata(&raw);
+    if enriched != raw {
+        fs::write(cache_path, &enriched)?;
+    }
+    Ok(true)
+}
+
+/// Synchronize `~/.codex/models_cache.json` in place if present on disk so `codex.orig.exe`
+/// never loads stale `200000` subagent metadata on a cache hit.
+pub fn sync_codex_models_cache() -> Option<PathBuf> {
+    let codex_home = get_codex_home_dir()?;
+    let cache_path = codex_home.join("models_cache.json");
+    if sync_models_cache_file(&cache_path).ok()? {
+        Some(cache_path)
+    } else {
+        None
+    }
+}
+
+/// Instruction appended to `"input"` when transforming a subagent `"generate": false`
+/// remote-compaction request into a 9Router summarization request.
+pub const COMPACTION_SUMMARIZATION_PROMPT: &str = "Summarize the conversation state, key findings, file changes, and remaining tasks concisely so the agent can continue seamlessly after context compaction.";
+
+/// Detect whether a `/responses` JSON request payload is a remote-compaction request (`"generate": false`).
+pub fn is_compaction_request(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("generate").and_then(|g| g.as_bool()))
+        == Some(false)
+}
+
+/// Transform a subagent `"generate": false` compaction request into a 9Router summarization request:
+/// - Ensures subagent model rewrite and input sanitization (`sanitize_subagent_request_for_9router`)
+/// - Removes `"generate"`, `"tools"`, `"tool_choice"`, and `"parallel_tool_calls"`
+/// - Appends a summarization instruction user message to `"input"`
+pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
+    let mut json = serde_json::from_slice::<Value>(body).ok()?;
+    sanitize_subagent_request_for_9router(&mut json);
+
+    let obj = json.as_object_mut()?;
+    let needs_model_rewrite = match obj.get("model").and_then(|v| v.as_str()) {
+        None => true,
+        Some(m) => {
+            m.is_empty()
+                || m.starts_with("gpt-")
+                || m.starts_with("o1")
+                || m.starts_with("o3")
+                || m.starts_with("chatgpt")
+        }
+    };
+    if needs_model_rewrite {
+        let detected_role = find_agent_role(&Value::Object(obj.clone()));
+        let mapped = map_role_to_model(detected_role.as_deref());
+        obj.insert("model".to_string(), Value::String(mapped));
+    }
+
+    obj.remove("generate");
+    obj.remove("tools");
+    obj.remove("tool_choice");
+    obj.remove("parallel_tool_calls");
+
+    let instruction_item = serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": COMPACTION_SUMMARIZATION_PROMPT
+            }
+        ]
+    });
+
+    match obj.get_mut("input") {
+        Some(Value::Array(arr)) => {
+            arr.push(instruction_item);
+        }
+        Some(Value::String(s)) => {
+            let prev = s.clone();
+            let mut arr = Vec::new();
+            if !prev.trim().is_empty() {
+                arr.push(serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prev}]
+                }));
+            }
+            arr.push(instruction_item);
+            obj.insert("input".to_string(), Value::Array(arr));
+        }
+        _ => {
+            obj.insert("input".to_string(), Value::Array(vec![instruction_item]));
+        }
+    }
+
+    serde_json::to_vec(&json).ok()
+}
+
+fn extract_text_from_content_value(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        }
+        Value::Array(arr) => {
+            let mut parts = Vec::new();
+            for part in arr {
+                if let Some(s) = part.as_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        parts.push(trimmed.to_string());
+                    }
+                } else if let Some(part_obj) = part.as_object() {
+                    for key in ["text", "output_text", "input_text", "summary_text", "encrypted_content"] {
+                        if let Some(t) = part_obj.get(key).and_then(|v| v.as_str()) {
+                            let trimmed = t.trim();
+                            if !trimmed.is_empty() {
+                                parts.push(trimmed.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_text_from_output_item(item: &Value) -> Option<String> {
+    let obj = item.as_object()?;
+    let item_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("message");
+    if item_type.eq_ignore_ascii_case("compaction")
+        || item_type.eq_ignore_ascii_case("compaction_summary")
+    {
+        let text = extract_compaction_item_text(obj);
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    if item_type.eq_ignore_ascii_case("message") || item_type.eq_ignore_ascii_case("agent_message") {
+        if let Some(content) = obj.get("content") {
+            if let Some(t) = extract_text_from_content_value(content) {
+                return Some(t);
+            }
+        }
+        if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+            let trimmed = t.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_text_from_response_json(val: &Value) -> Option<String> {
+    let obj = val.as_object()?;
+    if let Some(ot) = obj.get("output_text").and_then(|v| v.as_str()) {
+        let trimmed = ot.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(output_arr) = obj.get("output").and_then(|v| v.as_array()) {
+        let mut texts = Vec::new();
+        for item in output_arr {
+            if let Some(t) = extract_text_from_output_item(item) {
+                texts.push(t);
+            }
+        }
+        if !texts.is_empty() {
+            return Some(texts.join("\n"));
+        }
+    }
+    if let Some(choices) = obj.get("choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            if let Some(msg) = choice.get("message") {
+                if let Some(content) = msg.get("content") {
+                    if let Some(t) = extract_text_from_content_value(content) {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(inner_resp) = obj.get("response") {
+        if let Some(t) = extract_text_from_response_json(inner_resp) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Extract the assistant summary text from a 9Router `/v1/responses` response
+/// (supports both JSON responses and SSE `text/event-stream` responses).
+pub fn extract_summary_from_9router_response(resp_bytes: &[u8]) -> Option<String> {
+    if resp_bytes.is_empty() {
+        return None;
+    }
+
+    if let Ok(val) = serde_json::from_slice::<Value>(resp_bytes) {
+        if let Some(t) = extract_text_from_response_json(&val) {
+            return Some(t);
+        }
+    }
+
+    let text = String::from_utf8_lossy(resp_bytes);
+    let mut delta_acc = String::new();
+    let mut completed_texts: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(data_str) = trimmed.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = data_str.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match ev_type {
+            "response.output_text.delta" => {
+                if let Some(d) = ev.get("delta").and_then(|v| v.as_str()) {
+                    delta_acc.push_str(d);
+                }
+            }
+            "response.output_text.done" => {
+                if let Some(t) = ev.get("text").and_then(|v| v.as_str()) {
+                    let t_trim = t.trim();
+                    if !t_trim.is_empty() {
+                        completed_texts.push(t_trim.to_string());
+                    }
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = ev.get("item") {
+                    if let Some(t) = extract_text_from_output_item(item) {
+                        completed_texts.push(t);
+                    }
+                }
+            }
+            "response.completed" | "response.done" => {
+                if let Some(resp) = ev.get("response") {
+                    if let Some(t) = extract_text_from_response_json(resp) {
+                        completed_texts = vec![t];
+                    }
+                }
+            }
+            _ => {
+                if let Some(choices) = ev.get("choices").and_then(|v| v.as_array()) {
+                    for choice in choices {
+                        if let Some(d) = choice
+                            .get("delta")
+                            .and_then(|d| d.get("content"))
+                            .and_then(|c| c.as_str())
+                        {
+                            delta_acc.push_str(d);
+                        }
+                    }
+                } else if let Some(t) = extract_text_from_response_json(&ev) {
+                    completed_texts.push(t);
+                }
+            }
+        }
+    }
+
+    if !completed_texts.is_empty() {
+        let joined = completed_texts.join("\n");
+        let trimmed = joined.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let delta_trimmed = delta_acc.trim();
+    if !delta_trimmed.is_empty() {
+        return Some(delta_trimmed.to_string());
+    }
+
+    None
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let taken: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", taken)
+    } else {
+        taken
+    }
+}
+
+/// Construct a deterministic local summary from the request's `"input"` (or `"messages"`)
+/// if 9Router returns an error or an empty summary during remote compaction.
+pub fn build_deterministic_local_summary(req_json: &Value) -> String {
+    let mut entries: Vec<String> = Vec::new();
+
+    if let Some(input_arr) = req_json.get("input").and_then(|v| v.as_array()) {
+        for item in input_arr {
+            let Some(obj) = item.as_object() else {
+                if let Some(s) = item.as_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() && trimmed != COMPACTION_SUMMARIZATION_PROMPT {
+                        entries.push(format!("- user: {}", truncate_chars(trimmed, 600)));
+                    }
+                }
+                continue;
+            };
+            let item_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("message");
+            if item_type.eq_ignore_ascii_case("compaction")
+                || item_type.eq_ignore_ascii_case("compaction_summary")
+            {
+                let c_text = extract_compaction_item_text(obj);
+                if !c_text.is_empty() {
+                    entries.push(format!("- prior_summary: {}", truncate_chars(&c_text, 800)));
+                }
+                continue;
+            }
+            if item_type.eq_ignore_ascii_case("function_call")
+                || item_type.eq_ignore_ascii_case("custom_tool_call")
+            {
+                let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                let args = obj
+                    .get("arguments")
+                    .or_else(|| obj.get("input"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                entries.push(format!("- tool_call({}): {}", name, truncate_chars(args.trim(), 300)));
+                continue;
+            }
+            if item_type.eq_ignore_ascii_case("function_call_output")
+                || item_type.eq_ignore_ascii_case("custom_tool_call_output")
+            {
+                if let Some(out_val) = obj.get("output") {
+                    if let Some(out_text) = extract_text_from_content_value(out_val) {
+                        entries.push(format!(
+                            "- tool_output: {}",
+                            truncate_chars(&out_text, 400)
+                        ));
+                    }
+                }
+                continue;
+            }
+            let role = obj
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("user")
+                .to_lowercase();
+            if let Some(content) = obj.get("content") {
+                if let Some(text) = extract_text_from_content_value(content) {
+                    if text.trim() == COMPACTION_SUMMARIZATION_PROMPT {
+                        continue;
+                    }
+                    entries.push(format!("- {}: {}", role, truncate_chars(&text, 600)));
+                }
+            }
+        }
+    } else if let Some(input_str) = req_json.get("input").and_then(|v| v.as_str()) {
+        let trimmed = input_str.trim();
+        if !trimmed.is_empty() && trimmed != COMPACTION_SUMMARIZATION_PROMPT {
+            entries.push(format!("- user: {}", truncate_chars(trimmed, 600)));
+        }
+    } else if let Some(messages_arr) = req_json.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages_arr {
+            if let Some(obj) = msg.as_object() {
+                let role = obj
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("user")
+                    .to_lowercase();
+                if let Some(content) = obj.get("content") {
+                    if let Some(text) = extract_text_from_content_value(content) {
+                        entries.push(format!("- {}: {}", role, truncate_chars(&text, 600)));
+                    }
+                }
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return "Context compacted locally by Codex 9Router Proxy. Proceed with the delegated subagent task.".to_string();
+    }
+
+    // Keep most recent entries if there are many turns
+    let start_idx = entries.len().saturating_sub(20);
+    let body = entries[start_idx..].join("\n");
+    truncate_chars(&body, 6000)
+}
+
+/// Convenience helper to construct a deterministic local summary directly from raw JSON request bytes.
+pub fn build_deterministic_local_summary_from_bytes(body: &[u8]) -> String {
+    if let Ok(json) = serde_json::from_slice::<Value>(body) {
+        build_deterministic_local_summary(&json)
+    } else {
+        "Context compacted locally by Codex 9Router Proxy. Proceed with the delegated subagent task.".to_string()
+    }
+}
+
+/// Format a valid Responses API `text/event-stream` SSE payload containing `response.created`,
+/// `response.output_item.done` (`"item": {"type": "compaction", "id": "cmp_...", "encrypted_content": "<summary>"}`),
+/// and `response.completed`.
+pub fn build_compaction_sse_stream(summary: &str, model: &str) -> String {
+    let effective_summary = if summary.trim().is_empty() {
+        "Context compacted locally by Codex 9Router Proxy."
+    } else {
+        summary.trim()
+    };
+    let effective_model = if model.trim().is_empty() {
+        "9router-subagent"
+    } else {
+        model.trim()
+    };
+    let resp_id = "resp_9router_compact";
+    let item_id = "cmp_9router_compact";
+
+    let created = serde_json::json!({
+        "type": "response.created",
+        "response": {
+            "id": resp_id,
+            "object": "response",
+            "status": "in_progress",
+            "model": effective_model,
+            "output": []
+        }
+    });
+    let item_done = serde_json::json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "compaction",
+            "id": item_id,
+            "encrypted_content": effective_summary
+        }
+    });
+    let completed = serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "id": resp_id,
+            "object": "response",
+            "status": "completed",
+            "model": effective_model,
+            "output": [
+                {
+                    "type": "compaction",
+                    "id": item_id,
+                    "encrypted_content": effective_summary
+                }
+            ],
+            "usage": {
+                "input_tokens": 0,
+                "input_tokens_details": { "cached_tokens": 0 },
+                "output_tokens": 0,
+                "output_tokens_details": { "reasoning_tokens": 0 },
+                "total_tokens": 0
+            }
+        }
+    });
+
+    format!(
+        "event: response.created\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        created, item_done, completed
+    )
+}
+
+/// Build an Axum HTTP `200 OK` `text/event-stream` response for `compact_remote_v2_attempt`.
+pub fn build_compaction_sse_response(summary: &str, model: &str) -> Response {
+    let sse_payload = build_compaction_sse_stream(summary, model);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(sse_payload))
+        .unwrap_or_else(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Internal error building compaction SSE response: {}", e),
+            )
+                .into_response()
+        })
+}
+
+/// Handle a subagent `"generate": false` remote-compaction request strictly via 9Router
+/// with a deterministic local fallback summary if 9Router returns an error or empty summary.
+pub async fn handle_subagent_compaction(
+    client: &reqwest::Client,
+    target_url: &str,
+    forward_headers: HeaderMap,
+    routed_body: &[u8],
+) -> Response {
+    let model_name = serde_json::from_slice::<Value>(routed_body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| map_role_to_model(Some("default")));
+
+    if let Some(sum_body) = build_9router_compaction_request_body(routed_body) {
+        if let Ok((mut upstream_res, _)) = send_upstream_with_retry(
+            client,
+            Method::POST,
+            target_url,
+            forward_headers.clone(),
+            Bytes::from(sum_body.clone()),
+        )
+        .await
+        {
+            if upstream_res.status().as_u16() >= 400 {
+                if let Some(fallback_body) = rewrite_body_model_to_fallback(&sum_body) {
+                    if let Ok((retry_res, _)) = send_upstream_with_retry(
+                        client,
+                        Method::POST,
+                        target_url,
+                        forward_headers,
+                        Bytes::from(fallback_body),
+                    )
+                    .await
+                    {
+                        upstream_res = retry_res;
+                    }
+                }
+            }
+
+            if upstream_res.status() == reqwest::StatusCode::OK {
+                if let Ok(resp_bytes) = upstream_res.bytes().await {
+                    if let Some(summary) = extract_summary_from_9router_response(&resp_bytes) {
+                        return build_compaction_sse_response(&summary, &model_name);
+                    }
+                }
+            }
+        }
+    }
+
+    let fallback_summary = build_deterministic_local_summary_from_bytes(routed_body);
+    build_compaction_sse_response(&fallback_summary, &model_name)
 }
 
 /// Resolve the forward target URL for a given path and routing classification.
@@ -1584,6 +2251,18 @@ pub async fn proxy_handler(
     #[cfg(test)]
     forward_headers.remove("x-codex-test-upstream");
 
+    // If this is a subagent remote-compaction request ("generate": false), handle it strictly
+    // via 9Router summarization + deterministic local fallback and return a compaction SSE stream.
+    if is_subagent && is_compaction_request(&routed_body) {
+        return handle_subagent_compaction(
+            &state.http_client,
+            &target_url,
+            forward_headers,
+            &routed_body,
+        )
+        .await;
+    }
+
     // For GET /backend-api/models, strip compression and conditional cache headers
     // so ChatGPT returns plain 200 OK JSON that we can enrich with 9Router subagent models.
     if is_models_req {
@@ -1652,6 +2331,7 @@ pub async fn proxy_handler(
         return match upstream_res.bytes().await {
             Ok(raw_bytes) => {
                 let enriched = inject_subagent_models_metadata(&raw_bytes);
+                let _ = sync_codex_models_cache();
                 clean_headers.remove(header::CONTENT_ENCODING);
                 clean_headers.remove(header::ETAG);
                 let mut response = Response::builder().status(status);
@@ -1819,12 +2499,501 @@ pub fn spawn_embedded_reverse_proxy(bind_addr: &str) -> io::Result<PathBuf> {
     Ok(cert_path)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatGptWindowEntry {
+    pub desktop: String,
+    pub pid: u32,
+    pub hwnd: usize,
+    pub class_name: String,
+    pub visible: bool,
+    pub rect: (i32, i32, i32, i32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatGptDesktopClassification {
+    pub default_visible_windows: Vec<ChatGptWindowEntry>,
+    pub default_any_pids: Vec<u32>,
+    pub hidden_desktop_pids: Vec<u32>,
+    pub hidden_desktop_names: Vec<String>,
+}
+
+/// Classify enumerated `ChatGPT.exe` top-level windows across Win32 desktops.
+/// Identifies visible `Chrome_WidgetWin_1` windows on `Default` vs `Chrome_WidgetWin_*`
+/// windows stranded on hidden sandbox desktops (such as `exebox-*`), while ignoring
+/// Chromium's internal `sbox_alternate_desktop*` renderer desktops.
+pub fn classify_chatgpt_desktop_windows(
+    entries: &[ChatGptWindowEntry],
+) -> ChatGptDesktopClassification {
+    let mut default_visible_windows = Vec::new();
+    let mut default_any_pids = Vec::new();
+    let mut hidden_candidates: Vec<(u32, String)> = Vec::new();
+
+    for entry in entries {
+        if !entry.class_name.starts_with("Chrome_WidgetWin_") {
+            continue;
+        }
+        if entry.desktop.eq_ignore_ascii_case("Default") {
+            if !default_any_pids.contains(&entry.pid) {
+                default_any_pids.push(entry.pid);
+            }
+            if entry.class_name == "Chrome_WidgetWin_1" && entry.visible {
+                default_visible_windows.push(entry.clone());
+            }
+        } else if !entry
+            .desktop
+            .to_ascii_lowercase()
+            .starts_with("sbox_alternate_desktop")
+        {
+            hidden_candidates.push((entry.pid, entry.desktop.clone()));
+        }
+    }
+
+    let mut hidden_desktop_pids = Vec::new();
+    let mut hidden_desktop_names = Vec::new();
+    for (pid, dname) in hidden_candidates {
+        if !default_any_pids.contains(&pid) {
+            if !hidden_desktop_pids.contains(&pid) {
+                hidden_desktop_pids.push(pid);
+            }
+            if !hidden_desktop_names.contains(&dname) {
+                hidden_desktop_names.push(dname);
+            }
+        }
+    }
+
+    ChatGptDesktopClassification {
+        default_visible_windows,
+        default_any_pids,
+        hidden_desktop_pids,
+        hidden_desktop_names,
+    }
+}
+
+/// Candidate Electron singleton lockfile paths for unpackaged and MSIX-packaged Codex Desktop.
+pub fn codex_singleton_lockfile_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(appdata) = env::var("APPDATA") {
+        paths.push(
+            PathBuf::from(appdata)
+                .join("Codex")
+                .join("web")
+                .join("Codex")
+                .join("lockfile"),
+        );
+    }
+    if let Ok(local_appdata) = env::var("LOCALAPPDATA") {
+        paths.push(
+            PathBuf::from(local_appdata)
+                .join("Packages")
+                .join("OpenAI.Codex_2p2nqsd0c76g0")
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Codex")
+                .join("web")
+                .join("Codex")
+                .join("lockfile"),
+        );
+    }
+    paths
+}
+
+#[cfg(windows)]
+mod win_desktop {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct WinRect {
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
+    }
+
+    #[repr(C)]
+    struct StartupInfoW {
+        cb: u32,
+        lp_reserved: *mut u16,
+        lp_desktop: *mut u16,
+        lp_title: *mut u16,
+        dw_x: u32,
+        dw_y: u32,
+        dw_x_size: u32,
+        dw_y_size: u32,
+        dw_x_count_chars: u32,
+        dw_y_count_chars: u32,
+        dw_fill_attribute: u32,
+        dw_flags: u32,
+        w_show_window: u16,
+        cb_reserved2: u16,
+        lp_reserved2: *mut u8,
+        h_std_input: isize,
+        h_std_output: isize,
+        h_std_error: isize,
+    }
+
+    #[repr(C)]
+    struct ProcessInformation {
+        h_process: isize,
+        h_thread: isize,
+        dw_process_id: u32,
+        dw_thread_id: u32,
+    }
+
+    type EnumDesktopsProc = unsafe extern "system" fn(*const u16, isize) -> i32;
+    type EnumWindowsProc = unsafe extern "system" fn(isize, isize) -> i32;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetProcessWindowStation() -> isize;
+        fn EnumDesktopsW(hwinsta: isize, lp_enum_func: EnumDesktopsProc, l_param: isize) -> i32;
+        fn OpenDesktopW(
+            lpsz_desktop: *const u16,
+            dw_flags: u32,
+            f_inherit: i32,
+            dw_desired_access: u32,
+        ) -> isize;
+        fn CloseDesktop(h_desktop: isize) -> i32;
+        fn EnumDesktopWindows(
+            h_desktop: isize,
+            lpfn: EnumWindowsProc,
+            l_param: isize,
+        ) -> i32;
+        fn GetWindowThreadProcessId(h_wnd: isize, lpdw_process_id: *mut u32) -> u32;
+        fn GetClassNameW(h_wnd: isize, lp_class_name: *mut u16, n_max_count: i32) -> i32;
+        fn IsWindowVisible(h_wnd: isize) -> i32;
+        fn GetWindowRect(h_wnd: isize, lp_rect: *mut WinRect) -> i32;
+        fn GetThreadDesktop(dw_thread_id: u32) -> isize;
+        fn GetUserObjectInformationW(
+            h_obj: isize,
+            n_index: i32,
+            pv_info: *mut u8,
+            n_length: u32,
+            lpn_length_needed: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadId() -> u32;
+        fn OpenProcess(dw_desired_access: u32, b_inherit_handle: i32, dw_process_id: u32) -> isize;
+        fn CloseHandle(h_object: isize) -> i32;
+        fn QueryFullProcessImageNameW(
+            h_process: isize,
+            dw_flags: u32,
+            lp_exe_name: *mut u16,
+            lpdw_size: *mut u32,
+        ) -> i32;
+        fn CreateProcessW(
+            lp_application_name: *const u16,
+            lp_command_line: *mut u16,
+            lp_process_attributes: *const u8,
+            lp_thread_attributes: *const u8,
+            b_inherit_handles: i32,
+            dw_creation_flags: u32,
+            lp_environment: *const u8,
+            lp_current_directory: *const u16,
+            lp_startup_info: *const StartupInfoW,
+            lp_process_information: *mut ProcessInformation,
+        ) -> i32;
+    }
+
+    unsafe extern "system" fn enum_desktops_cb(desktop_ptr: *const u16, l_param: isize) -> i32 {
+        if desktop_ptr.is_null() || l_param == 0 {
+            return 1;
+        }
+        let mut len = 0usize;
+        while *desktop_ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(desktop_ptr, len);
+        let name = OsString::from_wide(slice).to_string_lossy().into_owned();
+        let list = &mut *(l_param as *mut Vec<String>);
+        list.push(name);
+        1
+    }
+
+    struct EnumWinContext {
+        desktop_name: String,
+        entries: Vec<ChatGptWindowEntry>,
+    }
+
+    fn is_chatgpt_pid(pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        unsafe {
+            let h_proc = OpenProcess(0x1000, 0, pid);
+            if h_proc == 0 {
+                return false;
+            }
+            let mut buf = [0u16; 512];
+            let mut size = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h_proc, 0, buf.as_mut_ptr(), &mut size);
+            CloseHandle(h_proc);
+            if ok == 0 || size == 0 {
+                return false;
+            }
+            let path_str = OsString::from_wide(&buf[..size as usize])
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            Path::new(&path_str)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("chatgpt"))
+        }
+    }
+
+    unsafe extern "system" fn enum_windows_cb(h_wnd: isize, l_param: isize) -> i32 {
+        if l_param == 0 {
+            return 1;
+        }
+        let mut cls_buf = [0u16; 256];
+        let cls_len = GetClassNameW(h_wnd, cls_buf.as_mut_ptr(), cls_buf.len() as i32);
+        if cls_len <= 0 {
+            return 1;
+        }
+        let cls_name = OsString::from_wide(&cls_buf[..cls_len as usize])
+            .to_string_lossy()
+            .into_owned();
+        if !cls_name.starts_with("Chrome_WidgetWin_") {
+            return 1;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(h_wnd, &mut pid);
+        if !is_chatgpt_pid(pid) {
+            return 1;
+        }
+        let visible = IsWindowVisible(h_wnd) != 0;
+        let mut rc = WinRect::default();
+        let _ = GetWindowRect(h_wnd, &mut rc);
+        let ctx = &mut *(l_param as *mut EnumWinContext);
+        ctx.entries.push(ChatGptWindowEntry {
+            desktop: ctx.desktop_name.clone(),
+            pid,
+            hwnd: h_wnd as usize,
+            class_name: cls_name,
+            visible,
+            rect: (rc.left, rc.top, rc.right, rc.bottom),
+        });
+        1
+    }
+
+    pub fn enumerate_chatgpt_desktop_windows() -> Vec<ChatGptWindowEntry> {
+        let mut desktops: Vec<String> = Vec::new();
+        unsafe {
+            let hwinsta = GetProcessWindowStation();
+            if hwinsta == 0 {
+                return Vec::new();
+            }
+            let _ = EnumDesktopsW(
+                hwinsta,
+                enum_desktops_cb,
+                (&mut desktops as *mut Vec<String>) as isize,
+            );
+        }
+
+        let mut all_entries = Vec::new();
+        for d_name in desktops {
+            let wide: Vec<u16> = std::ffi::OsStr::new(&d_name)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            unsafe {
+                let h_desk = OpenDesktopW(wide.as_ptr(), 0, 0, 0x01FF);
+                if h_desk == 0 {
+                    continue;
+                }
+                let mut ctx = EnumWinContext {
+                    desktop_name: d_name,
+                    entries: Vec::new(),
+                };
+                let _ = EnumDesktopWindows(
+                    h_desk,
+                    enum_windows_cb,
+                    (&mut ctx as *mut EnumWinContext) as isize,
+                );
+                let _ = CloseDesktop(h_desk);
+                all_entries.extend(ctx.entries);
+            }
+        }
+        all_entries
+    }
+
+    pub fn current_thread_desktop_name() -> Option<String> {
+        unsafe {
+            let h_desk = GetThreadDesktop(GetCurrentThreadId());
+            if h_desk == 0 {
+                return None;
+            }
+            let mut buf = [0u8; 512];
+            let mut needed: u32 = 0;
+            // UOI_NAME = 2
+            if GetUserObjectInformationW(h_desk, 2, buf.as_mut_ptr(), buf.len() as u32, &mut needed)
+                == 0
+            {
+                return None;
+            }
+            let u16_len = (needed as usize / 2).saturating_sub(1);
+            let wide = std::slice::from_raw_parts(buf.as_ptr() as *const u16, u16_len);
+            Some(OsString::from_wide(wide).to_string_lossy().into_owned())
+        }
+    }
+
+    pub fn launch_codex_on_default_desktop() -> bool {
+        let mut desktop_wide: Vec<u16> = std::ffi::OsStr::new("WinSta0\\Default")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut cmd_wide: Vec<u16> =
+            std::ffi::OsStr::new("explorer.exe shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App")
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+        unsafe {
+            let mut si: StartupInfoW = std::mem::zeroed();
+            si.cb = std::mem::size_of::<StartupInfoW>() as u32;
+            si.lp_desktop = desktop_wide.as_mut_ptr();
+            let mut pi: ProcessInformation = std::mem::zeroed();
+
+            let ok = CreateProcessW(
+                std::ptr::null(),
+                cmd_wide.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            );
+            if ok != 0 {
+                if pi.h_process != 0 {
+                    CloseHandle(pi.h_process);
+                }
+                if pi.h_thread != 0 {
+                    CloseHandle(pi.h_thread);
+                }
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    pub fn heal_hidden_desktop_codex(
+        relaunch_if_no_default: bool,
+    ) -> (ChatGptDesktopClassification, bool) {
+        let mut entries = enumerate_chatgpt_desktop_windows();
+        let mut class = classify_chatgpt_desktop_windows(&entries);
+
+        // If app-server was spawned from a hidden exebox-* desktop before ChatGPT.exe's window finished registering,
+        // wait briefly and re-check once.
+        if relaunch_if_no_default
+            && class.hidden_desktop_pids.is_empty()
+            && class.default_visible_windows.is_empty()
+        {
+            if let Some(cur_desk) = current_thread_desktop_name() {
+                if !cur_desk.eq_ignore_ascii_case("Default")
+                    && !cur_desk
+                        .to_ascii_lowercase()
+                        .starts_with("sbox_alternate_desktop")
+                {
+                    thread::sleep(Duration::from_millis(250));
+                    entries = enumerate_chatgpt_desktop_windows();
+                    class = classify_chatgpt_desktop_windows(&entries);
+                }
+            }
+        }
+
+        let mut healed = false;
+        if !class.hidden_desktop_pids.is_empty() {
+            healed = true;
+            if class.default_visible_windows.is_empty() {
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/IM", "ChatGPT.exe", "/T"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/IM", "codex-computer-use-swift.exe", "/T"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                thread::sleep(Duration::from_millis(400));
+                for lockfile in codex_singleton_lockfile_paths() {
+                    if lockfile.exists() {
+                        let _ = fs::remove_file(&lockfile);
+                    }
+                }
+                if relaunch_if_no_default {
+                    let stamp_path = env::temp_dir().join("codex-9router-desktop-heal.stamp");
+                    let allow_relaunch = stamp_path
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_none_or(|elapsed| elapsed > Duration::from_secs(10));
+                    if allow_relaunch {
+                        let _ = fs::write(&stamp_path, b"healed");
+                        let _ = launch_codex_on_default_desktop();
+                    }
+                    std::process::exit(0);
+                }
+            } else {
+                for pid in &class.hidden_desktop_pids {
+                    let _ = Command::new("taskkill")
+                        .args(["/F", "/PID", &pid.to_string(), "/T"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+        } else if class.default_any_pids.is_empty() {
+            // If no ChatGPT.exe owns any desktop window, remove stale lockfiles if they are unlocked.
+            for lockfile in codex_singleton_lockfile_paths() {
+                if lockfile.exists() {
+                    let _ = fs::remove_file(&lockfile);
+                }
+            }
+        }
+
+        (class, healed)
+    }
+}
+
 /// Run full system health diagnostics and print report.
 pub fn run_doctor() {
     println!("===================================================================");
     println!("           Codex 9Router Proxy - Diagnostics Doctor 🩺             ");
     println!("===================================================================");
     println!();
+
+    #[cfg(windows)]
+    {
+        let (class, healed) = win_desktop::heal_hidden_desktop_codex(false);
+        if healed {
+            println!(
+                "[WARN] Codex Desktop GUI : Terminated hidden-desktop ChatGPT.exe (PIDs {:?} on {:?})",
+                class.hidden_desktop_pids, class.hidden_desktop_names
+            );
+        }
+        let refreshed = classify_chatgpt_desktop_windows(&win_desktop::enumerate_chatgpt_desktop_windows());
+        if let Some(win) = refreshed.default_visible_windows.first() {
+            println!(
+                "[OK] Codex Desktop GUI  : Visible on WinSta0\\Default (PID {}, HWND 0x{:X}, Rect {},{}-{},{})",
+                win.pid, win.hwnd, win.rect.0, win.rect.1, win.rect.2, win.rect.3
+            );
+        } else {
+            println!(
+                "[INFO] Codex Desktop GUI : No active window on WinSta0\\Default (singleton lockfiles clean)"
+            );
+        }
+    }
 
     if let Ok(exe) = env::current_exe() {
         println!("[OK] Running executable : {}", exe.display());
@@ -1957,6 +3126,17 @@ pub fn run_doctor() {
         println!("[WARN] Config TOML      : Not found in ~/.codex/config.toml");
     }
 
+    match sync_codex_models_cache() {
+        Some(cache_path) => {
+            println!("[OK] Models Cache Sync  : Synchronized ({})", cache_path.display());
+        }
+        None => {
+            println!(
+                "[INFO] Models Cache     : Not present on disk (will enrich via GET /backend-api/models)"
+            );
+        }
+    }
+
     println!("     - Default Model    : {}", map_role_to_model(Some("default")));
     println!("     - Worker Model     : {}", map_role_to_model(Some("worker")));
     println!("     - Explorer Model   : {}", map_role_to_model(Some("explorer")));
@@ -2023,6 +3203,7 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    let _ = sync_codex_models_cache();
     let real_codex = find_real_codex();
 
     let is_lightweight_command = args.is_empty()
@@ -2059,6 +3240,11 @@ fn main() -> io::Result<()> {
 
         let status = cmd.args(&forward_args).status()?;
         std::process::exit(status.code().unwrap_or(1));
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = win_desktop::heal_hidden_desktop_codex(true);
     }
 
     let port = get_proxy_port();
@@ -2425,12 +3611,32 @@ default_subagent_model = "9router-subagent"
         let upstream_models = serde_json::json!({
             "models": [
                 {
+                    "slug": "gpt-5-mini",
+                    "display_name": "GPT-5 Mini",
+                    "context_window": 128000,
+                    "max_context_window": 128000,
+                    "comp_hash": "1000"
+                },
+                {
                     "slug": "gpt-6-luna",
                     "display_name": "GPT-6 Luna",
-                    "context_window": 400000,
+                    "context_window": 272000,
+                    "max_context_window": 872000,
+                    "effective_context_window_percent": 95,
+                    "comp_hash": "3000",
+                    "luna_marker": "from_luna_template",
                     "apply_patch_tool_type": "freeform",
                     "visibility": "list",
                     "supported_in_api": true,
+                    "experimental_supported_tools": ["code_mode"]
+                },
+                {
+                    "slug": "9router-subagent",
+                    "display_name": "Stale Cached Subagent",
+                    "context_window": 200000,
+                    "max_context_window": 200000,
+                    "comp_hash": "stale_hash",
+                    "apply_patch_tool_type": "freeform",
                     "experimental_supported_tools": ["code_mode"]
                 }
             ]
@@ -2440,11 +3646,21 @@ default_subagent_model = "9router-subagent"
         let parsed: Value = serde_json::from_slice(&enriched).unwrap();
         let arr = parsed["models"].as_array().unwrap();
 
-        let subagent_entry = arr
+        let subagent_matches: Vec<&Value> = arr
             .iter()
-            .find(|m| m["slug"] == "9router-subagent")
-            .expect("9router-subagent should be injected into models list");
-        assert_eq!(subagent_entry["context_window"], 200000);
+            .filter(|m| m["slug"] == "9router-subagent")
+            .collect();
+        assert_eq!(
+            subagent_matches.len(),
+            1,
+            "existing 9router-subagent entry should be updated in place without duplication"
+        );
+        let subagent_entry = subagent_matches[0];
+        assert_eq!(subagent_entry["context_window"], 272000);
+        assert_eq!(subagent_entry["max_context_window"], 872000);
+        assert_eq!(subagent_entry["effective_context_window_percent"], 95);
+        assert_eq!(subagent_entry["comp_hash"], "3000");
+        assert_eq!(subagent_entry["luna_marker"], "from_luna_template");
         assert_eq!(subagent_entry["apply_patch_tool_type"], "function");
         assert_eq!(
             subagent_entry["experimental_supported_tools"]
@@ -2453,6 +3669,16 @@ default_subagent_model = "9router-subagent"
                 .len(),
             0
         );
+
+        let implement_entry = arr
+            .iter()
+            .find(|m| m["slug"] == "implement")
+            .expect("implement should be injected using gpt-6-luna template");
+        assert_eq!(implement_entry["context_window"], 272000);
+        assert_eq!(implement_entry["max_context_window"], 872000);
+        assert_eq!(implement_entry["effective_context_window_percent"], 95);
+        assert_eq!(implement_entry["comp_hash"], "3000");
+        assert_eq!(implement_entry["luna_marker"], "from_luna_template");
     }
 
     #[test]
@@ -3430,6 +4656,413 @@ default_subagent_model = "9router-subagent"
         assert_eq!(resp_json["recovered"], true);
 
         let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_classify_chatgpt_desktop_windows_hidden_and_simultaneous_cases() {
+        // 1. Hidden exebox-* desktop only (PID 19056)
+        let hidden_only = vec![
+            ChatGptWindowEntry {
+                desktop: "exebox-RUHQPLQG5QBR5H5HFN5CKAPIKK".to_string(),
+                pid: 19056,
+                hwnd: 0xF0080E,
+                class_name: "Chrome_WidgetWin_1".to_string(),
+                visible: true,
+                rect: (0, 0, 960, 1080),
+            },
+            ChatGptWindowEntry {
+                desktop: "exebox-RUHQPLQG5QBR5H5HFN5CKAPIKK".to_string(),
+                pid: 19056,
+                hwnd: 0x6B0A1C,
+                class_name: "Chrome_WidgetWin_0".to_string(),
+                visible: false,
+                rect: (104, 104, 1544, 893),
+            },
+        ];
+        let c1 = classify_chatgpt_desktop_windows(&hidden_only);
+        assert!(c1.default_visible_windows.is_empty());
+        assert!(c1.default_any_pids.is_empty());
+        assert_eq!(c1.hidden_desktop_pids, vec![19056]);
+        assert_eq!(
+            c1.hidden_desktop_names,
+            vec!["exebox-RUHQPLQG5QBR5H5HFN5CKAPIKK".to_string()]
+        );
+
+        // 2. Simultaneous Default (PID 32048) + Hidden exebox-* (PID 19056) + Chromium sbox_alternate_desktop (PID 31144)
+        let simultaneous = vec![
+            ChatGptWindowEntry {
+                desktop: "Default".to_string(),
+                pid: 32048,
+                hwnd: 0x3510BE,
+                class_name: "Chrome_WidgetWin_1".to_string(),
+                visible: true,
+                rect: (0, 0, 960, 1080),
+            },
+            ChatGptWindowEntry {
+                desktop: "Default".to_string(),
+                pid: 32048,
+                hwnd: 0x3A0442,
+                class_name: "Chrome_WidgetWin_1".to_string(),
+                visible: false,
+                rect: (0, 0, 872, 1080),
+            },
+            ChatGptWindowEntry {
+                desktop: "sbox_alternate_desktop_local_winstation_0x3BD0".to_string(),
+                pid: 31144,
+                hwnd: 0x89073E,
+                class_name: "Chrome_WidgetWin_0".to_string(),
+                visible: false,
+                rect: (0, 0, 0, 0),
+            },
+            ChatGptWindowEntry {
+                desktop: "exebox-RUHQPLQG5QBR5H5HFN5CKAPIKK".to_string(),
+                pid: 19056,
+                hwnd: 0xF0080E,
+                class_name: "Chrome_WidgetWin_1".to_string(),
+                visible: true,
+                rect: (0, 0, 960, 1080),
+            },
+        ];
+        let c2 = classify_chatgpt_desktop_windows(&simultaneous);
+        assert_eq!(c2.default_visible_windows.len(), 1);
+        assert_eq!(c2.default_visible_windows[0].pid, 32048);
+        assert_eq!(c2.default_visible_windows[0].hwnd, 0x3510BE);
+        assert_eq!(c2.default_any_pids, vec![32048]);
+        assert_eq!(c2.hidden_desktop_pids, vec![19056]);
+    }
+
+    #[test]
+    fn test_sync_models_cache_file_updates_in_place_and_missing_file() {
+        let tmp_dir = env::temp_dir().join(format!("codex_models_cache_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let missing_path = tmp_dir.join("missing_models_cache.json");
+        assert!(!sync_models_cache_file(&missing_path).unwrap());
+
+        let cache_path = tmp_dir.join("models_cache.json");
+        let initial_cache = serde_json::json!({
+            "fetched_at": "2026-09-28T00:00:00Z",
+            "etag": "W/\"test-etag\"",
+            "models": [
+                {
+                    "slug": "gpt-6-luna",
+                    "display_name": "GPT-6 Luna",
+                    "context_window": 272000,
+                    "max_context_window": 872000,
+                    "effective_context_window_percent": 95,
+                    "comp_hash": "3000",
+                    "apply_patch_tool_type": "freeform"
+                },
+                {
+                    "slug": "9router-subagent",
+                    "display_name": "9router-subagent (9Router)",
+                    "context_window": 200000,
+                    "max_context_window": 200000
+                }
+            ]
+        });
+        fs::write(&cache_path, serde_json::to_vec(&initial_cache).unwrap()).unwrap();
+
+        assert!(sync_models_cache_file(&cache_path).unwrap());
+        let synced_bytes = fs::read(&cache_path).unwrap();
+        let synced_json: Value = serde_json::from_slice(&synced_bytes).unwrap();
+        assert_eq!(synced_json["etag"], "W/\"test-etag\"");
+
+        let models = synced_json["models"].as_array().unwrap();
+        let subagent = models
+            .iter()
+            .find(|m| m["slug"] == "9router-subagent")
+            .unwrap();
+        assert_eq!(subagent["context_window"], 272000);
+        assert_eq!(subagent["max_context_window"], 872000);
+        assert_eq!(subagent["effective_context_window_percent"], 95);
+        assert_eq!(subagent["comp_hash"], "3000");
+        assert_eq!(subagent["apply_patch_tool_type"], "function");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_sanitize_subagent_rehydrates_compaction_items_in_input() {
+        let mut json = serde_json::json!({
+            "model": "9router-subagent",
+            "input": [
+                {
+                    "type": "compaction",
+                    "id": "cmp_1",
+                    "encrypted_content": "Audited src/main.rs and identified 3 routes.",
+                    "summary": "old summary field",
+                    "internal_chat_message_metadata_passthrough": "meta_1"
+                },
+                {
+                    "type": "compaction_summary",
+                    "id": "cmp_2",
+                    "summary": [
+                        {"type": "summary_text", "text": "Part A summary"},
+                        {"type": "summary_text", "text": "Part B summary"}
+                    ]
+                },
+                {
+                    "type": "compaction",
+                    "id": "cmp_3",
+                    "encrypted_content": "   "
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Continue with step 2"}]
+                }
+            ]
+        });
+
+        sanitize_subagent_request_for_9router(&mut json);
+        let input_arr = json["input"].as_array().unwrap();
+        assert_eq!(input_arr.len(), 4);
+
+        assert_eq!(input_arr[0]["type"], "message");
+        assert_eq!(input_arr[0]["role"], "user");
+        assert_eq!(
+            input_arr[0]["content"][0]["text"],
+            "[Compacted Conversation Summary]\nAudited src/main.rs and identified 3 routes."
+        );
+        assert!(input_arr[0].get("encrypted_content").is_none());
+        assert!(input_arr[0].get("summary").is_none());
+        assert!(input_arr[0]
+            .get("internal_chat_message_metadata_passthrough")
+            .is_none());
+
+        assert_eq!(input_arr[1]["type"], "message");
+        assert_eq!(input_arr[1]["role"], "user");
+        assert_eq!(
+            input_arr[1]["content"][0]["text"],
+            "[Compacted Conversation Summary]\nPart A summary\nPart B summary"
+        );
+        assert!(input_arr[1].get("summary").is_none());
+
+        assert_eq!(input_arr[2]["type"], "message");
+        assert_eq!(input_arr[2]["role"], "user");
+        assert_eq!(
+            input_arr[2]["content"][0]["text"],
+            "[Compacted Conversation Summary]"
+        );
+        assert!(input_arr[2].get("encrypted_content").is_none());
+    }
+
+    #[test]
+    fn test_build_9router_compaction_request_body_strips_tools_and_appends_instruction() {
+        let req = serde_json::json!({
+            "model": "gpt-6-luna",
+            "generate": false,
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "You are an explorer subagent."}]
+                },
+                {
+                    "type": "agent_message",
+                    "content": [{"type": "input_text", "text": "Audit Cargo.toml and src/main.rs"}]
+                }
+            ]
+        });
+        let raw = serde_json::to_vec(&req).unwrap();
+        assert!(is_compaction_request(&raw));
+
+        let transformed_bytes = build_9router_compaction_request_body(&raw).unwrap();
+        assert!(!is_compaction_request(&transformed_bytes));
+
+        let transformed: Value = serde_json::from_slice(&transformed_bytes).unwrap();
+        assert_ne!(transformed["model"], "gpt-6-luna");
+        assert!(transformed.get("generate").is_none());
+        assert!(transformed.get("tools").is_none());
+        assert!(transformed.get("tool_choice").is_none());
+        assert!(transformed.get("parallel_tool_calls").is_none());
+
+        let input_arr = transformed["input"].as_array().unwrap();
+        assert_eq!(input_arr.len(), 3);
+        assert_eq!(input_arr[0]["role"], "system");
+        assert_eq!(input_arr[1]["type"], "message");
+        assert_eq!(input_arr[1]["role"], "user");
+        assert_eq!(input_arr[2]["type"], "message");
+        assert_eq!(input_arr[2]["role"], "user");
+        assert_eq!(
+            input_arr[2]["content"][0]["text"],
+            COMPACTION_SUMMARIZATION_PROMPT
+        );
+    }
+
+    #[test]
+    fn test_extract_summary_from_9router_response_json_and_sse_variants() {
+        // 1. JSON Responses API format
+        let json_resp = serde_json::to_vec(&serde_json::json!({
+            "id": "resp_1",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "Summary from JSON response."}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            extract_summary_from_9router_response(&json_resp),
+            Some("Summary from JSON response.".to_string())
+        );
+
+        // 2. SSE delta + output_item.done format
+        let sse_resp = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Streamed \"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"summary.\"}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Streamed summary.\"}]}}\n\ndata: [DONE]\n";
+        assert_eq!(
+            extract_summary_from_9router_response(sse_resp),
+            Some("Streamed summary.".to_string())
+        );
+
+        // 3. Empty or error payload returns None
+        let err_resp = br#"{"error":{"message":"upstream failed"}}"#;
+        assert_eq!(extract_summary_from_9router_response(err_resp), None);
+        assert_eq!(extract_summary_from_9router_response(b""), None);
+    }
+
+    #[test]
+    fn test_build_deterministic_local_summary_with_unicode_and_empty_inputs() {
+        let unicode_text = "◆ Subagent 🩺 — → ".repeat(60);
+        let req = serde_json::json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": unicode_text}]
+                },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"cargo test\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "output": "test result: ok. 50 passed"
+                }
+            ]
+        });
+        let summary = build_deterministic_local_summary(&req);
+        assert!(summary.contains("◆ Subagent 🩺"));
+        assert!(summary.contains("tool_call(exec_command)"));
+        assert!(summary.contains("tool_output: test result: ok. 50 passed"));
+
+        let empty_summary = build_deterministic_local_summary(&serde_json::json!({"input": []}));
+        assert!(!empty_summary.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_handler_subagent_compaction_via_9router_and_fallback_when_9router_fails() {
+        use axum::body::to_bytes;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::ServiceExt;
+
+        // Case A: 9Router returns a normal assistant message; proxy wraps it into a type=compaction SSE response
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    !req_str.contains("\"generate\":false"),
+                    "generate:false must be stripped before sending to 9Router"
+                );
+                assert!(
+                    !req_str.contains("gpt-6-luna"),
+                    "gpt-6-luna must be rewritten to 9router subagent model"
+                );
+                let body = r#"{"id":"resp_9r","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"9Router compacted summary of audit."}]}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let state = Arc::new(ProxyAppState {
+            http_client: build_upstream_http_client(),
+        });
+        let app = create_router(state.clone());
+
+        let test_upstream = format!("http://{}/v1/responses", addr);
+        let compaction_req = serde_json::json!({
+            "model": "gpt-6-luna",
+            "generate": false,
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Audit repository security rules"}]
+                }
+            ]
+        });
+        let req = axum::extract::Request::builder()
+            .uri("/backend-api/codex/responses")
+            .method("POST")
+            .header("x-openai-subagent", "explorer")
+            .header("x-codex-test-upstream", &test_upstream)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&compaction_req).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ctype = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ctype.starts_with("text/event-stream"));
+
+        let resp_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let sse_text = String::from_utf8_lossy(&resp_bytes);
+        assert!(sse_text.contains("event: response.created"));
+        assert!(sse_text.contains("event: response.output_item.done"));
+        assert!(sse_text.contains("\"type\":\"compaction\""));
+        assert!(sse_text.contains("\"encrypted_content\":\"9Router compacted summary of audit.\""));
+        assert!(sse_text.contains("event: response.completed"));
+        let _ = server_task.await;
+
+        // Case B: 9Router is unreachable / returns error -> proxy falls back to deterministic local summary
+        let closed_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        let app_fallback = create_router(state);
+        let closed_upstream = format!("http://{}/v1/responses", closed_addr);
+        let req_fallback = axum::extract::Request::builder()
+            .uri("/backend-api/codex/responses")
+            .method("POST")
+            .header("x-openai-subagent", "worker")
+            .header("x-codex-test-upstream", &closed_upstream)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&compaction_req).unwrap()))
+            .unwrap();
+
+        let fallback_res = app_fallback.oneshot(req_fallback).await.unwrap();
+        assert_eq!(fallback_res.status(), StatusCode::OK);
+        let fb_bytes = to_bytes(fallback_res.into_body(), 65536).await.unwrap();
+        let fb_text = String::from_utf8_lossy(&fb_bytes);
+        assert!(fb_text.contains("event: response.output_item.done"));
+        assert!(fb_text.contains("\"type\":\"compaction\""));
+        assert!(fb_text.contains("Audit repository security rules"));
+        assert!(fb_text.contains("event: response.completed"));
     }
 }
 

@@ -68,7 +68,7 @@ When using the official OpenAI Codex Desktop App signed into a personal or Pro C
 
 ## 🖥️ Tested Environment & Version Compatibility Matrix
 
-`codex-9router-proxy` `v0.2.4` is developed and verified against the following environment:
+`codex-9router-proxy` `v0.2.5` is developed and verified against the following environment:
 
 | Component | Verified Version | Notes |
 | :--- | :--- | :--- |
@@ -381,13 +381,13 @@ codex --version
 
 ---
 
-## 📦 What's New in `v0.2.4`
+## 📦 What's New in `v0.2.5`
 
-- **Upstream Connection Resilience & Automatic Retry**: Added a 10-second connect timeout (`.connect_timeout(Duration::from_secs(10))`) to the upstream `reqwest::Client` and a single automatic retry (`send_upstream_with_retry`) when `send().await` fails with a transient connection/request error (`err.is_connect() || err.is_request()`), recovering seamlessly from stale pooled HTTP/2 or TLS sockets after sleep/wake or network transitions.
-- **Full `Error::source()` Diagnostic Chain & Hints (`502 Bad Gateway`)**: Walks the full `std::error::Error::source()` chain (`format_error_chain` / `format_reqwest_upstream_error`) and appends connection/timeout/DNS classifications (`[connect]`, `[timeout]`, `[dns]`) and actionable hints so local DNS/network blackouts (such as Windows `os error 11001`) are immediately self-explanatory in the Codex UI.
-- **`CODEX_CLI_PATH` Override Persistence & Stock `bin\<hash>` Preservation**: Persists `CODEX_CLI_PATH = "%LOCALAPPDATA%\OpenAI\Codex\custom\codex-9router-subagents.exe"` in the Windows User environment while preserving `bin\<hash>\codex.exe` as the unmodified Microsoft Store binary so Electron's SHA-256 integrity check never deletes `bin\<hash>`.
-- **Automatic Microsoft Store Update Sync (`hook-sync.ps1`)**: Automatically refreshes `custom\codex.orig.exe`, `custom\codex-9router-subagents.orig.exe`, and companion helpers (`codex-command-runner.exe`, `codex-windows-sandbox-setup.exe`, `codex-windows-sandbox-service.exe`, `codex-code-mode-host.exe`, `rg.exe`) whenever the Microsoft Store `OpenAI.Codex` package updates.
-- **Enhanced `--doctor` Diagnostics**: Reports `Custom Shim Binary` (`custom\codex-9router-subagents.exe`) and `CODEX_CLI_PATH` status during `codex --doctor`.
+- **Subagent Remote-Compaction via 9Router + Deterministic Local Fallback (`"generate": false`)**: Intercepts subagent `/responses` remote-compaction requests (`"generate": false`), transforms them into 9Router summarization requests, extracts the assistant summary (or falls back to a deterministic local summary constructed from `"input"`), and returns a valid `text/event-stream` SSE sequence (`response.created`, `response.output_item.done` with `"type": "compaction"` and `"encrypted_content"`, and `response.completed`) strictly without routing subagent requests to ChatGPT.
+- **Compaction Checkpoint Rehydration (`"type": "compaction"`)**: Rehydrates `"type": "compaction"` items in `"input"` into standard `"type": "message"` (`"role": "user"`) items prefixed with `[Compacted Conversation Summary]` inside `sanitize_subagent_request_for_9router` so 9Router retains compacted context on subsequent turns.
+- **`gpt-6-luna` Metadata Alignment & `models_cache.json` In-Place Sync**: Aligns injected subagent model metadata (`context_window: 272000`, `max_context_window: 872000`, `effective_context_window_percent: 95`, `comp_hash: "3000"`) with `gpt-6-luna`, updates existing entries in place, and synchronizes `~/.codex/models_cache.json` on startup, `--doctor`, and installation so subagent forks never trigger false `model_downshift` or `comp_hash_changed` compactions.
+- **Hidden-Desktop (`exebox-*`) GUI Self-Healing**: Automatically detects and terminates `ChatGPT.exe` instances stranded on hidden sandbox desktops (`exebox-*`) while preserving visible `WinSta0\Default` windows.
+- **Upstream Connection Resilience & Full `Error::source()` Diagnostics**: Includes a 10-second connect timeout, automatic retry on transient socket errors, and full `Error::source()` diagnostic chains (`[connect]`, `[timeout]`, `[dns]`).
 
 ---
 

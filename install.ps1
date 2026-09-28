@@ -62,8 +62,101 @@ $targetBinary = Join-Path $scriptDir "target\release\codex-9router-proxy.exe"
 $bundledBinary = Join-Path $scriptDir "codex-9router-proxy.exe"
 $releaseBinary = if (Test-Path $targetBinary) { $targetBinary } elseif (Test-Path $bundledBinary) { $bundledBinary } else { $targetBinary }
 
+function Clear-HiddenDesktopCodexGui {
+    $chatGptPids = [int[]]@(Get-Process -Name "ChatGPT*" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+    if ($chatGptPids.Count -gt 0) {
+        if (-not ("CodexDesktopCheck" -as [type])) {
+            Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+public class CodexDesktopCheck {
+    [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode)]
+    public delegate bool EnumDesktopsDelegate([MarshalAs(UnmanagedType.LPWStr)] string desktop, IntPtr lParam);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDesktopsW(IntPtr hwinsta, EnumDesktopsDelegate lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr OpenDesktopW(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
+    [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr hDesktop);
+    [DllImport("user32.dll")] public static extern bool EnumDesktopWindows(IntPtr hDesktop, EnumWindowsProc lpfn, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    public static void ClassifyChatGptPids(int[] targetPids, out int[] defaultVisiblePids, out int[] defaultAnyPids, out int[] hiddenDesktopPids) {
+        HashSet<int> targetSet = new HashSet<int>(targetPids ?? new int[0]);
+        HashSet<int> defVis = new HashSet<int>();
+        HashSet<int> defAny = new HashSet<int>();
+        HashSet<int> hidden = new HashSet<int>();
+        List<string> desktops = new List<string>();
+        EnumDesktopsDelegate dCb = (d, l) => { desktops.Add(d); return true; };
+        EnumDesktopsW(GetProcessWindowStation(), dCb, IntPtr.Zero);
+        foreach (string dName in desktops) {
+            IntPtr hDesk = OpenDesktopW(dName, 0, false, 0x01FF);
+            if (hDesk == IntPtr.Zero) continue;
+            bool isDefault = string.Equals(dName, "Default", StringComparison.OrdinalIgnoreCase);
+            bool isChromiumSbox = dName.StartsWith("sbox_alternate_desktop", StringComparison.OrdinalIgnoreCase);
+            EnumWindowsProc wCb = (hWnd, l) => {
+                uint wpid = 0;
+                GetWindowThreadProcessId(hWnd, out wpid);
+                if (targetSet.Contains((int)wpid)) {
+                    StringBuilder cls = new StringBuilder(256);
+                    GetClassNameW(hWnd, cls, 256);
+                    string clsName = cls.ToString();
+                    if (clsName.StartsWith("Chrome_WidgetWin_", StringComparison.Ordinal)) {
+                        if (isDefault) {
+                            defAny.Add((int)wpid);
+                            if (clsName == "Chrome_WidgetWin_1" && IsWindowVisible(hWnd)) {
+                                defVis.Add((int)wpid);
+                            }
+                        } else if (!isChromiumSbox) {
+                            hidden.Add((int)wpid);
+                        }
+                    }
+                }
+                return true;
+            };
+            EnumDesktopWindows(hDesk, wCb, IntPtr.Zero);
+            CloseDesktop(hDesk);
+        }
+        hidden.ExceptWith(defAny);
+        defaultVisiblePids = new List<int>(defVis).ToArray();
+        defaultAnyPids = new List<int>(defAny).ToArray();
+        hiddenDesktopPids = new List<int>(hidden).ToArray();
+    }
+}
+"@ -ErrorAction SilentlyContinue
+        }
+        [int[]]$defaultVisiblePids = @()
+        [int[]]$defaultAnyPids = @()
+        [int[]]$hiddenDesktopPids = @()
+        [CodexDesktopCheck]::ClassifyChatGptPids($chatGptPids, [ref]$defaultVisiblePids, [ref]$defaultAnyPids, [ref]$hiddenDesktopPids)
+        if ($hiddenDesktopPids.Count -gt 0) {
+            if ($defaultVisiblePids.Count -eq 0) {
+                Write-Host "[WARN] Stopping hidden-desktop ChatGPT.exe instances (PIDs: $($hiddenDesktopPids -join ', ')) blocking Default desktop launch..." -ForegroundColor Yellow
+                Get-Process -Name "ChatGPT*","codex-computer-use*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 500
+            } else {
+                Write-Host "[WARN] Stopping stray hidden-desktop ChatGPT.exe instances (PIDs: $($hiddenDesktopPids -join ', ')) while preserving Default desktop session..." -ForegroundColor Yellow
+                foreach ($hpid in $hiddenDesktopPids) {
+                    & taskkill.exe /F /PID $hpid /T 2>&1 | Out-Null
+                }
+                Start-Sleep -Milliseconds 300
+            }
+        }
+    }
+    if (-not (Get-Process -Name "ChatGPT*" -ErrorAction SilentlyContinue)) {
+        @(
+            "$env:APPDATA\Codex\web\Codex\lockfile",
+            "$env:LOCALAPPDATA\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Roaming\Codex\web\Codex\lockfile"
+        ) | Where-Object { Test-Path $_ } | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # If -Doctor requested, run diagnostic check immediately
 if ($Doctor) {
+    Clear-HiddenDesktopCodexGui
     if (Test-Path $releaseBinary) {
         & $releaseBinary --doctor
     } else {
@@ -425,8 +518,9 @@ if (-not (Test-Path $releaseBinary)) {
 }
 Write-Host "[OK] Release binary ready ($((Get-Item $releaseBinary).Length) bytes)." -ForegroundColor Green
 
-# 6. Stop running codex processes and port 20129 listeners before hooking
+# 6. Stop running codex processes, hidden-desktop ChatGPT.exe instances, and port 20129 listeners before hooking
 Write-Host "[*] Checking for running codex processes..." -ForegroundColor Gray
+Clear-HiddenDesktopCodexGui
 Get-NetTCPConnection -LocalPort 20129 -ErrorAction SilentlyContinue | ForEach-Object {
     $procId = $_.OwningProcess
     if ($procId -gt 0 -and $procId -ne $PID) {
@@ -679,11 +773,11 @@ if ($storeResDir) {
     }
 }
 
-# Clear stale ~/.codex/models_cache.json so codex.orig.exe refreshes /backend-api/models with injected 9router-subagent metadata
+# Synchronize ~/.codex/models_cache.json in place with gpt-6-luna aligned subagent metadata (272k/872k, comp_hash=3000)
 $modelsCache = Join-Path $codexDir "models_cache.json"
 if (Test-Path $modelsCache) {
-    Remove-Item -Path $modelsCache -Force -ErrorAction SilentlyContinue
-    Write-Host "[OK] Cleared stale $modelsCache so subagent model metadata refreshes immediately." -ForegroundColor Green
+    & $releaseBinary --doctor 2>&1 | Out-Null
+    Write-Host "[OK] Synchronized subagent model metadata in $modelsCache (aligned with gpt-6-luna)." -ForegroundColor Green
 }
 
 # 10. Register Self-Healing Startup Hook
@@ -809,9 +903,38 @@ if (Test-Path `$binRoot) {
     }
 }
 
-# 5. Terminate any stale .old.* processes and clean up leftover .old.* files
+# 5. Terminate any stale .old.* processes, hidden-desktop ChatGPT.exe instances, and clean up leftover .old.* / lockfile files
 Get-Process -Name '*.old*' | Stop-Process -Force
 Get-ChildItem "`$binRoot\*\*.old.*", "`$customDir\*.old.*" | Remove-Item -Force
+
+`$chatGptPids = [int[]]@(Get-Process -Name 'ChatGPT*' | Select-Object -ExpandProperty Id)
+if (`$chatGptPids.Count -gt 0) {
+    if (-not ('CodexDesktopCheck' -as [type])) {
+        `$cs = 'using System; using System.Text; using System.Runtime.InteropServices; using System.Collections.Generic; public class CodexDesktopCheck { [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode)] public delegate bool EnumDesktopsDelegate([MarshalAs(UnmanagedType.LPWStr)] string desktop, IntPtr lParam); public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam); [DllImport("user32.dll")] public static extern IntPtr GetProcessWindowStation(); [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDesktopsW(IntPtr hwinsta, EnumDesktopsDelegate lpEnumFunc, IntPtr lParam); [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr OpenDesktopW(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess); [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr hDesktop); [DllImport("user32.dll")] public static extern bool EnumDesktopWindows(IntPtr hDesktop, EnumWindowsProc lpfn, IntPtr lParam); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId); [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd); public static void ClassifyChatGptPids(int[] targetPids, out int[] defaultVisiblePids, out int[] defaultAnyPids, out int[] hiddenDesktopPids) { HashSet<int> targetSet = new HashSet<int>(targetPids ?? new int[0]); HashSet<int> defVis = new HashSet<int>(); HashSet<int> defAny = new HashSet<int>(); HashSet<int> hidden = new HashSet<int>(); List<string> desktops = new List<string>(); EnumDesktopsDelegate dCb = (d, l) => { desktops.Add(d); return true; }; EnumDesktopsW(GetProcessWindowStation(), dCb, IntPtr.Zero); foreach (string dName in desktops) { IntPtr hDesk = OpenDesktopW(dName, 0, false, 0x01FF); if (hDesk == IntPtr.Zero) continue; bool isDefault = string.Equals(dName, "Default", StringComparison.OrdinalIgnoreCase); bool isChromiumSbox = dName.StartsWith("sbox_alternate_desktop", StringComparison.OrdinalIgnoreCase); EnumWindowsProc wCb = (hWnd, l) => { uint wpid = 0; GetWindowThreadProcessId(hWnd, out wpid); if (targetSet.Contains((int)wpid)) { StringBuilder cls = new StringBuilder(256); GetClassNameW(hWnd, cls, 256); string clsName = cls.ToString(); if (clsName.StartsWith("Chrome_WidgetWin_", StringComparison.Ordinal)) { if (isDefault) { defAny.Add((int)wpid); if (clsName == "Chrome_WidgetWin_1" && IsWindowVisible(hWnd)) { defVis.Add((int)wpid); } } else if (!isChromiumSbox) { hidden.Add((int)wpid); } } } return true; }; EnumDesktopWindows(hDesk, wCb, IntPtr.Zero); CloseDesktop(hDesk); } hidden.ExceptWith(defAny); defaultVisiblePids = new List<int>(defVis).ToArray(); defaultAnyPids = new List<int>(defAny).ToArray(); hiddenDesktopPids = new List<int>(hidden).ToArray(); } }'
+        Add-Type -TypeDefinition `$cs
+    }
+    [int[]]`$defaultVisiblePids = @()
+    [int[]]`$defaultAnyPids = @()
+    [int[]]`$hiddenDesktopPids = @()
+    [CodexDesktopCheck]::ClassifyChatGptPids(`$chatGptPids, [ref]`$defaultVisiblePids, [ref]`$defaultAnyPids, [ref]`$hiddenDesktopPids)
+    if (`$hiddenDesktopPids.Count -gt 0) {
+        if (`$defaultVisiblePids.Count -eq 0) {
+            Get-Process -Name 'ChatGPT*','codex-computer-use*' | Stop-Process -Force
+            Start-Sleep -Milliseconds 500
+        } else {
+            foreach (`$hpid in `$hiddenDesktopPids) {
+                & taskkill.exe /F /PID `$hpid /T 2>&1 | Out-Null
+            }
+            Start-Sleep -Milliseconds 300
+        }
+    }
+}
+if (-not (Get-Process -Name 'ChatGPT*')) {
+    @(
+        "`$env:APPDATA\Codex\web\Codex\lockfile",
+        "`$env:LOCALAPPDATA\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Roaming\Codex\web\Codex\lockfile"
+    ) | Where-Object { Test-Path `$_ } | Remove-Item -Force
+}
 "@
 [System.IO.File]::WriteAllText($syncScriptPath, $syncScript, $utf8NoBom)
 

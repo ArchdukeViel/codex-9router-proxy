@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "codex-9router-proxy"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "axum",
  "futures-util",
