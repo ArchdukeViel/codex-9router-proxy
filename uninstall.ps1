@@ -13,9 +13,18 @@ Write-Host "==================================================================="
 Write-Host "            Codex 9Router Proxy - Uninstaller                      " -ForegroundColor Yellow
 Write-Host "===================================================================" -ForegroundColor Yellow
 
-# 1. Stop running codex processes
+# 1. Stop running codex processes and port 20129 listeners
 Write-Host "[*] Stopping running codex processes..." -ForegroundColor Gray
+Get-NetTCPConnection -LocalPort 20129 -ErrorAction SilentlyContinue | ForEach-Object {
+    $procId = $_.OwningProcess
+    if ($procId -gt 0 -and $procId -ne $PID) {
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    }
+}
 Get-Process -Name "*codex*" -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID } | ForEach-Object {
+    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+}
+Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*.old*" -or $_.Path -like "*.old.*" } | ForEach-Object {
     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Milliseconds 500
@@ -38,7 +47,15 @@ if ($storePkg -and $storePkg.InstallLocation) {
     $cand = Join-Path $storePkg.InstallLocation "app\resources"
     if (Test-Path $cand) { $storeResDir = $cand }
 }
+if (-not $storeResDir) {
+    $winAppsCandidate = Get-ChildItem "C:\Program Files\WindowsApps\OpenAI.Codex*" -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($winAppsCandidate) {
+        $cand = Join-Path $winAppsCandidate.FullName "app\resources"
+        if (Test-Path $cand) { $storeResDir = $cand }
+    }
+}
 $desktopBinRoot = Join-Path $env:LOCALAPPDATA "OpenAI\Codex\bin"
+$customDir = Join-Path $env:LOCALAPPDATA "OpenAI\Codex\custom"
 if (Test-Path $desktopBinRoot) {
     Get-ChildItem -Path $desktopBinRoot -Directory | ForEach-Object {
         $c = Join-Path $_.FullName "codex.exe"
@@ -53,6 +70,7 @@ if (Test-Path $desktopBinRoot) {
         }
     }
 }
+Get-ChildItem "$desktopBinRoot\*\*.old.*", "$customDir\*.old.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
 # 4. Restore Daemon Binaries
 $daemonReleases = Join-Path $env:USERPROFILE ".codex\packages\app-server-daemon\releases"

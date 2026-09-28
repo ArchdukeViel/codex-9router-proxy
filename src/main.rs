@@ -295,6 +295,88 @@ pub fn get_target_model_provider() -> String {
     env::var("CODEX_SUBAGENT_PROVIDER").unwrap_or_else(|_| "9router".to_string())
 }
 
+/// Parse the value of a registry key from `reg query HKCU\Environment /v <name>` output.
+pub fn parse_reg_query_value(output: &str, name: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("HKEY_") {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let key_name = parts.next()?;
+        if !key_name.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let reg_type = parts.next()?;
+        if !reg_type.to_uppercase().starts_with("REG_") {
+            continue;
+        }
+        if let Some(type_pos) = trimmed.find(reg_type) {
+            let val = trimmed[type_pos + reg_type.len()..].trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Query a Windows User Environment variable from `HKCU\Environment`.
+pub fn get_user_env_var(name: &str) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let output = Command::new("reg")
+        .args(["query", r"HKCU\Environment", "/v", name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_reg_query_value(&text, name)
+}
+
+/// Select the best official `.orig.exe` candidate inside `dir`, preferring files > 10 MB
+/// (stock Codex binary) and sorting by most recent modification time.
+pub fn pick_best_orig_candidate(dir: &Path) -> Option<PathBuf> {
+    let cur_canon = env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    let mut valid_candidates: Vec<(PathBuf, u64, Option<std::time::SystemTime>)> = Vec::new();
+
+    for candidate_name in ["codex-9router-subagents.orig.exe", "codex.orig.exe"] {
+        let orig = dir.join(candidate_name);
+        if !orig.is_file() {
+            continue;
+        }
+        if let (Some(ref c1), Ok(c2)) = (&cur_canon, orig.canonicalize()) {
+            if c1 == &c2 {
+                continue;
+            }
+        }
+        let meta = orig.metadata().ok();
+        let len = meta.as_ref().map_or(0, |m| m.len());
+        if len == 0 {
+            continue;
+        }
+        let modified = meta.and_then(|m| m.modified().ok());
+        valid_candidates.push((orig, len, modified));
+    }
+
+    if valid_candidates.is_empty() {
+        return None;
+    }
+
+    let has_full_stock = valid_candidates.iter().any(|(_, len, _)| *len > 10_000_000);
+    if has_full_stock {
+        valid_candidates.retain(|(_, len, _)| *len > 10_000_000);
+    }
+
+    valid_candidates.sort_by_key(|a| std::cmp::Reverse(a.2));
+    valid_candidates.into_iter().next().map(|(p, _, _)| p)
+}
+
 /// Automatically locate the real official codex executable.
 pub fn find_real_codex() -> PathBuf {
     // 1. Explicit override via REAL_CODEX_PATH
@@ -305,36 +387,23 @@ pub fn find_real_codex() -> PathBuf {
         }
     }
 
-    // 2. Check if codex.orig.exe or codex-9router-subagents.orig.exe exists in the directory of the current executable
+    // 2. Check if codex-9router-subagents.orig.exe or codex.orig.exe exists in the directory of the current executable
     if let Ok(current_exe) = env::current_exe() {
         if let Some(parent) = current_exe.parent() {
-            for candidate_name in ["codex.orig.exe", "codex-9router-subagents.orig.exe"] {
-                let orig = parent.join(candidate_name);
-                if orig.is_file() {
-                    return orig;
-                }
+            if let Some(orig) = pick_best_orig_candidate(parent) {
+                return orig;
             }
         }
     }
 
     // 3. Check custom directory and bin/<hash> candidates in LOCALAPPDATA
     if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
-        let custom_orig = Path::new(&local_app_data)
+        let custom_dir = Path::new(&local_app_data)
             .join("OpenAI")
             .join("Codex")
-            .join("custom")
-            .join("codex-9router-subagents.orig.exe");
-        if custom_orig.is_file() {
-            return custom_orig;
-        }
-
-        let custom_codex_orig = Path::new(&local_app_data)
-            .join("OpenAI")
-            .join("Codex")
-            .join("custom")
-            .join("codex.orig.exe");
-        if custom_codex_orig.is_file() {
-            return custom_codex_orig;
+            .join("custom");
+        if let Some(orig) = pick_best_orig_candidate(&custom_dir) {
+            return orig;
         }
 
         let bin_dir = Path::new(&local_app_data)
@@ -1324,7 +1393,7 @@ pub fn format_error_chain(err: &dyn std::error::Error) -> String {
     while let Some(source) = current {
         let msg = source.to_string();
         let trimmed = msg.trim();
-        if !trimmed.is_empty() && chain.last().is_none_or(|last| !last.contains(trimmed)) {
+        if !trimmed.is_empty() && !chain.iter().any(|prev| prev.contains(trimmed)) {
             chain.push(trimmed.to_string());
         }
         current = source.source();
@@ -1332,17 +1401,22 @@ pub fn format_error_chain(err: &dyn std::error::Error) -> String {
     chain.join(" -> ")
 }
 
-/// Format a `reqwest::Error` with its full `std::error::Error::source()` cause chain and
-/// diagnostic connection/timeout/DNS hints for `502 Bad Gateway` responses.
-pub fn format_reqwest_upstream_error(target_url: &str, err: &reqwest::Error) -> String {
-    let chain = format_error_chain(err);
+/// Format an upstream error chain with classification tags (`[connect]`, `[timeout]`, `[dns]`, `[request]`)
+/// and diagnostic hints for `502 Bad Gateway` responses.
+pub fn format_upstream_error_with_flags(
+    target_url: &str,
+    chain: &str,
+    is_timeout: bool,
+    is_connect: bool,
+    is_request: bool,
+) -> String {
     let lower = chain.to_lowercase();
     let mut categories = Vec::new();
 
-    if err.is_timeout() || lower.contains("timed out") || lower.contains("timeout") {
+    if is_timeout || lower.contains("timed out") || lower.contains("timeout") {
         categories.push("timeout");
     }
-    if err.is_connect() {
+    if is_connect || lower.contains("client error (connect)") || lower.contains("connection refused") {
         categories.push("connect");
     }
     if lower.contains("dns")
@@ -1353,7 +1427,7 @@ pub fn format_reqwest_upstream_error(target_url: &str, err: &reqwest::Error) -> 
     {
         categories.push("dns");
     }
-    if err.is_request() && categories.is_empty() {
+    if is_request && categories.is_empty() {
         categories.push("request");
     }
 
@@ -1378,6 +1452,19 @@ pub fn format_reqwest_upstream_error(target_url: &str, err: &reqwest::Error) -> 
     format!(
         "Codex 9Router Proxy upstream connection error to {}: {}{}{}",
         target_url, chain, tag, hint
+    )
+}
+
+/// Format a `reqwest::Error` with its full `std::error::Error::source()` cause chain and
+/// diagnostic connection/timeout/DNS hints for `502 Bad Gateway` responses.
+pub fn format_reqwest_upstream_error(target_url: &str, err: &reqwest::Error) -> String {
+    let chain = format_error_chain(err);
+    format_upstream_error_with_flags(
+        target_url,
+        &chain,
+        err.is_timeout(),
+        err.is_connect(),
+        err.is_request(),
     )
 }
 
@@ -1494,6 +1581,8 @@ pub async fn proxy_handler(
     #[cfg(not(test))]
     let target_url = resolve_forward_url_with_query(path, query, is_subagent);
     let mut forward_headers = build_forward_headers(&headers, is_subagent);
+    #[cfg(test)]
+    forward_headers.remove("x-codex-test-upstream");
 
     // For GET /backend-api/models, strip compression and conditional cache headers
     // so ChatGPT returns plain 200 OK JSON that we can enrich with 9Router subagent models.
@@ -1541,13 +1630,14 @@ pub async fn proxy_handler(
     // automatically retry once using the default subagent model (`9router-subagent`).
     if is_subagent && upstream_res.status().as_u16() >= 400 {
         if let Some(fallback_body) = rewrite_body_model_to_fallback(&routed_body) {
-            if let Ok(retry_res) = state
-                .http_client
-                .request(method, &target_url)
-                .headers(forward_headers)
-                .body(Bytes::from(fallback_body))
-                .send()
-                .await
+            if let Ok((retry_res, _)) = send_upstream_with_retry(
+                &state.http_client,
+                method,
+                &target_url,
+                forward_headers,
+                Bytes::from(fallback_body),
+            )
+            .await
             {
                 upstream_res = retry_res;
             }
@@ -1578,7 +1668,15 @@ pub async fn proxy_handler(
             }
             Err(e) => (
                 StatusCode::BAD_GATEWAY,
-                format!("Upstream error reading models body: {}", e),
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "error": {
+                        "message": format_reqwest_upstream_error(&target_url, &e),
+                        "type": "proxy_gateway_error",
+                        "code": 502
+                    }
+                })
+                .to_string(),
             )
                 .into_response(),
         };
@@ -1765,10 +1863,19 @@ pub fn run_doctor() {
         }
     }
 
-    match env::var("CODEX_CLI_PATH") {
-        Ok(val) if !val.trim().is_empty() => {
-            let p = PathBuf::from(val.trim());
-            if p.is_file() {
+    let proc_cli_path = env::var("CODEX_CLI_PATH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let user_cli_path = get_user_env_var("CODEX_CLI_PATH")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    match (proc_cli_path.as_deref(), user_cli_path.as_deref()) {
+        (Some(val), Some(uval)) => {
+            let p = PathBuf::from(val);
+            let up = PathBuf::from(uval);
+            if p.is_file() && up.is_file() {
                 println!("[OK] CODEX_CLI_PATH     : {} (Verified)", p.display());
             } else {
                 println!(
@@ -1777,14 +1884,47 @@ pub fn run_doctor() {
                 );
             }
         }
-        _ => {
-            println!("[WARN] CODEX_CLI_PATH   : Not set in process environment");
+        (None, Some(uval)) => {
+            let up = PathBuf::from(uval);
+            if up.is_file() {
+                println!(
+                    "[OK] CODEX_CLI_PATH     : {} (Verified in User Environment)",
+                    up.display()
+                );
+            } else {
+                println!(
+                    "[WARN] CODEX_CLI_PATH   : {} (Target file missing)",
+                    up.display()
+                );
+            }
+        }
+        (Some(val), None) => {
+            let p = PathBuf::from(val);
+            if p.is_file() {
+                if cfg!(windows) {
+                    println!(
+                        "[WARN] CODEX_CLI_PATH   : {} (Set in process only; missing in User Environment)",
+                        p.display()
+                    );
+                } else {
+                    println!("[OK] CODEX_CLI_PATH     : {} (Verified)", p.display());
+                }
+            } else {
+                println!(
+                    "[WARN] CODEX_CLI_PATH   : {} (Target file missing)",
+                    p.display()
+                );
+            }
+        }
+        (None, None) => {
+            println!("[WARN] CODEX_CLI_PATH   : Not set in process or User environment");
         }
     }
 
     let provider = get_target_model_provider();
     println!("[OK] Subagent Provider  : {}", provider);
-    let key_set = env::var("NINEROUTER_KEY").is_ok_and(|k| !k.trim().is_empty());
+    let key_set = env::var("NINEROUTER_KEY").is_ok_and(|k| !k.trim().is_empty())
+        || get_user_env_var("NINEROUTER_KEY").is_some_and(|k| !k.trim().is_empty());
     if key_set {
         println!("[OK] Provider API Key   : [CONFIGURED / MASKED]");
     } else {
@@ -3130,6 +3270,110 @@ default_subagent_model = "9router-subagent"
         };
         // Duplicate substring in immediate child should not be repeated
         assert_eq!(format_error_chain(&dup_top), "dns failure: os error 11001");
+
+        // Non-adjacent duplicate (grandchild repeating top-level substring) should also not be repeated
+        let non_adj_leaf = TestNestedError {
+            msg: "os error 11001".to_string(),
+            source: None,
+        };
+        let non_adj_mid = TestNestedError {
+            msg: "client error (Connect)".to_string(),
+            source: Some(Box::new(non_adj_leaf)),
+        };
+        let non_adj_top = TestNestedError {
+            msg: "dns lookup failed with os error 11001".to_string(),
+            source: Some(Box::new(non_adj_mid)),
+        };
+        assert_eq!(
+            format_error_chain(&non_adj_top),
+            "dns lookup failed with os error 11001 -> client error (Connect)"
+        );
+    }
+
+    #[test]
+    fn test_format_upstream_error_with_flags_dns_timeout_and_request() {
+        let target = "https://chatgpt.com/backend-api/codex/responses";
+        let dns_chain = "error sending request for url (https://chatgpt.com/backend-api/codex/responses) -> client error (Connect) -> dns error -> No such host is known. (os error 11001)";
+        let dns_msg = format_upstream_error_with_flags(target, dns_chain, false, true, true);
+        assert!(dns_msg.contains("[connect/dns]"), "got: {}", dns_msg);
+        assert!(
+            dns_msg.contains("[hint: DNS lookup failed (e.g. os error 11001); check local internet/DNS connectivity]"),
+            "got: {}",
+            dns_msg
+        );
+
+        let timeout_chain = "error sending request for url -> operation timed out";
+        let timeout_msg = format_upstream_error_with_flags(target, timeout_chain, true, true, true);
+        assert!(timeout_msg.contains("[timeout/connect]"), "got: {}", timeout_msg);
+        assert!(
+            timeout_msg.contains("[hint: upstream connection timed out; check network stability or firewall]"),
+            "got: {}",
+            timeout_msg
+        );
+
+        let req_chain = "error sending request for url -> connection closed before message completed";
+        let req_msg = format_upstream_error_with_flags(target, req_chain, false, false, true);
+        assert!(req_msg.contains("[request]"), "got: {}", req_msg);
+        assert!(
+            req_msg.contains("[hint: transient upstream request/socket error; retried automatically]"),
+            "got: {}",
+            req_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_format_reqwest_upstream_error_timeout_classification() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            if let Ok((_stream, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let url = format!("http://{}/backend-api/codex/responses", addr);
+        let err = client.get(&url).send().await.unwrap_err();
+
+        let formatted = format_reqwest_upstream_error(&url, &err);
+        assert!(formatted.contains("[timeout"), "expected [timeout] tag in: {}", formatted);
+        assert!(
+            formatted.contains("[hint: upstream connection timed out; check network stability or firewall]"),
+            "expected timeout hint in: {}",
+            formatted
+        );
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_parse_reg_query_value() {
+        let sample = "\r\nHKEY_CURRENT_USER\\Environment\r\n    CODEX_CLI_PATH    REG_SZ    C:\\Users\\test user\\AppData\\Local\\OpenAI\\Codex\\custom\\codex-9router-subagents.exe\r\n\r\n";
+        assert_eq!(
+            parse_reg_query_value(sample, "CODEX_CLI_PATH"),
+            Some("C:\\Users\\test user\\AppData\\Local\\OpenAI\\Codex\\custom\\codex-9router-subagents.exe".to_string())
+        );
+        assert_eq!(parse_reg_query_value(sample, "OTHER_VAR"), None);
+    }
+
+    #[test]
+    fn test_pick_best_orig_candidate_prefers_newest_and_ignores_zero_byte() {
+        let tmp_dir = env::temp_dir().join(format!("codex_orig_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let zero_file = tmp_dir.join("codex.orig.exe");
+        let valid_file = tmp_dir.join("codex-9router-subagents.orig.exe");
+        fs::write(&zero_file, b"").unwrap();
+        fs::write(&valid_file, b"non-empty-binary").unwrap();
+
+        let picked = pick_best_orig_candidate(&tmp_dir).unwrap();
+        assert_eq!(picked, valid_file);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[tokio::test]

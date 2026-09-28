@@ -573,6 +573,9 @@ if (Test-Path $desktopBinRoot) {
             } elseif (-not (Test-Path $codexExe) -and (Test-Path $codexOrig) -and ((Get-Item $codexOrig).Length -gt 10000000)) {
                 Safe-CopyExecutable -Source $codexOrig -Destination $codexExe | Out-Null
                 Write-Host "[OK] Restored stock binary at $codexExe from $codexOrig" -ForegroundColor Green
+            } elseif (-not (Test-Path $codexExe) -and $storeResDir -and (Test-Path (Join-Path $storeResDir "codex.exe"))) {
+                Safe-CopyExecutable -Source (Join-Path $storeResDir "codex.exe") -Destination $codexExe | Out-Null
+                Write-Host "[OK] Restored stock binary at $codexExe from Microsoft Store resources" -ForegroundColor Green
             }
 
             if ((Test-Path $codexExe) -and ((Get-Item $codexExe).Length -gt 10000000) -and (Test-Path $codexOrig)) {
@@ -589,7 +592,7 @@ if (Test-Path $desktopBinRoot) {
                     $hSrc = Join-Path $storeResDir $helper
                     $hDst = Join-Path $targetDir $helper
                     if ((Test-Path $hSrc) -and -not (Test-Path $hDst)) {
-                        Copy-Item -Path $hSrc -Destination $hDst -Force -ErrorAction SilentlyContinue
+                        Safe-CopyExecutable -Source $hSrc -Destination $hDst | Out-Null
                     }
                 }
             }
@@ -692,6 +695,33 @@ $syncScript = @"
 `$customCodex = Join-Path `$customDir 'codex.exe'
 `$binRoot = Join-Path `$env:LOCALAPPDATA 'OpenAI\Codex\bin'
 
+function Sync-Executable {
+    param(
+        [string]`$Source,
+        [string]`$Destination
+    )
+    if (-not (Test-Path `$Source)) { return `$false }
+    `$destDir = Split-Path -Parent `$Destination
+    `$fileName = Split-Path -Leaf `$Destination
+    if (-not (Test-Path `$Destination)) {
+        Copy-Item -Path `$Source -Destination `$Destination -Force
+        return (Test-Path `$Destination)
+    }
+    try {
+        Copy-Item -Path `$Source -Destination `$Destination -Force -ErrorAction Stop
+        return `$true
+    } catch {
+        `$tempOld = Join-Path `$destDir "`$fileName.old.`$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        try {
+            Move-Item -Path `$Destination -Destination `$tempOld -Force -ErrorAction Stop
+            Copy-Item -Path `$Source -Destination `$Destination -Force -ErrorAction Stop
+            return `$true
+        } catch {
+            return `$false
+        }
+    }
+}
+
 # 1. Ensure CODEX_CLI_PATH User environment override points to our custom shim
 if (Test-Path `$proxyPath) {
     `$curCli = [System.Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'User')
@@ -700,7 +730,7 @@ if (Test-Path `$proxyPath) {
     }
     `$env:CODEX_CLI_PATH = `$proxyPath
     if ((-not (Test-Path `$customCodex)) -or ((Get-Item `$customCodex).Length -ne (Get-Item `$proxyPath).Length) -or ((Get-FileHash `$customCodex -Algorithm SHA256).Hash -ne (Get-FileHash `$proxyPath -Algorithm SHA256).Hash)) {
-        Copy-Item `$proxyPath `$customCodex -Force
+        Sync-Executable -Source `$proxyPath -Destination `$customCodex | Out-Null
     }
 }
 
@@ -726,7 +756,7 @@ if (`$resDir -and (Test-Path `$resDir)) {
         foreach (`$origName in @('codex-9router-subagents.orig.exe', 'codex.orig.exe')) {
             `$origDst = Join-Path `$customDir `$origName
             if ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -ne `$storeItem.Length) -or ((Get-Item `$origDst).LastWriteTimeUtc -ne `$storeItem.LastWriteTimeUtc)) {
-                Copy-Item `$storeCodex `$origDst -Force
+                Sync-Executable -Source `$storeCodex -Destination `$origDst | Out-Null
             }
         }
     }
@@ -736,7 +766,7 @@ if (`$resDir -and (Test-Path `$resDir)) {
         if (Test-Path `$hs) {
             `$hItem = Get-Item `$hs
             if ((-not (Test-Path `$hd)) -or ((Get-Item `$hd).Length -ne `$hItem.Length) -or ((Get-Item `$hd).LastWriteTimeUtc -ne `$hItem.LastWriteTimeUtc)) {
-                Copy-Item `$hs `$hd -Force
+                Sync-Executable -Source `$hs -Destination `$hd | Out-Null
             }
         }
     }
@@ -750,12 +780,14 @@ if (Test-Path `$binRoot) {
         if ((Test-Path `$c) -or (Test-Path `$o)) {
             if ((Test-Path `$c) -and ((Get-Item `$c).Length -lt 10000000)) {
                 if ((Test-Path `$o) -and ((Get-Item `$o).Length -gt 10000000)) {
-                    Copy-Item `$o `$c -Force
+                    Sync-Executable -Source `$o -Destination `$c | Out-Null
                 } elseif (`$resDir -and (Test-Path (Join-Path `$resDir 'codex.exe'))) {
-                    Copy-Item (Join-Path `$resDir 'codex.exe') `$c -Force
+                    Sync-Executable -Source (Join-Path `$resDir 'codex.exe') -Destination `$c | Out-Null
                 }
             } elseif ((-not (Test-Path `$c)) -and (Test-Path `$o) -and ((Get-Item `$o).Length -gt 10000000)) {
-                Copy-Item `$o `$c -Force
+                Sync-Executable -Source `$o -Destination `$c | Out-Null
+            } elseif ((-not (Test-Path `$c)) -and `$resDir -and (Test-Path (Join-Path `$resDir 'codex.exe'))) {
+                Sync-Executable -Source (Join-Path `$resDir 'codex.exe') -Destination `$c | Out-Null
             }
             if ((Test-Path `$c) -and ((Get-Item `$c).Length -gt 10000000) -and (Test-Path `$o)) {
                 Remove-Item `$o -Force
@@ -769,7 +801,7 @@ if (Test-Path `$binRoot) {
                     `$hs = Join-Path `$resDir `$h
                     `$hd = Join-Path `$_.FullName `$h
                     if ((Test-Path `$hs) -and -not (Test-Path `$hd)) {
-                        Copy-Item `$hs `$hd -Force
+                        Sync-Executable -Source `$hs -Destination `$hd | Out-Null
                     }
                 }
             }
@@ -777,7 +809,8 @@ if (Test-Path `$binRoot) {
     }
 }
 
-# 5. Clean up any unlocked leftover .old.* files
+# 5. Terminate any stale .old.* processes and clean up leftover .old.* files
+Get-Process -Name '*.old*' | Stop-Process -Force
 Get-ChildItem "`$binRoot\*\*.old.*", "`$customDir\*.old.*" | Remove-Item -Force
 "@
 [System.IO.File]::WriteAllText($syncScriptPath, $syncScript, $utf8NoBom)
@@ -791,14 +824,12 @@ Write-Host "[OK] Registered self-healing startup hook in $startupCmd." -Foregrou
 # 11. Terminate any stale .old.* processes that respawned during copy and clean up .old.* files
 Get-NetTCPConnection -LocalPort 20129 -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
     $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
-    if ($p -and $p.Name -like "*.old.*") {
+    if ($p -and ($p.Name -like "*.old*" -or $p.Path -like "*.old.*")) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     }
 }
-Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*.old.*" } | ForEach-Object {
-    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-}
-Start-Sleep -Milliseconds 500
+Get-Process -Name "*.old*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 600
 Get-ChildItem "$desktopBinRoot\*\*.old.*", "$customDir\*.old.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
 # 12. Restart Daemon if available
