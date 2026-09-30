@@ -187,7 +187,8 @@ pub fn builtin_role_model(_role: &str) -> &'static str {
 /// 4. Built-in default: `9router-subagent`
 pub fn map_role_to_model(role: Option<&str>) -> String {
     let role_str = role.unwrap_or("default");
-    let role_lower = role_str.to_lowercase();
+    let role_lower =
+        normalize_subagent_role_token(role_str).unwrap_or_else(|| role_str.trim().to_lowercase());
 
     // 1. Specific role env var: CODEX_WORKER_MODEL, CODEX_EXPLORER_MODEL, etc.
     let env_role = format!("CODEX_{}_MODEL", role_lower.to_uppercase());
@@ -215,11 +216,259 @@ pub fn map_role_to_model(role: Option<&str>) -> String {
     builtin_role_model(&role_lower).to_string()
 }
 
-/// Check if HTTP headers indicate a spawned subagent request (`x-openai-subagent` or `x-codex-parent-thread-id`).
+/// Decode standard or URL-safe base64 into a UTF-8 string (with or without `=` padding).
+pub fn decode_base64_utf8(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(trimmed.len() * 3 / 4 + 3);
+    let mut acc: u32 = 0;
+    let mut bits: u8 = 0;
+    for b in trimmed.bytes() {
+        if b == b'=' || b.is_ascii_whitespace() {
+            continue;
+        }
+        let val: u32 = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            buf.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+/// Normalize a raw subagent role or `agent_name` path (e.g. `"/root/explorer"`, `"review"`, `"collab_spawn"`)
+/// into a canonical role name (`"worker"`, `"explorer"`, `"reviewer"`, `"default"`, or custom role).
+pub fn normalize_subagent_role_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+    if matches!(
+        lower.as_str(),
+        "user" | "assistant" | "system" | "developer" | "tool" | "function" | "main"
+            | "primary" | "root" | "/root"
+    ) {
+        return None;
+    }
+    let segment = lower
+        .strip_prefix("/root/")
+        .or_else(|| lower.strip_prefix("root/"))
+        .or_else(|| lower.strip_prefix('/'))
+        .unwrap_or(lower.as_str())
+        .split('/')
+        .next_back()
+        .unwrap_or("")
+        .trim();
+    if segment.is_empty()
+        || matches!(
+            segment,
+            "user" | "assistant" | "system" | "developer" | "tool" | "function" | "main"
+                | "primary" | "root"
+        )
+    {
+        return None;
+    }
+    let base_segment = segment
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .trim_end_matches(['_', '-']);
+    let effective = if matches!(
+        base_segment,
+        "review" | "reviewer" | "worker" | "implement" | "explorer" | "explore" | "default"
+    ) {
+        base_segment
+    } else {
+        segment
+    };
+    match effective {
+        "review" | "reviewer" => Some("reviewer".to_string()),
+        "worker" | "implement" => Some("worker".to_string()),
+        "explorer" | "explore" => Some("explorer".to_string()),
+        "collab_spawn" | "thread_spawn" | "subagent" | "sub-agent" | "sub_agent" | "compact"
+        | "memory_consolidation" | "default" => Some("default".to_string()),
+        other if is_subagent_role_name(other) => Some(other.to_string()),
+        _ => None,
+    }
+}
+
+fn extract_role_from_turn_metadata_value(parsed: &Value) -> Option<String> {
+    let obj = parsed.as_object()?;
+    for key in [
+        "agent_role",
+        "agentRole",
+        "agent_type",
+        "agentType",
+        "subagent_role",
+        "subagentRole",
+        "agent_name",
+        "agentName",
+    ] {
+        if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+            if let Some(norm) = normalize_subagent_role_token(s) {
+                return Some(norm);
+            }
+        }
+    }
+    if let Some(s) = obj
+        .get("subagent_kind")
+        .or_else(|| obj.get("subagentKind"))
+        .and_then(|v| v.as_str())
+    {
+        if let Some(norm) = normalize_subagent_role_token(s) {
+            return Some(norm);
+        }
+    }
+    None
+}
+
+fn extract_role_from_turn_metadata_str(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(role) = extract_role_from_turn_metadata_value(&parsed) {
+            return Some(role);
+        }
+    } else if let Some(decoded) = decode_base64_utf8(trimmed) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(decoded.trim()) {
+            if let Some(role) = extract_role_from_turn_metadata_value(&parsed) {
+                return Some(role);
+            }
+        }
+    }
+    None
+}
+
+/// Extract the most specific subagent role from HTTP headers (`x-codex-turn-metadata` and `x-openai-subagent`).
+pub fn extract_role_from_http_headers(headers: &HeaderMap) -> Option<String> {
+    let mut fallback_default = false;
+    for val in headers.get_all("x-codex-turn-metadata") {
+        if let Ok(turn_meta) = val.to_str() {
+            if let Some(role) = extract_role_from_turn_metadata_str(turn_meta) {
+                if role != "default" {
+                    return Some(role);
+                }
+                fallback_default = true;
+            }
+        }
+    }
+    if let Some(sub_hdr) = headers.get("x-openai-subagent").and_then(|v| v.to_str().ok()) {
+        if let Some(role) = normalize_subagent_role_token(sub_hdr) {
+            if role != "default" {
+                return Some(role);
+            }
+            fallback_default = true;
+        }
+    }
+    if fallback_default {
+        Some("default".to_string())
+    } else {
+        None
+    }
+}
+
+fn is_subagent_turn_metadata_value(parsed: &Value) -> bool {
+    let Some(obj) = parsed.as_object() else {
+        return false;
+    };
+    if let Some(src) = obj.get("thread_source").or_else(|| obj.get("threadSource")) {
+        if src
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("subagent"))
+            || contains_subagent_source(src)
+        {
+            return true;
+        }
+    }
+    if let Some(kind) = obj.get("subagent_kind").or_else(|| obj.get("subagentKind")) {
+        match kind {
+            Value::String(s) if !s.trim().is_empty() => return true,
+            Value::Object(m) if !m.is_empty() => return true,
+            _ => {}
+        }
+    }
+    for key in [
+        "parent_thread_id",
+        "parentThreadId",
+        "parent_turn_id",
+        "parentTurnId",
+        "forked_from_thread_id",
+        "forkedFromThreadId",
+        "x-openai-subagent",
+        "x-codex-parent-thread-id",
+    ] {
+        if obj
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return true;
+        }
+    }
+    if extract_role_from_turn_metadata_value(parsed).is_some() {
+        return true;
+    }
+    false
+}
+
+fn is_subagent_turn_metadata_str(turn_meta: &str) -> bool {
+    let trimmed = turn_meta.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        return is_subagent_turn_metadata_value(&parsed);
+    }
+    if let Some(decoded) = decode_base64_utf8(trimmed) {
+        if is_subagent_turn_metadata_str(&decoded) {
+            return true;
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("\"thread_source\":\"subagent\"")
+        || lower.contains("\"thread_source\": \"subagent\"")
+        || lower.contains("\"thread_source\":\"thread_spawn\"")
+        || lower.contains("\"thread_source\": \"thread_spawn\"")
+        || lower.contains("\"subagent_kind\":\"")
+        || lower.contains("\"subagent_kind\": \"")
+        || lower.contains("\"subagent_kind\":{")
+        || lower.contains("\"subagent_kind\": {")
+        || lower.contains("\"parent_thread_id\":\"")
+        || lower.contains("\"parent_thread_id\": \"")
+        || lower.contains("\"parent_turn_id\":\"")
+        || lower.contains("\"parent_turn_id\": \"")
+        || lower.contains("\"forked_from_thread_id\":\"")
+        || lower.contains("\"forked_from_thread_id\": \"")
+}
+
+/// Check if HTTP headers indicate a spawned subagent request (`x-openai-subagent`, `x-codex-parent-thread-id`,
+/// or `x-codex-turn-metadata` carrying subagent metadata in raw JSON or base64).
 pub fn is_subagent_http_headers(headers: &HeaderMap) -> bool {
     for key in ["x-openai-subagent", "x-codex-parent-thread-id"] {
         if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
             if !val.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    for val in headers.get_all("x-codex-turn-metadata") {
+        if let Ok(turn_meta) = val.to_str() {
+            if is_subagent_turn_metadata_str(turn_meta) {
                 return true;
             }
         }
@@ -247,7 +496,16 @@ pub fn contains_subagent_source(v: &Value) -> bool {
             {
                 return true;
             }
-            for k in ["x-openai-subagent", "x-codex-parent-thread-id", "parent_turn_id"] {
+            for k in [
+                "x-openai-subagent",
+                "x-codex-parent-thread-id",
+                "parent_turn_id",
+                "parentTurnId",
+                "parent_thread_id",
+                "parentThreadId",
+                "forked_from_thread_id",
+                "forkedFromThreadId",
+            ] {
                 if let Some(s) = map.get(k).and_then(|x| x.as_str()) {
                     if !s.trim().is_empty() {
                         return true;
@@ -255,11 +513,7 @@ pub fn contains_subagent_source(v: &Value) -> bool {
                 }
             }
             if let Some(turn_meta) = map.get("x-codex-turn-metadata").and_then(|x| x.as_str()) {
-                let lower = turn_meta.to_lowercase();
-                if lower.contains("\"thread_source\":\"subagent\"")
-                    || lower.contains("\"subagent_kind\":")
-                    || lower.contains("\"parent_thread_id\":")
-                {
+                if is_subagent_turn_metadata_str(turn_meta) {
                     return true;
                 }
             }
@@ -553,6 +807,7 @@ pub fn sanitize_rate_limits(val: &mut Value) -> bool {
 pub fn find_agent_role(v: &Value) -> Option<String> {
     match v {
         Value::Object(map) => {
+            let mut fallback_role: Option<String> = None;
             for key in [
                 "agentRole",
                 "agent_role",
@@ -560,33 +815,52 @@ pub fn find_agent_role(v: &Value) -> Option<String> {
                 "agent_type",
                 "subagent_role",
                 "subagentRole",
+                "agentName",
+                "agent_name",
             ] {
                 if let Some(r) = map.get(key).and_then(|x| x.as_str()) {
-                    let trimmed = r.trim();
-                    if !trimmed.is_empty() && is_subagent_role_name(trimmed) {
-                        return Some(trimmed.to_string());
+                    if let Some(norm) = normalize_subagent_role_token(r) {
+                        if norm != "default" {
+                            return Some(norm);
+                        }
+                        fallback_role.get_or_insert(norm);
+                    }
+                }
+            }
+            for meta_key in ["x-codex-turn-metadata", "turn_metadata", "turnMetadata"] {
+                if let Some(meta_val) = map.get(meta_key) {
+                    let meta_role = match meta_val {
+                        Value::String(s) => extract_role_from_turn_metadata_str(s),
+                        other => extract_role_from_turn_metadata_value(other),
+                    };
+                    if let Some(norm) = meta_role {
+                        if norm != "default" {
+                            return Some(norm);
+                        }
+                        fallback_role.get_or_insert(norm);
                     }
                 }
             }
             if let Some(r) = map.get("x-openai-subagent").and_then(|x| x.as_str()) {
                 let trimmed = r.trim();
-                if trimmed.eq_ignore_ascii_case("review") {
-                    return Some("reviewer".to_string());
-                } else if is_subagent_role_name(trimmed) {
-                    return Some(trimmed.to_lowercase());
+                if let Some(norm) = normalize_subagent_role_token(trimmed) {
+                    if norm != "default" {
+                        return Some(norm);
+                    }
+                    fallback_role.get_or_insert(norm);
                 } else if !trimmed.is_empty() {
-                    return Some("default".to_string());
+                    fallback_role.get_or_insert_with(|| "default".to_string());
                 }
             }
             // In JSON-RPC thread/start or turn/start params (where "input"/"messages" is not the parent),
             // allow top-level "role" only if it is explicitly one of the known subagent roles.
             if let Some(r) = map.get("role").and_then(|x| x.as_str()) {
                 let lower = r.trim().to_lowercase();
-                if matches!(
-                    lower.as_str(),
-                    "worker" | "explorer" | "reviewer" | "default" | "subagent"
-                ) {
+                if matches!(lower.as_str(), "worker" | "explorer" | "reviewer") {
                     return Some(lower);
+                }
+                if matches!(lower.as_str(), "default" | "subagent") {
+                    fallback_role.get_or_insert(lower);
                 }
             }
             for (k, child) in map.iter() {
@@ -603,18 +877,25 @@ pub fn find_agent_role(v: &Value) -> Option<String> {
                     continue;
                 }
                 if let Some(r) = find_agent_role(child) {
-                    return Some(r);
+                    if r != "default" && r != "subagent" {
+                        return Some(r);
+                    }
+                    fallback_role.get_or_insert(r);
                 }
             }
-            None
+            fallback_role
         }
         Value::Array(arr) => {
+            let mut fallback_role: Option<String> = None;
             for child in arr {
                 if let Some(r) = find_agent_role(child) {
-                    return Some(r);
+                    if r != "default" && r != "subagent" {
+                        return Some(r);
+                    }
+                    fallback_role.get_or_insert(r);
                 }
             }
-            None
+            fallback_role
         }
         _ => None,
     }
@@ -1099,6 +1380,32 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
                 continue;
             }
 
+            if item_type == "image_generation_call" {
+                let prompt_text = item_obj
+                    .get("revised_prompt")
+                    .or_else(|| item_obj.get("prompt"))
+                    .and_then(extract_text_from_content_value)
+                    .unwrap_or_default();
+                let text = if prompt_text.trim().is_empty() {
+                    "[Image Generation Call]".to_string()
+                } else {
+                    format!("[Image Generation Call]\n{}", prompt_text)
+                };
+                item_obj.clear();
+                item_obj.insert("type".to_string(), Value::String("message".to_string()));
+                item_obj.insert("role".to_string(), Value::String("assistant".to_string()));
+                item_obj.insert(
+                    "content".to_string(),
+                    serde_json::json!([
+                        {
+                            "type": "output_text",
+                            "text": text
+                        }
+                    ]),
+                );
+                continue;
+            }
+
             if item_type == "agent_message" {
                 item_obj.insert("type".to_string(), Value::String("message".to_string()));
                 let normalized_role = match item_obj
@@ -1157,6 +1464,10 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
             )
         });
     }
+
+    // 3. Strip ChatGPT-internal top-level fields that 9Router / downstream providers do not accept.
+    obj.remove("access_programs");
+    obj.remove("codex_output_schema");
 }
 
 /// Inspect and determine routing policy for an HTTP request to the loopback proxy
@@ -1216,21 +1527,9 @@ pub fn inspect_and_route_http_request_with_headers(
     };
 
     if needs_model_rewrite {
-        let header_role = headers
-            .get("x-openai-subagent")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| {
-                let trimmed = s.trim();
-                if trimmed.eq_ignore_ascii_case("review") {
-                    Some("reviewer".to_string())
-                } else if is_subagent_role_name(trimmed) {
-                    Some(trimmed.to_lowercase())
-                } else {
-                    None
-                }
-            });
+        let header_role = extract_role_from_http_headers(headers);
         let effective_role = match (detected_role.as_deref(), header_role.as_deref()) {
-            (Some("default"), Some(hr)) => Some(hr),
+            (Some("default" | "subagent"), Some(hr)) => Some(hr),
             (Some(dr), _) => Some(dr),
             (None, hr) => hr,
         };
@@ -1268,7 +1567,7 @@ fn apply_subagent_model_metadata_fields(
         Value::String("Subagent model routed via Codex 9Router Proxy".to_string()),
     );
     entry_obj.insert("prefer_websockets".to_string(), Value::Bool(false));
-    entry_obj.insert("context_window".to_string(), serde_json::json!(272000));
+    entry_obj.insert("context_window".to_string(), serde_json::json!(872000));
     entry_obj.insert("max_context_window".to_string(), serde_json::json!(872000));
     entry_obj.insert("auto_compact_token_limit".to_string(), Value::Null);
     entry_obj.insert(
@@ -1328,7 +1627,7 @@ fn apply_subagent_model_metadata_fields(
 /// Inject subagent model metadata descriptors (`9router-subagent`, `implement`, `explore`, `review`,
 /// and any configured role models) into the `/backend-api/models` or `models_cache.json` JSON payload
 /// so `codex.orig.exe` never logs `Model metadata for ... not found`, aligns subagent context metadata
-/// with `gpt-6-luna` (`context_window: 272000`, `max_context_window: 872000`,
+/// with `gpt-6-luna` (`context_window: 872000`, `max_context_window: 872000`,
 /// `effective_context_window_percent: 95`, `comp_hash: "3000"`), and configures function `apply_patch`.
 pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
     let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
@@ -1404,7 +1703,7 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
                 "display_name": format!("{} (9Router)", slug),
                 "description": "Subagent model routed via Codex 9Router Proxy",
                 "prefer_websockets": false,
-                "context_window": 272000,
+                "context_window": 872000,
                 "max_context_window": 872000,
                 "auto_compact_token_limit": null,
                 "effective_context_window_percent": 95,
@@ -1462,7 +1761,7 @@ pub fn sync_models_cache_file(cache_path: &Path) -> io::Result<bool> {
 }
 
 /// Synchronize `~/.codex/models_cache.json` in place if present on disk so `codex.orig.exe`
-/// never loads stale `200000` subagent metadata on a cache hit.
+/// never loads stale `200000` or `272000` subagent metadata on a cache hit.
 pub fn sync_codex_models_cache() -> Option<PathBuf> {
     let codex_home = get_codex_home_dir()?;
     let cache_path = codex_home.join("models_cache.json");
@@ -1474,23 +1773,161 @@ pub fn sync_codex_models_cache() -> Option<PathBuf> {
 }
 
 /// Instruction appended to `"input"` when transforming a subagent `"generate": false`
-/// remote-compaction request into a 9Router summarization request.
+/// or `x-codex-turn-metadata` remote-compaction request into a 9Router summarization request.
 pub const COMPACTION_SUMMARIZATION_PROMPT: &str = "Summarize the conversation state, key findings, file changes, and remaining tasks concisely so the agent can continue seamlessly after context compaction.";
 
-/// Detect whether a `/responses` JSON request payload is a remote-compaction request (`"generate": false`).
-pub fn is_compaction_request(body: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("generate").and_then(|g| g.as_bool()))
-        == Some(false)
+fn is_compaction_turn_metadata_substring(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.contains("\"request_kind\":\"compaction\"")
+        || lower.contains("\"request_kind\": \"compaction\"")
+        || lower.contains("\"requestkind\":\"compaction\"")
+        || lower.contains("\"requestkind\": \"compaction\"")
+        || lower.contains("\"request_kind\":\"compact\"")
+        || lower.contains("\"request_kind\": \"compact\"")
+        || lower.contains("\"requestkind\":\"compact\"")
+        || lower.contains("\"requestkind\": \"compact\"")
+        || lower.contains("\"subagent_kind\":\"compact\"")
+        || lower.contains("\"subagent_kind\": \"compact\"")
+        || lower.contains("\"subagentkind\":\"compact\"")
+        || lower.contains("\"subagentkind\": \"compact\"")
+        || lower.contains("\"compaction\":{")
+        || lower.contains("\"compaction\": {")
+        || lower.contains("\"compaction\":true")
+        || lower.contains("\"compaction\": true")
 }
 
-/// Transform a subagent `"generate": false` compaction request into a 9Router summarization request:
+fn is_compaction_turn_metadata_str(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.eq_ignore_ascii_case("compaction") || trimmed.eq_ignore_ascii_case("compact") {
+        return true;
+    }
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+        if val.is_object() && is_compaction_metadata_value(&val) {
+            return true;
+        }
+    }
+    if let Some(decoded) = decode_base64_utf8(trimmed) {
+        let dec_trimmed = decoded.trim();
+        if dec_trimmed.eq_ignore_ascii_case("compaction")
+            || dec_trimmed.eq_ignore_ascii_case("compact")
+        {
+            return true;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(dec_trimmed) {
+            if val.is_object() && is_compaction_metadata_value(&val) {
+                return true;
+            }
+        }
+        if is_compaction_turn_metadata_substring(dec_trimmed) {
+            return true;
+        }
+    }
+    is_compaction_turn_metadata_substring(trimmed)
+}
+
+fn is_compaction_metadata_value(val: &Value) -> bool {
+    match val {
+        Value::String(s) => is_compaction_turn_metadata_str(s),
+        Value::Object(map) => {
+            if map
+                .get("request_kind")
+                .or_else(|| map.get("requestKind"))
+                .or_else(|| map.get("subagent_kind"))
+                .or_else(|| map.get("subagentKind"))
+                .or_else(|| map.get("mode"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| {
+                    let t = s.trim();
+                    t.eq_ignore_ascii_case("compaction") || t.eq_ignore_ascii_case("compact")
+                })
+            {
+                return true;
+            }
+            if let Some(comp) = map.get("compaction") {
+                match comp {
+                    Value::Object(_) => return true,
+                    Value::Bool(true) => return true,
+                    Value::String(s) if !s.trim().is_empty() => return true,
+                    _ => {}
+                }
+            }
+            if let Some(turn_meta) = map
+                .get("x-codex-turn-metadata")
+                .or_else(|| map.get("turn_metadata"))
+                .or_else(|| map.get("turnMetadata"))
+            {
+                if is_compaction_metadata_value(turn_meta) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Detect whether HTTP headers indicate a remote-compaction request
+/// (e.g. `x-codex-turn-metadata` containing `"request_kind":"compaction"` or `"compaction":{...}`,
+/// including base64-encoded header values and `"compact"` enum variants).
+pub fn is_compaction_http_headers(headers: &HeaderMap) -> bool {
+    for val in headers.get_all("x-codex-turn-metadata") {
+        if let Ok(s) = val.to_str() {
+            if is_compaction_turn_metadata_str(s) {
+                return true;
+            }
+        }
+    }
+    for key in ["x-codex-request-kind", "x-openai-request-kind"] {
+        for val in headers.get_all(key) {
+            if let Ok(s) = val.to_str() {
+                let t = s.trim();
+                if t.eq_ignore_ascii_case("compaction") || t.eq_ignore_ascii_case("compact") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Detect whether a `/responses` JSON request payload is a remote-compaction request
+/// (`"generate": false`, `"request_kind": "compaction"`, `"compaction": {...}`, or `"client_metadata"` / `"clientMetadata"`).
+pub fn is_compaction_request(body: &[u8]) -> bool {
+    let Ok(val) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    if val.get("generate").and_then(|g| g.as_bool()) == Some(false) {
+        return true;
+    }
+    if is_compaction_metadata_value(&val) {
+        return true;
+    }
+    if val
+        .get("client_metadata")
+        .or_else(|| val.get("clientMetadata"))
+        .is_some_and(is_compaction_metadata_value)
+    {
+        return true;
+    }
+    false
+}
+
+/// Detect whether an HTTP `/responses` request is a remote-compaction request
+/// using both HTTP headers (`x-codex-turn-metadata`) and the JSON request body.
+pub fn is_compaction_request_with_headers(headers: &HeaderMap, body: &[u8]) -> bool {
+    is_compaction_http_headers(headers) || is_compaction_request(body)
+}
+
+/// Transform a subagent remote-compaction request (`"generate": false` or `x-codex-turn-metadata` compaction)
+/// into a 9Router summarization request:
 /// - Ensures subagent model rewrite and input sanitization (`sanitize_subagent_request_for_9router`)
-/// - Removes `"generate"`, `"tools"`, `"tool_choice"`, `"parallel_tool_calls"`, `"include"`, and `"service_tier"`
+/// - Removes `"generate"`, `"request_kind"`, `"compaction"`, `"client_metadata"`, `"tools"`, `"tool_choice"`, `"parallel_tool_calls"`, `"include"`, `"service_tier"`, `"previous_response_id"`, `"prompt_cache_key"`, `"access_programs"`, `"codex_output_schema"`, `"store"`, and `"stream_options"`
 /// - Converts tool-call/output and reasoning history items in `"input"` into plain `"type": "message"` items
 ///   so tool-less summarization requests are never rejected by downstream providers
-/// - Appends a summarization instruction user message to `"input"`
+/// - Appends a summarization instruction user message to `"input"` unless a compaction prompt is already present
 pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
     let mut json = serde_json::from_slice::<Value>(body).ok()?;
     sanitize_subagent_request_for_9router(&mut json);
@@ -1512,12 +1949,27 @@ pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
         obj.insert("model".to_string(), Value::String(mapped));
     }
 
-    obj.remove("generate");
-    obj.remove("tools");
-    obj.remove("tool_choice");
-    obj.remove("parallel_tool_calls");
-    obj.remove("include");
-    obj.remove("service_tier");
+    for key in [
+        "generate",
+        "request_kind",
+        "requestKind",
+        "compaction",
+        "client_metadata",
+        "clientMetadata",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "include",
+        "service_tier",
+        "previous_response_id",
+        "prompt_cache_key",
+        "access_programs",
+        "codex_output_schema",
+        "store",
+        "stream_options",
+    ] {
+        obj.remove(key);
+    }
 
     let instruction_item = serde_json::json!({
         "type": "message",
@@ -1566,7 +2018,9 @@ pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
                             "content": [{"type": "output_text", "text": text}]
                         }));
                     }
-                    "function_call_output" => {
+                    "function_call_output"
+                    | "local_shell_call_output"
+                    | "web_search_call_output" => {
                         let out_text = item_obj
                             .get("output")
                             .and_then(extract_text_from_content_value)
@@ -1602,12 +2056,24 @@ pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
                     }
                 }
             }
-            normalized_items.push(instruction_item);
+            let already_has_compaction_prompt = normalized_items.iter().any(|item| {
+                item.get("content")
+                    .and_then(extract_text_from_content_value)
+                    .is_some_and(|t| {
+                        t.contains("CONTEXT CHECKPOINT COMPACTION")
+                            || t.contains(COMPACTION_SUMMARIZATION_PROMPT)
+                    })
+            });
+            if !already_has_compaction_prompt {
+                normalized_items.push(instruction_item);
+            }
             *arr = normalized_items;
         }
         Some(Value::String(s)) => {
             let prev = s.clone();
             let mut arr = Vec::new();
+            let already_has_compaction_prompt = prev.contains("CONTEXT CHECKPOINT COMPACTION")
+                || prev.contains(COMPACTION_SUMMARIZATION_PROMPT);
             if !prev.trim().is_empty() {
                 arr.push(serde_json::json!({
                     "type": "message",
@@ -1615,7 +2081,9 @@ pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
                     "content": [{"type": "input_text", "text": prev}]
                 }));
             }
-            arr.push(instruction_item);
+            if !already_has_compaction_prompt {
+                arr.push(instruction_item);
+            }
             obj.insert("input".to_string(), Value::Array(arr));
         }
         _ => {
@@ -2022,14 +2490,18 @@ pub fn build_compaction_sse_response(summary: &str, model: &str) -> Response {
         })
 }
 
-/// Handle a subagent `"generate": false` remote-compaction request strictly via 9Router
-/// with a deterministic local fallback summary if 9Router returns an error or empty summary.
+/// Handle a subagent remote-compaction request (`"generate": false` or `x-codex-turn-metadata` compaction)
+/// strictly via 9Router with a deterministic local fallback summary if 9Router returns an error or empty summary.
 pub async fn handle_subagent_compaction(
     client: &reqwest::Client,
     target_url: &str,
-    forward_headers: HeaderMap,
+    mut forward_headers: HeaderMap,
     routed_body: &[u8],
 ) -> Response {
+    forward_headers.remove("x-codex-turn-metadata");
+    forward_headers.remove("x-codex-request-kind");
+    forward_headers.remove("x-openai-request-kind");
+
     let model_name = serde_json::from_slice::<Value>(routed_body)
         .ok()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
@@ -2471,9 +2943,9 @@ pub async fn proxy_handler(
     #[cfg(test)]
     forward_headers.remove("x-codex-test-upstream");
 
-    // If this is a subagent remote-compaction request ("generate": false), handle it strictly
-    // via 9Router summarization + deterministic local fallback and return a compaction SSE stream.
-    if is_subagent && is_compaction_request(&routed_body) {
+    // If this is a subagent remote-compaction request ("generate": false or x-codex-turn-metadata compaction),
+    // handle it strictly via 9Router summarization + deterministic local fallback and return a compaction SSE stream.
+    if is_subagent && is_compaction_request_with_headers(&headers, &routed_body) {
         return handle_subagent_compaction(
             &state.http_client,
             &target_url,
@@ -3905,7 +4377,7 @@ default_subagent_model = "9router-subagent"
             "existing 9router-subagent entry should be updated in place without duplication"
         );
         let subagent_entry = subagent_matches[0];
-        assert_eq!(subagent_entry["context_window"], 272000);
+        assert_eq!(subagent_entry["context_window"], 872000);
         assert_eq!(subagent_entry["max_context_window"], 872000);
         assert_eq!(subagent_entry["effective_context_window_percent"], 95);
         assert_eq!(subagent_entry["comp_hash"], "3000");
@@ -3923,7 +4395,7 @@ default_subagent_model = "9router-subagent"
             .iter()
             .find(|m| m["slug"] == "implement")
             .expect("implement should be injected using gpt-6-luna template");
-        assert_eq!(implement_entry["context_window"], 272000);
+        assert_eq!(implement_entry["context_window"], 872000);
         assert_eq!(implement_entry["max_context_window"], 872000);
         assert_eq!(implement_entry["effective_context_window_percent"], 95);
         assert_eq!(implement_entry["comp_hash"], "3000");
@@ -5023,7 +5495,7 @@ default_subagent_model = "9router-subagent"
             .iter()
             .find(|m| m["slug"] == "9router-subagent")
             .unwrap();
-        assert_eq!(subagent["context_window"], 272000);
+        assert_eq!(subagent["context_window"], 872000);
         assert_eq!(subagent["max_context_window"], 872000);
         assert_eq!(subagent["effective_context_window_percent"], 95);
         assert_eq!(subagent["comp_hash"], "3000");
@@ -5379,7 +5851,7 @@ default_subagent_model = "9router-subagent"
                 .iter()
                 .find(|m| m["slug"] == slug)
                 .unwrap_or_else(|| panic!("missing injected model {}", slug));
-            assert_eq!(entry["context_window"], 272000);
+            assert_eq!(entry["context_window"], 872000);
             assert_eq!(entry["max_context_window"], 872000);
             assert_eq!(entry["effective_context_window_percent"], 95);
             assert_eq!(entry["comp_hash"], "3000");
@@ -5562,5 +6034,345 @@ default_subagent_model = "9router-subagent"
             "daemon".to_string(),
             "stop".to_string()
         ]));
+    }
+
+    #[test]
+    fn test_is_compaction_http_headers_and_body_variants() {
+        // 1. x-codex-turn-metadata JSON with request_kind = compaction and compaction object
+        let mut h1 = HeaderMap::new();
+        h1.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(
+                r#"{"turn_id":"019ac141","thread_source":"subagent","request_kind":"compaction","compaction":{"trigger":"auto"}}"#,
+            ),
+        );
+        assert!(is_compaction_http_headers(&h1));
+        assert!(is_subagent_http_headers(&h1));
+
+        let body_without_generate = br#"{"model":"9router-subagent","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Inspect git status"}]}]}"#;
+        assert!(!is_compaction_request(body_without_generate));
+        assert!(is_compaction_request_with_headers(&h1, body_without_generate));
+
+        // 2. x-codex-turn-metadata with only "compaction":{...} object
+        let mut h2 = HeaderMap::new();
+        h2.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(r#"{"compaction":{"reason":"model_downshift"}}"#),
+        );
+        assert!(is_compaction_http_headers(&h2));
+
+        // 3. Substring fallback when x-codex-turn-metadata is truncated/non-standard
+        let mut h3 = HeaderMap::new();
+        h3.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(r#"{"request_kind": "compaction", "truncated": "#),
+        );
+        assert!(is_compaction_http_headers(&h3));
+
+        // 4. Normal subagent turn metadata (not compaction, even if compaction: null is present)
+        let mut h_normal = HeaderMap::new();
+        h_normal.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(
+                r#"{"turn_id":"t1","thread_source":"subagent","subagent_kind":"thread_spawn","compaction":null}"#,
+            ),
+        );
+        assert!(!is_compaction_http_headers(&h_normal));
+        assert!(is_subagent_http_headers(&h_normal));
+        assert!(!is_compaction_request_with_headers(
+            &h_normal,
+            body_without_generate
+        ));
+
+        // 5. Normal root user turn metadata (neither subagent nor compaction)
+        let mut h_root = HeaderMap::new();
+        h_root.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(
+                r#"{"turn_id":"t_root","thread_source":"user","agent_name":"/root","parent_thread_id":null}"#,
+            ),
+        );
+        assert!(!is_compaction_http_headers(&h_root));
+        assert!(!is_subagent_http_headers(&h_root));
+
+        // 6. Body-level client_metadata and request_kind compaction variants
+        let body_client_meta = serde_json::to_vec(&serde_json::json!({
+            "model": "9router-subagent",
+            "client_metadata": {
+                "x-codex-turn-metadata": "{\"request_kind\":\"compaction\",\"compaction\":{\"trigger\":\"auto\"}}"
+            },
+            "input": []
+        }))
+        .unwrap();
+        assert!(is_compaction_request(&body_client_meta));
+        let transformed = build_9router_compaction_request_body(&body_client_meta).unwrap();
+        assert!(!is_compaction_request(&transformed));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_handler_http_post_compaction_via_turn_metadata_header_without_generate_false() {
+        use axum::body::to_bytes;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::ServiceExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let req_lower = req_str.to_ascii_lowercase();
+                assert!(
+                    !req_lower.contains("x-codex-turn-metadata"),
+                    "x-codex-turn-metadata header must be stripped before forwarding summarization request to 9Router: {}",
+                    req_str
+                );
+                assert!(
+                    req_str.contains(COMPACTION_SUMMARIZATION_PROMPT),
+                    "summarization prompt must be appended to input when forwarding to 9Router"
+                );
+                let body = r#"{"id":"resp_hdr_cmp","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Compacted via x-codex-turn-metadata header."}]}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let state = Arc::new(ProxyAppState {
+            http_client: build_upstream_http_client(),
+        });
+        let app = create_router(state);
+        let test_upstream = format!("http://{}/v1/responses", addr);
+
+        // Body intentionally omits "generate": false and "client_metadata", matching codex.orig.exe HTTP POST behavior
+        let http_compaction_body = serde_json::json!({
+            "model": "9router-subagent",
+            "instructions": "You are a coding worker.",
+            "tools": [{"type": "function", "name": "shell_command"}],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Audit git worktree ownership"}]
+                }
+            ]
+        });
+
+        let req = axum::extract::Request::builder()
+            .uri("/backend-api/codex/responses")
+            .method("POST")
+            .header(
+                "x-codex-turn-metadata",
+                r#"{"turn_id":"019ac999","thread_source":"subagent","subagent_kind":"thread_spawn","request_kind":"compaction","compaction":{"trigger":"auto"}}"#,
+            )
+            .header("x-codex-test-upstream", &test_upstream)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&http_compaction_body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ctype = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ctype.starts_with("text/event-stream"));
+
+        let resp_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let sse_text = String::from_utf8_lossy(&resp_bytes);
+        assert!(sse_text.contains("event: response.created"));
+        assert!(sse_text.contains("event: response.output_item.done"));
+        assert!(sse_text.contains("\"type\":\"compaction\""));
+        assert!(
+            sse_text.contains("\"encrypted_content\":\"Compacted via x-codex-turn-metadata header.\"")
+        );
+        assert!(sse_text.contains("event: response.completed"));
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_base64_and_codex_orig_turn_metadata_variants() {
+        // 1. Base64-encoded JSON {"turn_id":"t_b64","thread_source":"thread_spawn","agent_name":"/root/explorer","request_kind":"compaction"}
+        // Standard base64: eyJ0dXJuX2lkIjoidF9iNjQiLCJ0aHJlYWRfc291cmNlIjoidGhyZWFkX3NwYXduIiwiYWdlbnRfbmFtZSI6Ii9yb290L2V4cGxvcmVyIiwicmVxdWVzdF9raW5kIjoiY29tcGFjdGlvbiJ9
+        let b64_meta = "eyJ0dXJuX2lkIjoidF9iNjQiLCJ0aHJlYWRfc291cmNlIjoidGhyZWFkX3NwYXduIiwiYWdlbnRfbmFtZSI6Ii9yb290L2V4cGxvcmVyIiwicmVxdWVzdF9raW5kIjoiY29tcGFjdGlvbiJ9";
+        let mut h_b64 = HeaderMap::new();
+        h_b64.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(b64_meta),
+        );
+        assert!(is_subagent_http_headers(&h_b64));
+        assert!(is_compaction_http_headers(&h_b64));
+        assert_eq!(
+            extract_role_from_http_headers(&h_b64).as_deref(),
+            Some("explorer")
+        );
+
+        // 2. codex.orig.exe TurnMetadata with parent_turn_id / forked_from_thread_id and subagent_kind = compact
+        let mut h_forked = HeaderMap::new();
+        h_forked.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(
+                r#"{"turn_id":"t2","parent_turn_id":"pt1","forked_from_thread_id":"th_parent","subagent_kind":"compact","agent_name":"/root/worker_1"}"#,
+            ),
+        );
+        assert!(is_subagent_http_headers(&h_forked));
+        assert!(is_compaction_http_headers(&h_forked));
+        assert_eq!(
+            extract_role_from_http_headers(&h_forked).as_deref(),
+            Some("worker")
+        );
+
+        // 3. Mechanism tag x-openai-subagent: collab_spawn paired with x-codex-turn-metadata agent_name: /root/reviewer
+        let mut h_collab = HeaderMap::new();
+        h_collab.insert(
+            header::HeaderName::from_static("x-openai-subagent"),
+            HeaderValue::from_static("collab_spawn"),
+        );
+        h_collab.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(
+                r#"{"thread_source":{"subagent":"thread_spawn"},"agent_name":"/root/reviewer"}"#,
+            ),
+        );
+        assert!(is_subagent_http_headers(&h_collab));
+        assert_eq!(
+            extract_role_from_http_headers(&h_collab).as_deref(),
+            Some("reviewer")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_previous_model_compaction_fallback_and_field_stripping() {
+        use axum::body::to_bytes;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::ServiceExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16384];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let body_idx = req_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                let forwarded_json: Value = serde_json::from_str(&req_str[body_idx..]).unwrap();
+
+                // Model must be rewritten away from parent gpt-6-luna
+                assert_ne!(
+                    forwarded_json.get("model").and_then(|v| v.as_str()),
+                    Some("gpt-6-luna")
+                );
+                // Internal OpenAI fields must be stripped
+                for forbidden in [
+                    "previous_response_id",
+                    "prompt_cache_key",
+                    "access_programs",
+                    "codex_output_schema",
+                    "store",
+                    "stream_options",
+                    "tools",
+                ] {
+                    assert!(
+                        forwarded_json.get(forbidden).is_none(),
+                        "field {} should be stripped from compaction summarization request",
+                        forbidden
+                    );
+                }
+
+                // Input items must have image_generation_call and local_shell_call_output normalized to "message",
+                // and must NOT duplicate COMPACTION_SUMMARIZATION_PROMPT when CONTEXT CHECKPOINT COMPACTION is already present
+                let input_arr = forwarded_json
+                    .get("input")
+                    .and_then(|v| v.as_array())
+                    .unwrap();
+                for item in input_arr {
+                    assert_eq!(item.get("type").and_then(|v| v.as_str()), Some("message"));
+                }
+                let dump = serde_json::to_string(input_arr).unwrap();
+                assert!(dump.contains("[Image Generation Call]"));
+                assert!(dump.contains("[Tool Output]"));
+                assert!(dump.contains("CONTEXT CHECKPOINT COMPACTION"));
+                assert!(
+                    !dump.contains(COMPACTION_SUMMARIZATION_PROMPT),
+                    "should not append duplicate COMPACTION_SUMMARIZATION_PROMPT when CONTEXT CHECKPOINT COMPACTION is already present"
+                );
+
+                let body = r#"{"id":"resp_prev_model_cmp","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Previous-model fallback compacted via 9Router."}]}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let state = Arc::new(ProxyAppState {
+            http_client: build_upstream_http_client(),
+        });
+        let app = create_router(state);
+        let test_upstream = format!("http://{}/v1/responses", addr);
+
+        // Simulate compact_model_fallback.rs ("previous-model compaction" with model="gpt-6-luna")
+        let fallback_compaction_body = serde_json::json!({
+            "model": "gpt-6-luna",
+            "previous_response_id": "resp_parent_123",
+            "prompt_cache_key": "cache_key_abc",
+            "access_programs": ["internal_alpha"],
+            "codex_output_schema": {"type": "object"},
+            "store": false,
+            "stream_options": {"include_obfuscation": true},
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+            "input": [
+                {
+                    "type": "image_generation_call",
+                    "id": "img_1",
+                    "revised_prompt": "architecture diagram"
+                },
+                {
+                    "type": "local_shell_call_output",
+                    "call_id": "call_1",
+                    "output": "exit code 0"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "CONTEXT CHECKPOINT COMPACTION\nSummarize work so far."}]
+                }
+            ]
+        });
+
+        let req = axum::extract::Request::builder()
+            .uri("/backend-api/codex/responses")
+            .method("POST")
+            .header(
+                "x-codex-turn-metadata",
+                r#"{"turn_id":"t_prev","parent_turn_id":"pt_root","forked_from_thread_id":"th_root","agent_name":"/root/explorer","request_kind":"compact"}"#,
+            )
+            .header("x-codex-test-upstream", &test_upstream)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&fallback_compaction_body).unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let resp_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let sse_text = String::from_utf8_lossy(&resp_bytes);
+        assert!(sse_text.contains(
+            "\"encrypted_content\":\"Previous-model fallback compacted via 9Router.\""
+        ));
+        let _ = server_task.await;
     }
 }

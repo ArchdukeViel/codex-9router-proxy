@@ -773,7 +773,7 @@ if ($storeResDir) {
     }
 }
 
-# Synchronize ~/.codex/models_cache.json in place with gpt-6-luna aligned subagent metadata (272k/872k, comp_hash=3000)
+# Synchronize ~/.codex/models_cache.json in place with gpt-6-luna aligned subagent metadata (872k/872k, comp_hash=3000)
 $modelsCache = Join-Path $codexDir "models_cache.json"
 if (Test-Path $modelsCache) {
     & $releaseBinary --doctor 2>&1 | Out-Null
