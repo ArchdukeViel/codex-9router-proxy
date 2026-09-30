@@ -492,11 +492,21 @@ if ($configContent -match "(?m)^chatgpt_base_url\s*=") {
 Write-Host "[OK] Configured $configFile and role manifests in $agentsDir (BOM-Free UTF-8)." -ForegroundColor Green
 
 # 4. Inject SQLite Automatic Provider Trigger into Databases
-$dbCandidates = @(
-    (Join-Path $codexDir "state_5.sqlite"),
-    (Join-Path $codexDir "sqlite\state_5.sqlite"),
-    (Join-Path $codexDir "sqlite\codex-dev.db")
-)
+$dbCandidateList = New-Object System.Collections.Generic.List[string]
+foreach ($searchDir in @($codexDir, (Join-Path $codexDir "sqlite"))) {
+    if (Test-Path $searchDir) {
+        Get-ChildItem -Path $searchDir -Filter "state_*.sqlite" -File -ErrorAction SilentlyContinue | ForEach-Object {
+            if (-not $dbCandidateList.Contains($_.FullName)) {
+                $dbCandidateList.Add($_.FullName)
+            }
+        }
+        $devDb = Join-Path $searchDir "codex-dev.db"
+        if ((Test-Path $devDb) -and -not $dbCandidateList.Contains($devDb)) {
+            $dbCandidateList.Add($devDb)
+        }
+    }
+}
+$dbCandidates = @($dbCandidateList)
 
 $hasPython = $false
 if (Get-Command python -ErrorAction SilentlyContinue) {
@@ -520,21 +530,25 @@ for m in models:
         unique_models.append(m_clean)
 models_in_clause = ", ".join(q(m) for m in unique_models)
 provider_lit = q(provider.strip() or '9router')
+required_cols = {'id', 'model', 'model_provider', 'agent_role', 'thread_source'}
 try:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=5.0)
     cur = conn.cursor()
     cur.execute("DROP TRIGGER IF EXISTS fix_subagent_provider_trigger;")
     cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'")
     if cur.fetchone() is not None:
-        cur.execute(f"""
-        CREATE TRIGGER fix_subagent_provider_trigger
-        AFTER INSERT ON threads
-        FOR EACH ROW
-        WHEN (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
-        BEGIN
-            UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
-        END;
-        """)
+        cur.execute("PRAGMA table_info(threads);")
+        existing_cols = {row[1] for row in cur.fetchall()}
+        if required_cols.issubset(existing_cols):
+            cur.execute(f"""
+            CREATE TRIGGER fix_subagent_provider_trigger
+            AFTER INSERT ON threads
+            FOR EACH ROW
+            WHEN (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
+            BEGIN
+                UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
+            END;
+            """)
     conn.commit()
     conn.close()
     sys.exit(0)
@@ -586,7 +600,27 @@ if (-not (Test-Path $releaseBinary)) {
 }
 Write-Host "[OK] Release binary ready ($((Get-Item $releaseBinary).Length) bytes)." -ForegroundColor Green
 
-# 6. Stop running codex processes, hidden-desktop ChatGPT.exe instances, and verified port listeners before hooking
+# 6. Stop running codex processes (excluding ancestor PIDs in ParentProcessId chain), hidden-desktop ChatGPT.exe instances, and verified port listeners before hooking
+function Get-AncestorProcessIds {
+    $ancestors = New-Object 'System.Collections.Generic.HashSet[int]'
+    $curPid = $PID
+    for ($depth = 0; $depth -lt 32 -and $curPid -gt 0; $depth++) {
+        [void]$ancestors.Add([int]$curPid)
+        try {
+            $procInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $curPid" -ErrorAction SilentlyContinue
+            if ($procInfo -and $procInfo.ParentProcessId -gt 0 -and -not $ancestors.Contains([int]$procInfo.ParentProcessId)) {
+                $curPid = [int]$procInfo.ParentProcessId
+            } else {
+                break
+            }
+        } catch {
+            break
+        }
+    }
+    return $ancestors
+}
+
+$ancestorPids = Get-AncestorProcessIds
 $exactCodexProcessNames = @(
     "codex",
     "codex.orig",
@@ -601,15 +635,15 @@ $exactCodexProcessNames = @(
 Write-Host "[*] Checking for running codex processes..." -ForegroundColor Gray
 Clear-HiddenDesktopCodexGui
 Get-NetTCPConnection -LocalPort $proxyPort -ErrorAction SilentlyContinue | ForEach-Object {
-    $procId = $_.OwningProcess
-    if ($procId -gt 0 -and $procId -ne $PID) {
+    $procId = [int]$_.OwningProcess
+    if ($procId -gt 0 -and -not $ancestorPids.Contains($procId)) {
         $ownerProc = Get-Process -Id $procId -ErrorAction SilentlyContinue
         if ($ownerProc -and ($exactCodexProcessNames -contains $ownerProc.Name -or $ownerProc.Name -like "codex*.old*")) {
             Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
         }
     }
 }
-Get-Process -Name $exactCodexProcessNames -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID } | ForEach-Object {
+Get-Process -Name $exactCodexProcessNames -ErrorAction SilentlyContinue | Where-Object { -not $ancestorPids.Contains([int]$_.Id) } | ForEach-Object {
     Write-Host "    Stopping process $($_.Name) (PID $($_.Id))..." -ForegroundColor Gray
     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
 }
@@ -655,8 +689,14 @@ function Get-CodexStoreResourceDirectories {
     $appModelKey = "HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"
     if (Test-Path $appModelKey) {
         Get-ChildItem -Path $appModelKey -ErrorAction SilentlyContinue |
-            Where-Object { $_.PSChildName -like "OpenAI.Codex*" } |
-            Sort-Object PSChildName -Descending |
+            Where-Object { $_.PSChildName -like "OpenAI.Codex*" -or $_.PSChildName -like "OpenAI.CodexPrimaryRuntime*" } |
+            Sort-Object {
+                if ($_.PSChildName -match '_(\d+\.\d+\.\d+\.\d+)_') {
+                    try { [version]$Matches[1] } catch { [version]"0.0.0.0" }
+                } else {
+                    [version]"0.0.0.0"
+                }
+            } -Descending |
             ForEach-Object {
                 $rootFolder = (Get-ItemProperty -Path $_.PSPath -Name "PackageRootFolder" -ErrorAction SilentlyContinue).PackageRootFolder
                 if ($rootFolder -and (Test-Path $rootFolder)) {
@@ -666,7 +706,8 @@ function Get-CodexStoreResourceDirectories {
                 }
             }
     }
-    $storePkgs = Get-AppxPackage -Name "*OpenAI.Codex*" -ErrorAction SilentlyContinue | Sort-Object Version -Descending
+    $storePkgs = Get-AppxPackage -Name "*OpenAI.Codex*" -ErrorAction SilentlyContinue |
+        Sort-Object { try { [version]$_.Version } catch { [version]"0.0.0.0" } } -Descending
     foreach ($pkg in $storePkgs) {
         if ($pkg.InstallLocation -and (Test-Path $pkg.InstallLocation)) {
             $appRes = Join-Path $pkg.InstallLocation "app\resources"
@@ -674,7 +715,14 @@ function Get-CodexStoreResourceDirectories {
             if (-not $dirs.Contains($pkg.InstallLocation)) { $dirs.Add($pkg.InstallLocation) }
         }
     }
-    $winApps = Get-ChildItem "C:\Program Files\WindowsApps\OpenAI.Codex*" -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+    $winApps = Get-ChildItem "C:\Program Files\WindowsApps\OpenAI.Codex*" -Directory -ErrorAction SilentlyContinue |
+        Sort-Object {
+            if ($_.Name -match '_(\d+\.\d+\.\d+\.\d+)_') {
+                try { [version]$Matches[1] } catch { [version]"0.0.0.0" }
+            } else {
+                [version]"0.0.0.0"
+            }
+        }, LastWriteTime -Descending
     foreach ($wa in $winApps) {
         $appRes = Join-Path $wa.FullName "app\resources"
         if ((Test-Path $appRes) -and -not $dirs.Contains($appRes)) { $dirs.Add($appRes) }
@@ -831,10 +879,10 @@ foreach ($ideRoot in @(
 )) {
     if (Test-Path $ideRoot) {
         Get-ChildItem -Path $ideRoot -Directory -Filter "openai.chatgpt-*" -ErrorAction SilentlyContinue | ForEach-Object {
-            $extBin = Join-Path $_.FullName "bin\windows-x86_64"
-            if (Test-Path $extBin) { $extraHookDirs.Add($extBin) }
-            $extBinArm = Join-Path $_.FullName "bin\windows-aarch64"
-            if (Test-Path $extBinArm) { $extraHookDirs.Add($extBinArm) }
+            foreach ($archSub in @("bin\windows-x86_64", "bin\windows-aarch64", "bin\windows-arm64")) {
+                $extBin = Join-Path $_.FullName $archSub
+                if (Test-Path $extBin) { $extraHookDirs.Add($extBin) }
+            }
         }
     }
 }
@@ -1024,7 +1072,18 @@ function Sync-Executable {
     }
 }
 
-# 1. Ensure CODEX_CLI_PATH User environment override and User PATH index-0 priority point to our custom shim
+function Get-PackageSortVersion {
+    param([string]`$Text)
+    if (`$Text -match '_(\d+\.\d+\.\d+\.\d+)_') {
+        `$v = `$null
+        if ([version]::TryParse(`$Matches[1], [ref]`$v)) { return `$v }
+    }
+    `$v2 = `$null
+    if ([version]::TryParse(`$Text, [ref]`$v2)) { return `$v2 }
+    return [version]'0.0.0.0'
+}
+
+# 1. Ensure CODEX_CLI_PATH User environment override and User/Process PATH index-0 priority point to our custom shim
 if (Test-Path `$proxyPath) {
     `$curCli = [System.Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'User')
     if (`$curCli -ne `$proxyPath) {
@@ -1037,17 +1096,20 @@ if (Test-Path `$proxyPath) {
     `$normCustom = `$customDir.TrimEnd('\')
     `$uPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
     `$uEntries = if (`$uPath) { @(`$uPath -split ';' | Where-Object { `$_.Trim() }) } else { @() }
-    if (`$uEntries.Count -eq 0 -or (`$uEntries[0].Trim().TrimEnd('\') -ine `$normCustom)) {
-        `$rest = @(`$uEntries | Where-Object { `$_.Trim().TrimEnd('\') -ine `$normCustom })
-        [System.Environment]::SetEnvironmentVariable('Path', ((@(`$customDir) + `$rest) -join ';'), 'User')
+    `$rest = @(`$uEntries | Where-Object { `$_.Trim().TrimEnd('\') -ine `$normCustom })
+    `$desiredUserPath = (@(`$customDir) + `$rest) -join ';'
+    if (`$uPath -ne `$desiredUserPath) {
+        [System.Environment]::SetEnvironmentVariable('Path', `$desiredUserPath, 'User')
     }
+    `$pEntries = if (`$env:Path) { @(`$env:Path -split ';' | Where-Object { `$_.Trim() -and (`$_.Trim().TrimEnd('\') -ine `$normCustom) }) } else { @() }
+    `$env:Path = (@(`$customDir) + `$pEntries) -join ';'
 }
 
-# 2. Locate latest Microsoft Store OpenAI.Codex & OpenAI.CodexPrimaryRuntime resource directories
+# 2. Locate latest Microsoft Store OpenAI.Codex & OpenAI.CodexPrimaryRuntime resource directories (sorted by parsed [version] descending)
 `$candDirs = New-Object System.Collections.Generic.List[string]
 `$appModelKey = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages'
 if (Test-Path `$appModelKey) {
-    Get-ChildItem -Path `$appModelKey | Where-Object { `$_.PSChildName -like 'OpenAI.Codex*' } | Sort-Object PSChildName -Descending | ForEach-Object {
+    Get-ChildItem -Path `$appModelKey | Where-Object { `$_.PSChildName -like 'OpenAI.Codex*' } | Sort-Object { Get-PackageSortVersion `$_.PSChildName } -Descending | ForEach-Object {
         `$rf = (Get-ItemProperty -Path `$_.PSPath -Name 'PackageRootFolder').PackageRootFolder
         if (`$rf -and (Test-Path `$rf)) {
             `$ar = Join-Path `$rf 'app\resources'
@@ -1056,11 +1118,19 @@ if (Test-Path `$appModelKey) {
         }
     }
 }
-Get-AppxPackage -Name '*OpenAI.Codex*' | Sort-Object Version -Descending | ForEach-Object {
+Get-AppxPackage -Name '*OpenAI.Codex*' | Sort-Object { Get-PackageSortVersion `$_.Version } -Descending | ForEach-Object {
     if (`$_.InstallLocation -and (Test-Path `$_.InstallLocation)) {
         `$ar = Join-Path `$_.InstallLocation 'app\resources'
         if ((Test-Path `$ar) -and -not `$candDirs.Contains(`$ar)) { `$candDirs.Add(`$ar) }
         if (-not `$candDirs.Contains(`$_.InstallLocation)) { `$candDirs.Add(`$_.InstallLocation) }
+    }
+}
+`$winApps = 'C:\Program Files\WindowsApps'
+if ((`$candDirs.Count -eq 0) -and (Test-Path `$winApps)) {
+    Get-ChildItem -Path `$winApps -Directory -Filter 'OpenAI.Codex*' | Sort-Object { Get-PackageSortVersion `$_.Name } -Descending | ForEach-Object {
+        `$ar = Join-Path `$_.FullName 'app\resources'
+        if ((Test-Path `$ar) -and -not `$candDirs.Contains(`$ar)) { `$candDirs.Add(`$ar) }
+        if (-not `$candDirs.Contains(`$_.FullName)) { `$candDirs.Add(`$_.FullName) }
     }
 }
 `$resDir = `$candDirs | Where-Object { Test-Path (Join-Path `$_ 'codex.exe') } | Select-Object -First 1
@@ -1080,24 +1150,26 @@ foreach (`$ideRoot in @(
 )) {
     if (Test-Path `$ideRoot) {
         Get-ChildItem -Path `$ideRoot -Directory -Filter 'openai.chatgpt-*' | ForEach-Object {
-            `$eb = Join-Path `$_.FullName 'bin\windows-x86_64'
-            if (Test-Path `$eb) { `$extraDirs.Add(`$eb) }
-            `$eba = Join-Path `$_.FullName 'bin\windows-aarch64'
-            if (Test-Path `$eba) { `$extraDirs.Add(`$eba) }
+            foreach (`$archSub in @('bin\windows-x86_64', 'bin\windows-aarch64', 'bin\windows-arm64')) {
+                `$eb = Join-Path `$_.FullName `$archSub
+                if (Test-Path `$eb) { `$extraDirs.Add(`$eb) }
+            }
         }
     }
 }
 if (Test-Path `$proxyPath) {
-    `$proxyLen = (Get-Item `$proxyPath).Length
+    `$proxyItem = Get-Item `$proxyPath
     foreach (`$ed in `$extraDirs) {
         `$ce = Join-Path `$ed 'codex.exe'
         `$co = Join-Path `$ed 'codex.orig.exe'
         if (Test-Path `$ce) {
             `$ci = Get-Item `$ce
             if (`$ci.Length -gt 10000000) {
-                Sync-Executable -Source `$ce -Destination `$co | Out-Null
+                if ((-not (Test-Path `$co)) -or ((Get-Item `$co).Length -ne `$ci.Length) -or ((Get-Item `$co).LastWriteTimeUtc -ne `$ci.LastWriteTimeUtc)) {
+                    Sync-Executable -Source `$ce -Destination `$co | Out-Null
+                }
             }
-            if (`$ci.Length -ne `$proxyLen) {
+            if ((`$ci.Length -ne `$proxyItem.Length) -or (`$ci.LastWriteTimeUtc -ne `$proxyItem.LastWriteTimeUtc)) {
                 Sync-Executable -Source `$proxyPath -Destination `$ce | Out-Null
             }
         }
@@ -1142,14 +1214,14 @@ if (`$resDir -and (Test-Path (Join-Path `$resDir 'codex.exe'))) {
     if (`$fbStock) {
         foreach (`$origName in @('codex-9router-subagents.orig.exe', 'codex.orig.exe')) {
             `$origDst = Join-Path `$customDir `$origName
-            if ((`$fbStock.FullName -ne `$origDst) -and ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -lt 10000000) -or ((Get-Item `$origDst).Length -ne `$fbStock.Length))) {
+            if ((`$fbStock.FullName -ne `$origDst) -and ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -lt 10000000) -or ((Get-Item `$origDst).Length -ne `$fbStock.Length) -or ((Get-Item `$origDst).LastWriteTimeUtc -lt `$fbStock.LastWriteTimeUtc))) {
                 Sync-Executable -Source `$fbStock.FullName -Destination `$origDst | Out-Null
             }
         }
         foreach (`$h in `$customHelpers) {
             `$hs = Join-Path `$fbStock.DirectoryName `$h
             `$hd = Join-Path `$customDir `$h
-            if ((Test-Path `$hs) -and (`$hs -ne `$hd) -and ((-not (Test-Path `$hd)) -or ((Get-Item `$hd).Length -ne (Get-Item `$hs).Length))) {
+            if ((Test-Path `$hs) -and (`$hs -ne `$hd) -and ((-not (Test-Path `$hd)) -or ((Get-Item `$hd).Length -ne (Get-Item `$hs).Length) -or ((Get-Item `$hd).LastWriteTimeUtc -lt (Get-Item `$hs).LastWriteTimeUtc))) {
                 Sync-Executable -Source `$hs -Destination `$hd | Out-Null
             }
         }
@@ -1226,6 +1298,65 @@ if (-not (Get-Process -Name 'ChatGPT*')) {
     `$lockCandidates | Where-Object { Test-Path `$_ } | Remove-Item -Force
 }
 
+# 7. Ensure SQLite trigger is installed across all state_*.sqlite databases in `$codexDir` and `$codexDir\sqlite`
+`$dbPaths = New-Object System.Collections.Generic.List[string]
+foreach (`$sDir in @(`$codexDir, (Join-Path `$codexDir 'sqlite'))) {
+    if (Test-Path `$sDir) {
+        Get-ChildItem -Path `$sDir -Filter 'state_*.sqlite' -File | ForEach-Object {
+            if (-not `$dbPaths.Contains(`$_.FullName)) { `$dbPaths.Add(`$_.FullName) }
+        }
+        `$devDb = Join-Path `$sDir 'codex-dev.db'
+        if ((Test-Path `$devDb) -and -not `$dbPaths.Contains(`$devDb)) { `$dbPaths.Add(`$devDb) }
+    }
+}
+if ((`$dbPaths.Count -gt 0) -and (Get-Command python -ErrorAction SilentlyContinue)) {
+    `$pyTrig = @'
+import sqlite3, sys
+provider = sys.argv[1]
+models = [m.strip() for m in sys.argv[2:6] if m.strip()] + ['implement', 'explore', 'review']
+db_paths = sys.argv[6:]
+def q(s):
+    return "'" + s.replace("'", "''") + "'"
+unique_models = []
+for m in models:
+    if m not in unique_models:
+        unique_models.append(m)
+models_in_clause = ", ".join(q(m) for m in unique_models)
+provider_lit = q(provider.strip() or '9router')
+required_cols = {'id', 'model', 'model_provider', 'agent_role', 'thread_source'}
+for db_path in db_paths:
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'")
+        if cur.fetchone() is None:
+            conn.close()
+            continue
+        cur.execute("PRAGMA table_info(threads);")
+        existing_cols = {row[1] for row in cur.fetchall()}
+        if not required_cols.issubset(existing_cols):
+            conn.close()
+            continue
+        cur.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='fix_subagent_provider_trigger'")
+        if cur.fetchone() is None:
+            cur.execute(f"""
+            CREATE TRIGGER fix_subagent_provider_trigger
+            AFTER INSERT ON threads
+            FOR EACH ROW
+            WHEN (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
+            BEGIN
+                UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
+            END;
+            """)
+            conn.commit()
+        conn.close()
+    except Exception:
+        pass
+'@
+    `$pyArgs = @('-c', `$pyTrig, '$($Provider -replace "'","''")', '$($DefaultModel -replace "'","''")', '$($WorkerModel -replace "'","''")', '$($ExplorerModel -replace "'","''")', '$($ReviewerModel -replace "'","''")') + @(`$dbPaths)
+    & python @pyArgs 2>&1 | Out-Null
+}
+
 if (Test-Path `$proxyPath) {
     & `$proxyPath --doctor 2>&1 | Out-Null
     if (-not (Get-NetTCPConnection -LocalPort `$proxyPort -State Listen -ErrorAction SilentlyContinue)) {
@@ -1237,8 +1368,8 @@ if (Test-Path `$proxyPath) {
 
 $startupFolder = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Startup)
 $startupCmd = Join-Path $startupFolder "Codex9RouterHookSync.cmd"
-$cmdContent = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$syncScriptPath`"`r`n"
-[System.IO.File]::WriteAllText($startupCmd, $cmdContent, [System.Text.Encoding]::ASCII)
+$cmdContent = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"%LOCALAPPDATA%\OpenAI\Codex\custom\hook-sync.ps1`"`r`n"
+[System.IO.File]::WriteAllText($startupCmd, $cmdContent, $utf8NoBom)
 Write-Host "[OK] Registered self-healing startup hook in $startupCmd." -ForegroundColor Green
 
 # 11. Terminate any stale .old.* processes that respawned during copy and clean up .old.* files

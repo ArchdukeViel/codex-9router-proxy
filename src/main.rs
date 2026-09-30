@@ -435,6 +435,71 @@ pub fn collect_configured_subagent_models_in_dir(codex_home: Option<&Path>) -> V
     models
 }
 
+/// Find the subagent role name (`"worker"`, `"explorer"`, `"reviewer"`, `"default"`, or custom role in `agents/*.toml`
+/// or `[subagent_models]`) whose configured model matches `model_name`.
+pub fn find_role_for_model_in_dir(codex_home: Option<&Path>, model_name: &str) -> Option<String> {
+    let target = model_name.trim();
+    if target.is_empty() || is_parent_chatgpt_model(target) {
+        return None;
+    }
+    if let Some(dir) = codex_home {
+        for role in ["worker", "explorer", "reviewer", "default"] {
+            if let Some(m) = read_model_from_config_in_dir(dir, role) {
+                if m.trim().eq_ignore_ascii_case(target) {
+                    return Some(role.to_string());
+                }
+            }
+        }
+        let agents_dir = dir.join("agents");
+        if let Ok(entries) = fs::read_dir(&agents_dir) {
+            let mut toml_files: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+                })
+                .collect();
+            toml_files.sort();
+            for path in toml_files {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Some(m) = parse_model_from_role_toml(&content) {
+                        if m.trim().eq_ignore_ascii_case(target) {
+                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                return Some(stem.to_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let config_path = dir.join("config.toml");
+        if let Ok(content) = fs::read_to_string(&config_path) {
+            let mut in_subagent_models = false;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('#') || trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    let section = trimmed.trim_matches(|c| c == '[' || c == ']').trim();
+                    in_subagent_models = section.eq_ignore_ascii_case("subagent_models");
+                    continue;
+                }
+                if in_subagent_models {
+                    if let Some((k, v)) = parse_toml_key_value(trimmed) {
+                        if v.trim().eq_ignore_ascii_case(target) {
+                            return normalize_subagent_role_token(&k).or_else(|| Some(k.to_lowercase()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Parse `[subagent_models]` or `[agents].default_subagent_model` from TOML text.
 pub fn parse_model_from_toml(content: &str, role: &str) -> Option<String> {
     let mut in_subagent_models = false;
@@ -1372,6 +1437,7 @@ pub fn discover_codex_binary_candidate_dirs() -> Vec<PathBuf> {
                         .is_some_and(|n| n.to_ascii_lowercase().starts_with("openai.chatgpt-"))
                     {
                         push_dir(entry.path().join("bin").join("windows-x86_64"));
+                        push_dir(entry.path().join("bin").join("windows-aarch64"));
                         push_dir(entry.path().join("bin").join("windows-arm64"));
                     }
                 }
@@ -1564,10 +1630,62 @@ pub fn sync_custom_codex_binaries_from_candidates_with_min_size(
     refreshed_count
 }
 
+/// Auto-hook standalone CLI (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`) and IDE extensions
+/// (`openai.chatgpt-*\bin\windows-*\codex.exe`) by backing up stock `> min_stock_bytes` binaries to
+/// `codex.orig.exe` and replacing `codex.exe` with `proxy_shim`.
+pub fn sync_hooked_surface_binaries_with_min_size(
+    proxy_shim: &Path,
+    hook_dirs: &[PathBuf],
+    min_stock_bytes: u64,
+) -> usize {
+    let Ok(shim_meta) = proxy_shim.metadata() else {
+        return 0;
+    };
+    if !shim_meta.is_file() || shim_meta.len() == 0 || shim_meta.len() > min_stock_bytes {
+        return 0;
+    }
+    let shim_len = shim_meta.len();
+    let mut hooked = 0;
+
+    for hdir in hook_dirs {
+        let codex_exe = hdir.join("codex.exe");
+        let codex_orig = hdir.join("codex.orig.exe");
+        let Ok(exe_meta) = codex_exe.metadata() else {
+            continue;
+        };
+        if !exe_meta.is_file() {
+            continue;
+        }
+        if exe_meta.len() > min_stock_bytes {
+            let needs_backup = match codex_orig.metadata() {
+                Err(_) => true,
+                Ok(orig_meta) => {
+                    orig_meta.len() != exe_meta.len()
+                        || orig_meta.modified().ok() != exe_meta.modified().ok()
+                }
+            };
+            if (!needs_backup || safe_copy_or_rename_locked(&codex_exe, &codex_orig).is_ok())
+                && safe_copy_or_rename_locked(proxy_shim, &codex_exe).is_ok()
+            {
+                hooked += 1;
+            }
+        } else if codex_orig
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.len() > min_stock_bytes)
+            && (exe_meta.len() != shim_len
+                || exe_meta.modified().ok() != shim_meta.modified().ok())
+            && safe_copy_or_rename_locked(proxy_shim, &codex_exe).is_ok()
+        {
+            hooked += 1;
+        }
+    }
+
+    hooked
+}
+
 /// Perform in-process self-healing of `%LOCALAPPDATA%\OpenAI\Codex\custom` binaries and helpers,
-/// and re-hook standalone CLI (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`) or IDE extensions
-/// (`openai.chatgpt-*`) if an external update overwrote `codex.exe` with a `> 10 MB` stock binary while
-/// `codex.orig.exe` already exists in that directory.
+/// and hook/re-hook standalone CLI (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`) or IDE extensions
+/// (`openai.chatgpt-*`) if an external update installed or overwrote `codex.exe` with a `> 10 MB` stock binary.
 pub fn sync_custom_codex_binaries() -> usize {
     let Ok(local_app_data) = env::var("LOCALAPPDATA") else {
         return 0;
@@ -1582,54 +1700,36 @@ pub fn sync_custom_codex_binaries() -> usize {
     let candidate_dirs = discover_codex_binary_candidate_dirs();
     let mut count = sync_custom_codex_binaries_from_candidates(&custom_dir, &candidate_dirs);
 
-    // If custom\codex-9router-subagents.exe exists (< 10 MB proxy binary), auto-heal any previously
-    // hooked standalone CLI or VS Code extension surface where an update replaced codex.exe (> 10 MB)
-    // alongside an existing codex.orig.exe.
     let proxy_shim = custom_dir.join("codex-9router-subagents.exe");
-    if proxy_shim
-        .metadata()
-        .is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() < 10_000_000)
-    {
-        let mut hook_dirs = vec![Path::new(&local_app_data)
-            .join("Programs")
-            .join("OpenAI")
-            .join("Codex")
-            .join("bin")];
-        if let Ok(userprofile) = env::var("USERPROFILE") {
-            for ext_root in [
-                ".vscode\\extensions",
-                ".vscode-insiders\\extensions",
-                ".cursor\\extensions",
-                ".windsurf\\extensions",
-            ] {
-                let ext_dir = Path::new(&userprofile).join(ext_root);
-                if let Ok(entries) = fs::read_dir(&ext_dir) {
-                    for entry in entries.flatten() {
-                        if entry
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|n| n.to_ascii_lowercase().starts_with("openai.chatgpt-"))
-                        {
-                            hook_dirs.push(entry.path().join("bin").join("windows-x86_64"));
-                        }
+    let mut hook_dirs = vec![Path::new(&local_app_data)
+        .join("Programs")
+        .join("OpenAI")
+        .join("Codex")
+        .join("bin")];
+    if let Ok(userprofile) = env::var("USERPROFILE") {
+        for ext_root in [
+            ".vscode\\extensions",
+            ".vscode-insiders\\extensions",
+            ".cursor\\extensions",
+            ".windsurf\\extensions",
+        ] {
+            let ext_dir = Path::new(&userprofile).join(ext_root);
+            if let Ok(entries) = fs::read_dir(&ext_dir) {
+                for entry in entries.flatten() {
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| n.to_ascii_lowercase().starts_with("openai.chatgpt-"))
+                    {
+                        hook_dirs.push(entry.path().join("bin").join("windows-x86_64"));
+                        hook_dirs.push(entry.path().join("bin").join("windows-aarch64"));
+                        hook_dirs.push(entry.path().join("bin").join("windows-arm64"));
                     }
                 }
             }
         }
-        for hdir in hook_dirs {
-            let codex_exe = hdir.join("codex.exe");
-            let codex_orig = hdir.join("codex.orig.exe");
-            if codex_orig.is_file()
-                && codex_exe
-                    .metadata()
-                    .is_ok_and(|m| m.is_file() && m.len() > 10_000_000)
-                && safe_copy_or_rename_locked(&codex_exe, &codex_orig).is_ok()
-                && safe_copy_or_rename_locked(&proxy_shim, &codex_exe).is_ok()
-            {
-                count += 1;
-            }
-        }
     }
+    count += sync_hooked_surface_binaries_with_min_size(&proxy_shim, &hook_dirs, 10_000_000);
 
     count
 }
@@ -1946,7 +2046,18 @@ pub fn route_thread_params(params: &mut serde_json::Map<String, Value>) -> bool 
 
     // Check role / agent type across current map and nested trees
     let detected_role = find_agent_role(&Value::Object(params.clone()));
-    let role = detected_role.as_deref();
+    let model_str = params
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    let inferred_role = match detected_role.as_deref() {
+        None | Some("default" | "subagent") => model_str
+            .as_deref()
+            .and_then(|m| find_role_for_model_in_dir(get_codex_home_dir().as_deref(), m))
+            .or(detected_role.clone()),
+        _ => detected_role.clone(),
+    };
+    let role = inferred_role.as_deref();
     let target_provider = get_target_model_provider_for_role(role);
 
     let role_is_subagent = if let Some(r) = role {
@@ -1970,11 +2081,6 @@ pub fn route_thread_params(params: &mut serde_json::Map<String, Value>) -> bool 
 
     let is_subagent =
         role_is_subagent || has_agent_nickname || source_is_subagent || nested_subagent;
-
-    let model_str = params
-        .get("model")
-        .and_then(|m| m.as_str())
-        .map(|s| s.to_string());
 
     let is_9router_model = if let Some(ref m) = model_str {
         is_subagent_model_name(m)
@@ -2982,6 +3088,7 @@ pub fn inject_subagent_models_metadata_with_primary(
 }
 
 /// Apply `inject_subagent_models_metadata` to a `models_cache.json` file on disk if present.
+/// Uses an atomic temporary file + rename (with direct write fallback) so concurrent processes never read partial JSON.
 /// Never logs or exposes file contents.
 pub fn sync_models_cache_file(cache_path: &Path) -> io::Result<bool> {
     if !cache_path.is_file() {
@@ -2990,7 +3097,22 @@ pub fn sync_models_cache_file(cache_path: &Path) -> io::Result<bool> {
     let raw = fs::read(cache_path)?;
     let enriched = inject_subagent_models_metadata(&raw);
     if enriched != raw {
-        fs::write(cache_path, &enriched)?;
+        let tmp_path = cache_path.with_file_name(format!(
+            "{}.tmp.{}",
+            cache_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("models_cache.json"),
+            std::process::id()
+        ));
+        if fs::write(&tmp_path, &enriched).is_ok() {
+            if fs::rename(&tmp_path, cache_path).is_err() {
+                let _ = fs::remove_file(&tmp_path);
+                fs::write(cache_path, &enriched)?;
+            }
+        } else {
+            fs::write(cache_path, &enriched)?;
+        }
     }
     Ok(true)
 }
@@ -4222,14 +4344,21 @@ pub async fn proxy_handler(
     let (is_subagent, routed_body) =
         inspect_and_route_http_request_with_headers(path, &headers, &decompressed_body);
     let effective_role = if is_subagent {
-        let body_role = serde_json::from_slice::<Value>(&decompressed_body)
-            .ok()
-            .and_then(|v| find_agent_role(&v));
+        let parsed_body = serde_json::from_slice::<Value>(&decompressed_body).ok();
+        let body_role = parsed_body.as_ref().and_then(find_agent_role);
         let header_role = extract_role_from_http_headers(&headers);
-        match (body_role, header_role) {
+        let primary_role = match (body_role, header_role) {
             (Some(r), Some(hr)) if r == "default" || r == "subagent" => Some(hr),
             (Some(r), _) => Some(r),
             (None, hr) => hr,
+        };
+        match primary_role.as_deref() {
+            None | Some("default" | "subagent") => parsed_body
+                .as_ref()
+                .and_then(|v| v.get("model").and_then(|m| m.as_str()))
+                .and_then(|m| find_role_for_model_in_dir(get_codex_home_dir().as_deref(), m))
+                .or(primary_role),
+            _ => primary_role,
         }
     } else {
         None
@@ -5283,24 +5412,37 @@ pub fn run_doctor() {
     println!("===================================================================");
 }
 
-/// Strip any existing `chatgpt_base_url` override from CLI arguments and insert the HTTPS loopback URL
-/// before any `--` argument separator so positional arguments after `--` are never polluted.
+/// Strip any existing `chatgpt_base_url` override from CLI arguments before `--` and insert the HTTPS loopback URL
+/// before any `--` argument separator so positional arguments after `--` are never modified or polluted.
 pub fn inject_loopback_base_url(args: &[String], port: &str) -> Vec<String> {
-    let mut cleaned = Vec::new();
+    let sep_pos = args.iter().position(|a| a == "--");
+    let pre_args = match sep_pos {
+        Some(idx) => &args[..idx],
+        None => args,
+    };
+    let post_args = match sep_pos {
+        Some(idx) => &args[idx..],
+        None => &[],
+    };
+
+    let mut cleaned_pre = Vec::with_capacity(pre_args.len() + 2);
     let mut skip_next = false;
-    for (i, a) in args.iter().enumerate() {
+    for (i, a) in pre_args.iter().enumerate() {
         if skip_next {
             skip_next = false;
             continue;
         }
-        if a == "-c" && i + 1 < args.len() && args[i + 1].contains("chatgpt_base_url") {
+        if (a == "-c" || a == "--config")
+            && i + 1 < pre_args.len()
+            && pre_args[i + 1].contains("chatgpt_base_url")
+        {
             skip_next = true;
             continue;
         }
-        if a.starts_with("-c=") && a.contains("chatgpt_base_url") {
+        if (a.starts_with("-c=") || a.starts_with("--config=")) && a.contains("chatgpt_base_url") {
             continue;
         }
-        cleaned.push(a.clone());
+        cleaned_pre.push(a.clone());
     }
 
     let base_url_arg = format!(
@@ -5308,18 +5450,10 @@ pub fn inject_loopback_base_url(args: &[String], port: &str) -> Vec<String> {
         port
     );
 
-    if let Some(sep_idx) = cleaned.iter().position(|a| a == "--") {
-        let mut out = Vec::with_capacity(cleaned.len() + 2);
-        out.extend_from_slice(&cleaned[..sep_idx]);
-        out.push("-c".to_string());
-        out.push(base_url_arg);
-        out.extend_from_slice(&cleaned[sep_idx..]);
-        out
-    } else {
-        cleaned.push("-c".to_string());
-        cleaned.push(base_url_arg);
-        cleaned
-    }
+    cleaned_pre.push("-c".to_string());
+    cleaned_pre.push(base_url_arg);
+    cleaned_pre.extend_from_slice(post_args);
+    cleaned_pre
 }
 
 /// Determine whether CLI arguments represent a non-API / lightweight command (e.g. `--version`, `--help`,
@@ -8456,6 +8590,60 @@ auditor = "claude-3-7-sonnet-audit"
                 "-leading-dash-prompt".to_string(),
             ]
         );
+
+        let args_with_pre_and_post_overrides = vec![
+            "exec".to_string(),
+            "--config".to_string(),
+            "chatgpt_base_url=\"https://old.example/\"".to_string(),
+            "--".to_string(),
+            "-c".to_string(),
+            "chatgpt_base_url=literal_prompt_arg".to_string(),
+        ];
+        let injected2 = inject_loopback_base_url(&args_with_pre_and_post_overrides, "20130");
+        assert_eq!(
+            injected2,
+            vec![
+                "exec".to_string(),
+                "-c".to_string(),
+                "chatgpt_base_url=\"https://127.0.0.1:20130/backend-api/\"".to_string(),
+                "--".to_string(),
+                "-c".to_string(),
+                "chatgpt_base_url=literal_prompt_arg".to_string(),
+            ],
+            "must strip --config chatgpt_base_url before -- while preserving literal -c args after --"
+        );
+
+        let tmp_hook = env::temp_dir().join(format!("codex_hook_surface_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_hook);
+        let ext_bin = tmp_hook.join("vscode_ext_bin");
+        fs::create_dir_all(&ext_bin).unwrap();
+        let proxy_shim = tmp_hook.join("codex-9router-subagents.exe");
+        fs::write(&proxy_shim, vec![b'P'; 200]).unwrap();
+        // Fresh VS Code extension directory with stock > 1000-byte codex.exe and NO codex.orig.exe yet
+        fs::write(ext_bin.join("codex.exe"), vec![b'S'; 5000]).unwrap();
+        let hooked_count = sync_hooked_surface_binaries_with_min_size(
+            &proxy_shim,
+            std::slice::from_ref(&ext_bin),
+            1_000,
+        );
+        assert_eq!(hooked_count, 1);
+        assert_eq!(fs::read(ext_bin.join("codex.orig.exe")).unwrap().len(), 5000);
+        assert_eq!(fs::read(ext_bin.join("codex.exe")).unwrap().len(), 200);
+        let _ = fs::remove_dir_all(&tmp_hook);
+
+        let tmp_role_lookup = env::temp_dir().join(format!("codex_role_lookup_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_role_lookup);
+        fs::create_dir_all(tmp_role_lookup.join("agents")).unwrap();
+        fs::write(
+            tmp_role_lookup.join("agents").join("researcher.toml"),
+            "name = \"researcher\"\nmodel = \"deepseek-r1-custom\"\nmodel_provider = \"openrouter\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_role_for_model_in_dir(Some(&tmp_role_lookup), "deepseek-r1-custom").as_deref(),
+            Some("researcher")
+        );
+        let _ = fs::remove_dir_all(&tmp_role_lookup);
 
         for sub in [
             "sandbox",
