@@ -155,12 +155,14 @@ pub fn parse_provider_from_config_toml(content: &str) -> Option<String> {
     None
 }
 
-/// Parse `base_url = "..."` from `[model_providers.<provider>]` in `~/.codex/config.toml`.
+/// Parse `base_url = "..."` strictly from `[model_providers.<provider>]` in `~/.codex/config.toml`.
 pub fn parse_provider_base_url_from_config_toml(content: &str, provider: &str) -> Option<String> {
-    let target_section = format!("model_providers.{}", provider.trim());
+    let prov_trimmed = provider.trim();
+    if prov_trimmed.is_empty() {
+        return None;
+    }
+    let target_section = format!("model_providers.{}", prov_trimmed);
     let mut in_target_provider = false;
-    let mut in_any_provider = false;
-    let mut fallback_base_url: Option<String> = None;
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -171,31 +173,58 @@ pub fn parse_provider_base_url_from_config_toml(content: &str, provider: &str) -
             let section = trimmed.trim_matches(|c| c == '[' || c == ']').trim();
             let normalized_section = section.replace(['"', '\''], "");
             in_target_provider = normalized_section.eq_ignore_ascii_case(&target_section);
-            in_any_provider = normalized_section
-                .to_ascii_lowercase()
-                .starts_with("model_providers.");
             continue;
         }
-        if in_target_provider || in_any_provider {
+        if in_target_provider {
             if let Some((k, v)) = parse_toml_key_value(trimmed) {
                 if k.eq_ignore_ascii_case("base_url") {
-                    if in_target_provider {
-                        return Some(v);
-                    }
-                    if fallback_base_url.is_none() {
-                        fallback_base_url = Some(v);
-                    }
+                    return Some(v);
                 }
             }
         }
     }
-    fallback_base_url
+    None
 }
 
-/// Read target subagent model provider from `<codex_home>/agents/*.toml` or `<codex_home>/config.toml`.
-pub fn read_provider_from_config_in_dir(codex_home: &Path) -> Option<String> {
-    for role in ["default", "worker", "explorer", "reviewer"] {
-        let role_file = codex_home.join("agents").join(format!("{}.toml", role));
+/// Parse `env_key = "..."` strictly from `[model_providers.<provider>]` in `~/.codex/config.toml`.
+pub fn parse_provider_env_key_from_config_toml(content: &str, provider: &str) -> Option<String> {
+    let prov_trimmed = provider.trim();
+    if prov_trimmed.is_empty() {
+        return None;
+    }
+    let target_section = format!("model_providers.{}", prov_trimmed);
+    let mut in_target_provider = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section = trimmed.trim_matches(|c| c == '[' || c == ']').trim();
+            let normalized_section = section.replace(['"', '\''], "");
+            in_target_provider = normalized_section.eq_ignore_ascii_case(&target_section);
+            continue;
+        }
+        if in_target_provider {
+            if let Some((k, v)) = parse_toml_key_value(trimmed) {
+                if k.eq_ignore_ascii_case("env_key") {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read target subagent model provider for an optional specific role from `<codex_home>/agents/*.toml` or `<codex_home>/config.toml`.
+pub fn read_provider_for_role_from_config_in_dir(
+    codex_home: &Path,
+    role: Option<&str>,
+) -> Option<String> {
+    if let Some(r) = role {
+        let role_lower = normalize_subagent_role_token(r).unwrap_or_else(|| r.trim().to_lowercase());
+        let role_file = codex_home.join("agents").join(format!("{}.toml", role_lower));
         if role_file.is_file() {
             if let Ok(content) = fs::read_to_string(&role_file) {
                 if let Some(p) = parse_provider_from_role_toml(&content) {
@@ -206,15 +235,66 @@ pub fn read_provider_from_config_in_dir(codex_home: &Path) -> Option<String> {
             }
         }
     }
+
+    let mut first_role_provider: Option<String> = None;
+    for r in ["default", "worker", "explorer", "reviewer"] {
+        let role_file = codex_home.join("agents").join(format!("{}.toml", r));
+        if role_file.is_file() {
+            if let Ok(content) = fs::read_to_string(&role_file) {
+                if let Some(p) = parse_provider_from_role_toml(&content) {
+                    if !p.is_empty() && !p.eq_ignore_ascii_case("openai") {
+                        if !p.eq_ignore_ascii_case("9router") {
+                            return Some(p);
+                        }
+                        if first_role_provider.is_none() {
+                            first_role_provider = Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let config_path = codex_home.join("config.toml");
-    let content = fs::read_to_string(&config_path).ok()?;
-    parse_provider_from_config_toml(&content)
+    if let Ok(content) = fs::read_to_string(&config_path) {
+        if let Some(cfg_prov) = parse_provider_from_config_toml(&content) {
+            if !cfg_prov.eq_ignore_ascii_case("9router") || first_role_provider.is_none() {
+                return Some(cfg_prov);
+            }
+        }
+    }
+
+    first_role_provider
+}
+
+/// Read target subagent model provider from `<codex_home>/agents/*.toml` or `<codex_home>/config.toml`.
+pub fn read_provider_from_config_in_dir(codex_home: &Path) -> Option<String> {
+    read_provider_for_role_from_config_in_dir(codex_home, None)
 }
 
 /// Read target subagent model provider from `~/.codex/agents/*.toml` or `~/.codex/config.toml`.
 pub fn read_provider_from_config() -> Option<String> {
     let codex_home = get_codex_home_dir()?;
     read_provider_from_config_in_dir(&codex_home)
+}
+
+/// Read the top-level primary parent model (`model = "..."`) from `<codex_home>/config.toml`.
+pub fn read_primary_model_from_config_in_dir(codex_home: &Path) -> Option<String> {
+    let config_path = codex_home.join("config.toml");
+    let content = fs::read_to_string(&config_path).ok()?;
+    let m = parse_model_from_role_toml(&content)?;
+    let trimmed = m.trim();
+    if !trimmed.is_empty() && is_parent_chatgpt_model(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Read the top-level primary parent model (`model = "..."`) from `~/.codex/config.toml`.
+pub fn read_primary_model_from_config() -> Option<String> {
+    let codex_home = get_codex_home_dir()?;
+    read_primary_model_from_config_in_dir(&codex_home)
 }
 
 /// Parse `[subagent_models]` or `[agents].default_subagent_model` from TOML text.
@@ -278,8 +358,22 @@ pub fn read_model_from_config_in_dir(codex_home: &Path, role: &str) -> Option<St
         }
     }
     let config_path = codex_home.join("config.toml");
-    let content = fs::read_to_string(&config_path).ok()?;
-    parse_model_from_toml(&content, role)
+    if let Ok(content) = fs::read_to_string(&config_path) {
+        if let Some(m) = parse_model_from_toml(&content, role) {
+            return Some(m);
+        }
+    }
+    if !role.eq_ignore_ascii_case("default") {
+        let default_file = codex_home.join("agents").join("default.toml");
+        if default_file.is_file() {
+            if let Ok(content) = fs::read_to_string(&default_file) {
+                if let Some(m) = parse_model_from_role_toml(&content) {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Read model configuration for a specific role from `~/.codex/agents/<role>.toml` or `~/.codex/config.toml`.
@@ -310,12 +404,13 @@ pub fn map_role_to_model(role: Option<&str>) -> String {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let reg_role_val = get_user_env_var(&env_role)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let mut reg_role_val: Option<String> = None;
 
     // 1. Explicit process-level role override (when not merely inherited unchanged from HKCU\Environment)
     if let Some(ref m) = proc_role_val {
+        reg_role_val = get_user_env_var(&env_role)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         if reg_role_val.as_deref() != Some(m.as_str()) {
             return m.clone();
         }
@@ -326,10 +421,11 @@ pub fn map_role_to_model(role: Option<&str>) -> String {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let reg_generic_val = get_user_env_var("CODEX_SUBAGENT_MODEL")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let mut reg_generic_val: Option<String> = None;
     if let Some(ref m) = proc_generic_val {
+        reg_generic_val = get_user_env_var("CODEX_SUBAGENT_MODEL")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         if reg_generic_val.as_deref() != Some(m.as_str()) {
             return m.clone();
         }
@@ -341,10 +437,22 @@ pub fn map_role_to_model(role: Option<&str>) -> String {
     }
 
     // 4. Persisted environment / Windows User Registry fallback
-    if let Some(m) = proc_role_val.or(reg_role_val) {
+    if let Some(m) = proc_role_val.or_else(|| {
+        reg_role_val.or_else(|| {
+            get_user_env_var(&env_role)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    }) {
         return m;
     }
-    if let Some(m) = proc_generic_val.or(reg_generic_val) {
+    if let Some(m) = proc_generic_val.or_else(|| {
+        reg_generic_val.or_else(|| {
+            get_user_env_var("CODEX_SUBAGENT_MODEL")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    }) {
         return m;
     }
     if let Some(m) = env::var("CODEX_DEFAULT_MODEL")
@@ -692,31 +800,45 @@ pub fn contains_subagent_source(v: &Value) -> bool {
     }
 }
 
-/// Retrieve the configured target model provider (defaults to "9router").
-pub fn get_target_model_provider() -> String {
+/// Retrieve the configured target model provider for an optional subagent role (defaults to "9router").
+pub fn get_target_model_provider_for_role(role: Option<&str>) -> String {
     let proc_val = env::var("CODEX_SUBAGENT_PROVIDER")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let reg_val = get_user_env_var("CODEX_SUBAGENT_PROVIDER")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let mut reg_val: Option<String> = None;
 
     if let Some(ref p) = proc_val {
+        reg_val = get_user_env_var("CODEX_SUBAGENT_PROVIDER")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         if reg_val.as_deref() != Some(p.as_str()) {
             return p.clone();
         }
     }
 
-    if let Some(cfg_prov) = read_provider_from_config() {
-        return cfg_prov;
+    if let Some(codex_home) = get_codex_home_dir() {
+        if let Some(cfg_prov) = read_provider_for_role_from_config_in_dir(&codex_home, role) {
+            return cfg_prov;
+        }
     }
 
-    if let Some(p) = proc_val.or(reg_val) {
+    if let Some(p) = proc_val.or_else(|| {
+        reg_val.or_else(|| {
+            get_user_env_var("CODEX_SUBAGENT_PROVIDER")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    }) {
         return p;
     }
 
     "9router".to_string()
+}
+
+/// Retrieve the configured target model provider (defaults to "9router").
+pub fn get_target_model_provider() -> String {
+    get_target_model_provider_for_role(None)
 }
 
 /// Parse the value of a registry key from `reg query HKCU\Environment /v <name>` output.
@@ -745,22 +867,107 @@ pub fn parse_reg_query_value(output: &str, name: &str) -> Option<String> {
     None
 }
 
+#[cfg(windows)]
+fn query_hkcu_environment_win32(name: &str) -> Option<String> {
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            h_key: isize,
+            lp_sub_key: *const u16,
+            ul_options: u32,
+            sam_desired: u32,
+            phk_result: *mut isize,
+        ) -> i32;
+        fn RegQueryValueExW(
+            h_key: isize,
+            lp_value_name: *const u16,
+            lp_reserved: *const u32,
+            lp_type: *mut u32,
+            lp_data: *mut u8,
+            lpcb_data: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(h_key: isize) -> i32;
+    }
+
+    const HKEY_CURRENT_USER: isize = -2147483647i32 as isize; // 0x80000001
+    const KEY_READ: u32 = 0x20019;
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+
+    let subkey: Vec<u16> = OsStr::new("Environment")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let val_name: Vec<u16> = OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut hkey: isize = 0;
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) != 0
+            || hkey == 0
+        {
+            return None;
+        }
+        let mut val_type: u32 = 0;
+        let mut data_len: u32 = 0;
+        let status = RegQueryValueExW(
+            hkey,
+            val_name.as_ptr(),
+            std::ptr::null(),
+            &mut val_type,
+            std::ptr::null_mut(),
+            &mut data_len,
+        );
+        if status != 0 || (val_type != REG_SZ && val_type != REG_EXPAND_SZ) || data_len < 2 {
+            let _ = RegCloseKey(hkey);
+            return None;
+        }
+        let mut buf = vec![0u16; (data_len as usize).div_ceil(2)];
+        let mut actual_len = (buf.len() * 2) as u32;
+        let status2 = RegQueryValueExW(
+            hkey,
+            val_name.as_ptr(),
+            std::ptr::null(),
+            &mut val_type,
+            buf.as_mut_ptr() as *mut u8,
+            &mut actual_len,
+        );
+        let _ = RegCloseKey(hkey);
+        if status2 != 0 {
+            return None;
+        }
+        let mut u16_count = actual_len as usize / 2;
+        while u16_count > 0 && buf[u16_count - 1] == 0 {
+            u16_count -= 1;
+        }
+        let s = OsString::from_wide(&buf[..u16_count])
+            .to_string_lossy()
+            .trim()
+            .to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+}
+
 /// Query a Windows User Environment variable from `HKCU\Environment`.
 pub fn get_user_env_var(name: &str) -> Option<String> {
-    if !cfg!(windows) {
-        return None;
+    #[cfg(windows)]
+    {
+        query_hkcu_environment_win32(name)
     }
-    let output = Command::new("reg")
-        .args(["query", r"HKCU\Environment", "/v", name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        None
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_reg_query_value(&text, name)
 }
 
 /// Select the best official `.orig.exe` candidate inside `dir`, preferring files > 10 MB
@@ -1075,7 +1282,6 @@ pub fn find_agent_role(v: &Value) -> Option<String> {
 pub fn route_thread_params(params: &mut serde_json::Map<String, Value>) -> bool {
     let mut modified = false;
     let mut nested_subagent = false;
-    let target_provider = get_target_model_provider();
 
     // Check nested objects
     let mut nested_model: Option<String> = None;
@@ -1115,6 +1321,7 @@ pub fn route_thread_params(params: &mut serde_json::Map<String, Value>) -> bool 
     // Check role / agent type across current map and nested trees
     let detected_role = find_agent_role(&Value::Object(params.clone()));
     let role = detected_role.as_deref();
+    let target_provider = get_target_model_provider_for_role(role);
 
     let role_is_subagent = if let Some(r) = role {
         is_subagent_role_name(r)
@@ -1233,7 +1440,7 @@ pub fn probe_endpoint(endpoint: &str) {
 /// Check if a given model string corresponds to a 9Router or subagent model.
 pub fn is_subagent_model_name(m: &str) -> bool {
     let trimmed = m.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || is_parent_chatgpt_model(trimmed) {
         return false;
     }
     let lower = trimmed.to_lowercase();
@@ -1342,10 +1549,11 @@ pub fn get_subagent_responses_url() -> String {
     let proc_val = env::var("CODEX_SUBAGENT_ENDPOINT")
         .ok()
         .and_then(|s| normalize_subagent_responses_endpoint(&s));
-    let reg_val = get_user_env_var("CODEX_SUBAGENT_ENDPOINT")
-        .and_then(|s| normalize_subagent_responses_endpoint(&s));
+    let mut reg_val: Option<String> = None;
 
     if let Some(ref ep) = proc_val {
+        reg_val = get_user_env_var("CODEX_SUBAGENT_ENDPOINT")
+            .and_then(|s| normalize_subagent_responses_endpoint(&s));
         if reg_val.as_deref() != Some(ep.as_str()) {
             return ep.clone();
         }
@@ -1356,7 +1564,12 @@ pub fn get_subagent_responses_url() -> String {
         return cfg_ep;
     }
 
-    if let Some(ep) = proc_val.or(reg_val) {
+    if let Some(ep) = proc_val.or_else(|| {
+        reg_val.or_else(|| {
+            get_user_env_var("CODEX_SUBAGENT_ENDPOINT")
+                .and_then(|s| normalize_subagent_responses_endpoint(&s))
+        })
+    }) {
         return ep;
     }
 
@@ -1370,12 +1583,35 @@ pub fn get_subagent_auth_header() -> Option<String> {
         if !trimmed.is_empty() {
             return Some(format!("Bearer {}", trimmed));
         }
-        return None;
     }
     if let Some(key) = get_user_env_var("NINEROUTER_KEY") {
         let trimmed = key.trim();
         if !trimmed.is_empty() {
             return Some(format!("Bearer {}", trimmed));
+        }
+    }
+    if let Some(codex_home) = get_codex_home_dir() {
+        let provider = get_target_model_provider();
+        if let Ok(content) = fs::read_to_string(codex_home.join("config.toml")) {
+            if let Some(env_key_name) = parse_provider_env_key_from_config_toml(&content, &provider)
+            {
+                let trimmed_name = env_key_name.trim();
+                if !trimmed_name.is_empty() && !trimmed_name.eq_ignore_ascii_case("NINEROUTER_KEY")
+                {
+                    if let Ok(k) = env::var(trimmed_name) {
+                        let t = k.trim();
+                        if !t.is_empty() {
+                            return Some(format!("Bearer {}", t));
+                        }
+                    }
+                    if let Some(k) = get_user_env_var(trimmed_name) {
+                        let t = k.trim();
+                        if !t.is_empty() {
+                            return Some(format!("Bearer {}", t));
+                        }
+                    }
+                }
+            }
         }
     }
     None
@@ -1898,6 +2134,15 @@ fn apply_subagent_model_metadata_fields(
 /// `context_window: 872000`, `max_context_window: 872000`, `effective_context_window_percent: 95`),
 /// and configures function `apply_patch`.
 pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
+    let primary = read_primary_model_from_config();
+    inject_subagent_models_metadata_with_primary(body, primary.as_deref())
+}
+
+/// Inject subagent model metadata descriptors with an optional configured primary parent model preference.
+pub fn inject_subagent_models_metadata_with_primary(
+    body: &[u8],
+    primary_model: Option<&str>,
+) -> Vec<u8> {
     let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
         return body.to_vec();
     };
@@ -1918,14 +2163,27 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
         return body.to_vec();
     };
 
-    // Prefer "gpt-6-luna" in models_arr as the base template, falling back to the first non-subagent parent model
-    let template = models_arr
-        .iter()
-        .find(|item| {
-            item.get("slug")
-                .or_else(|| item.get("id"))
-                .and_then(|s| s.as_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("gpt-6-luna"))
+    // Prefer the user's configured primary parent model from config.toml (if present in models_arr),
+    // then "gpt-6-luna", then the first non-subagent parent model. Never select a subagent model as template.
+    let primary_clean = primary_model
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !is_subagent_model_name(s));
+    let template = primary_clean
+        .and_then(|prim| {
+            models_arr.iter().find(|item| {
+                item.get("slug")
+                    .or_else(|| item.get("id"))
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case(prim))
+            })
+        })
+        .or_else(|| {
+            models_arr.iter().find(|item| {
+                item.get("slug")
+                    .or_else(|| item.get("id"))
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case("gpt-6-luna"))
+            })
         })
         .or_else(|| {
             models_arr.iter().find(|item| {
@@ -1935,7 +2193,6 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
                     .is_some_and(|s| !is_subagent_model_name(s))
             })
         })
-        .or_else(|| models_arr.first())
         .cloned();
 
     let mut slugs_to_ensure = vec![
@@ -3550,17 +3807,39 @@ pub fn codex_singleton_lockfile_paths() -> Vec<PathBuf> {
         );
     }
     if let Ok(local_appdata) = env::var("LOCALAPPDATA") {
-        paths.push(
-            PathBuf::from(local_appdata)
-                .join("Packages")
-                .join("OpenAI.Codex_2p2nqsd0c76g0")
-                .join("LocalCache")
-                .join("Roaming")
-                .join("Codex")
-                .join("web")
-                .join("Codex")
-                .join("lockfile"),
-        );
+        let packages_dir = PathBuf::from(&local_appdata).join("Packages");
+        if let Ok(entries) = fs::read_dir(&packages_dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.to_ascii_lowercase().starts_with("openai.codex"))
+                {
+                    let lock = entry
+                        .path()
+                        .join("LocalCache")
+                        .join("Roaming")
+                        .join("Codex")
+                        .join("web")
+                        .join("Codex")
+                        .join("lockfile");
+                    if !paths.contains(&lock) {
+                        paths.push(lock);
+                    }
+                }
+            }
+        }
+        let default_pkg_lock = packages_dir
+            .join("OpenAI.Codex_2p2nqsd0c76g0")
+            .join("LocalCache")
+            .join("Roaming")
+            .join("Codex")
+            .join("web")
+            .join("Codex")
+            .join("lockfile");
+        if !paths.contains(&default_pkg_lock) {
+            paths.push(default_pkg_lock);
+        }
     }
     paths
 }
@@ -6730,7 +7009,68 @@ default_subagent_model = "9router-subagent"
         assert_eq!(subagent["context_window"], 872000);
         assert_eq!(subagent["max_context_window"], 872000);
 
-        // 2. Explicit CODEX_SUBAGENT_CONTEXT_WINDOW override and larger parent template fallback
+        // 2. Catalog containing both gpt-6-luna (comp_hash="3000") and gpt-5.4 (comp_hash="1000")
+        //    when user's primary model in config.toml is "gpt-5.4"
+        let catalog_both = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-6-luna",
+                    "display_name": "GPT-6 Luna",
+                    "context_window": 272000,
+                    "max_context_window": 872000,
+                    "comp_hash": "3000"
+                },
+                {
+                    "slug": "gpt-5.4",
+                    "display_name": "GPT-5.4",
+                    "context_window": 272000,
+                    "max_context_window": 400000,
+                    "comp_hash": "1000"
+                }
+            ]
+        });
+        let enriched_primary_bytes = inject_subagent_models_metadata_with_primary(
+            &serde_json::to_vec(&catalog_both).unwrap(),
+            Some("gpt-5.4"),
+        );
+        let enriched_primary: Value = serde_json::from_slice(&enriched_primary_bytes).unwrap();
+        let subagent_primary = enriched_primary["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["slug"] == "9router-subagent")
+            .unwrap();
+        assert_eq!(subagent_primary["comp_hash"], "1000");
+
+        // 3. Stale subagent-only catalog must NOT select subagent as template and must reset comp_hash to "3000"
+        let stale_subagent_only = serde_json::json!({
+            "models": [
+                {
+                    "slug": "9router-subagent",
+                    "context_window": 200000,
+                    "max_context_window": 200000,
+                    "comp_hash": "stale_hash"
+                }
+            ]
+        });
+        let enriched_stale_bytes = inject_subagent_models_metadata_with_primary(
+            &serde_json::to_vec(&stale_subagent_only).unwrap(),
+            None,
+        );
+        let enriched_stale: Value = serde_json::from_slice(&enriched_stale_bytes).unwrap();
+        let subagent_stale = enriched_stale["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["slug"] == "9router-subagent")
+            .unwrap();
+        assert_eq!(
+            subagent_stale["comp_hash"], "3000",
+            "stale subagent-only catalog must not inherit its own stale_hash as template"
+        );
+        assert_eq!(subagent_stale["context_window"], 872000);
+
+        // 4. Explicit CODEX_SUBAGENT_CONTEXT_WINDOW override and larger parent template fallback
         let tmpl = &catalog_gpt54["models"][0];
         assert_eq!(
             resolve_subagent_context_window_with_override(Some(tmpl), Some("256000")),
@@ -6788,17 +7128,24 @@ default_subagent_model = "9router-subagent"
         let agents_dir = tmp_home.join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
 
+        // Both default.toml (with 9router) and worker.toml (customized to ollama) exist
+        fs::write(
+            agents_dir.join("default.toml"),
+            "name = \"default\"\nmodel = \"default-toml-model\"\nmodel_provider = \"9router\"\n",
+        )
+        .unwrap();
         fs::write(
             agents_dir.join("worker.toml"),
             "name = \"worker\"\nmodel = \"hot-reloaded-worker\"\nmodel_provider = \"ollama\"\n",
         )
         .unwrap();
-        fs::write(
-            tmp_home.join("config.toml"),
-            "[model_providers.ollama]\nname = \"ollama\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n\n[agents]\ndefault_subagent_model = \"hot-reloaded-default\"\n",
-        )
-        .unwrap();
+        let config_toml = "model = \"gpt-5.4\"\n\n[model_providers.openai]\nname = \"openai\"\nbase_url = \"https://api.openai.com/v1\"\n\n[model_providers.ollama]\nname = \"ollama\"\nbase_url = \"http://127.0.0.1:11434/v1\"\nenv_key = \"OLLAMA_API_KEY\"\n\n[agents]\ndefault_subagent_model = \"hot-reloaded-default\"\n";
+        fs::write(tmp_home.join("config.toml"), config_toml).unwrap();
 
+        assert_eq!(
+            read_primary_model_from_config_in_dir(&tmp_home).as_deref(),
+            Some("gpt-5.4")
+        );
         assert_eq!(
             read_model_from_config_in_dir(&tmp_home, "worker").as_deref(),
             Some("hot-reloaded-worker")
@@ -6808,12 +7155,29 @@ default_subagent_model = "9router-subagent"
             Some("hot-reloaded-default")
         );
         assert_eq!(
+            read_provider_for_role_from_config_in_dir(&tmp_home, Some("worker")).as_deref(),
+            Some("ollama")
+        );
+        assert_eq!(
+            read_provider_for_role_from_config_in_dir(&tmp_home, Some("default")).as_deref(),
+            Some("9router")
+        );
+        assert_eq!(
             read_provider_from_config_in_dir(&tmp_home).as_deref(),
             Some("ollama")
         );
         assert_eq!(
             read_subagent_endpoint_from_config_in_dir(&tmp_home, "ollama").as_deref(),
             Some("http://127.0.0.1:11434/v1/responses")
+        );
+        assert_eq!(
+            read_subagent_endpoint_from_config_in_dir(&tmp_home, "unconfigured_provider"),
+            None,
+            "must not fall back to [model_providers.openai] or unrelated provider base_url"
+        );
+        assert_eq!(
+            parse_provider_env_key_from_config_toml(config_toml, "ollama").as_deref(),
+            Some("OLLAMA_API_KEY")
         );
 
         let _ = fs::remove_dir_all(&tmp_home);

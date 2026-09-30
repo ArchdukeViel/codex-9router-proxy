@@ -14,7 +14,15 @@ Write-Host "            Codex 9Router Proxy - Uninstaller                      "
 Write-Host "===================================================================" -ForegroundColor Yellow
 
 # 1. Stop running codex processes and proxy port listeners
-$proxyPort = if ($env:CODEX_PROXY_PORT -and $env:CODEX_PROXY_PORT.Trim()) { [int]$env:CODEX_PROXY_PORT.Trim() } else { 20129 }
+$parsedPort = 0
+$userPortRaw = [System.Environment]::GetEnvironmentVariable("CODEX_PROXY_PORT", "User")
+$proxyPort = if ($env:CODEX_PROXY_PORT -and [int]::TryParse($env:CODEX_PROXY_PORT.Trim(), [ref]$parsedPort) -and $parsedPort -gt 0) {
+    $parsedPort
+} elseif ($userPortRaw -and [int]::TryParse($userPortRaw.Trim(), [ref]$parsedPort) -and $parsedPort -gt 0) {
+    $parsedPort
+} else {
+    20129
+}
 Write-Host "[*] Stopping running codex processes and port $proxyPort listeners..." -ForegroundColor Gray
 Get-NetTCPConnection -LocalPort $proxyPort -ErrorAction SilentlyContinue | ForEach-Object {
     $procId = $_.OwningProcess
@@ -82,20 +90,28 @@ $dbCandidates = @(
 ) | Where-Object { Test-Path $_ }
 
 if ($dbCandidates.Count -gt 0) {
-    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($pythonCmd) {
-        foreach ($dbFile in $dbCandidates) {
-            try {
-                $pyDropScript = @"
-import sqlite3
-conn = sqlite3.connect(r'$dbFile')
+    $hasPython = $false
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        try {
+            & python -c "import sqlite3" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { $hasPython = $true }
+        } catch {}
+    }
+    if ($hasPython) {
+        $pyDropScript = @'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
 cur = conn.cursor()
-cur.execute('DROP TRIGGER IF EXISTS fix_subagent_provider_trigger;')
+cur.execute("DROP TRIGGER IF EXISTS fix_subagent_provider_trigger;")
 conn.commit()
 conn.close()
-"@
-                $pyDropScript | & python - 2>&1 | Out-Null
-                Write-Host "[OK] Removed SQLite subagent provider trigger from $dbFile" -ForegroundColor Green
+'@
+        foreach ($dbFile in $dbCandidates) {
+            try {
+                & python -c $pyDropScript $dbFile 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "[OK] Removed SQLite subagent provider trigger from $dbFile" -ForegroundColor Green
+                }
             } catch {}
         }
     }
@@ -133,7 +149,7 @@ if (Test-Path $desktopBinRoot) {
 Get-ChildItem "$desktopBinRoot\*\*.old.*", "$customDir\*.old.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
 # 5. Restore Daemon Binaries
-$daemonReleases = Join-Path $env:USERPROFILE ".codex\packages\app-server-daemon\releases"
+$daemonReleases = Join-Path $codexDir "packages\app-server-daemon\releases"
 if (Test-Path $daemonReleases) {
     Get-ChildItem -Path $daemonReleases -Directory | ForEach-Object {
         $dBin = Join-Path $_.FullName "bin"

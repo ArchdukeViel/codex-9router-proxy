@@ -147,10 +147,10 @@ public class CodexDesktopCheck {
         }
     }
     if (-not (Get-Process -Name "ChatGPT*" -ErrorAction SilentlyContinue)) {
-        @(
-            "$env:APPDATA\Codex\web\Codex\lockfile",
-            "$env:LOCALAPPDATA\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Roaming\Codex\web\Codex\lockfile"
-        ) | Where-Object { Test-Path $_ } | Remove-Item -Force -ErrorAction SilentlyContinue
+        $lockCandidates = @("$env:APPDATA\Codex\web\Codex\lockfile")
+        $pkgLocks = Get-ChildItem "$env:LOCALAPPDATA\Packages\OpenAI.Codex*\LocalCache\Roaming\Codex\web\Codex\lockfile" -File -ErrorAction SilentlyContinue
+        if ($pkgLocks) { $lockCandidates += $pkgLocks.FullName }
+        $lockCandidates | Where-Object { Test-Path $_ } | Remove-Item -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -365,16 +365,18 @@ if (-not (($env:Path -split ';') | Where-Object { $_.Trim().TrimEnd('\') -ieq $n
     $env:Path = "$customDir;$env:Path"
 }
 
-$proxyPort = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_PROXY_PORT)) {
-    [int]$env:CODEX_PROXY_PORT
-} elseif (-not [string]::IsNullOrWhiteSpace([System.Environment]::GetEnvironmentVariable("CODEX_PROXY_PORT", "User"))) {
-    [int][System.Environment]::GetEnvironmentVariable("CODEX_PROXY_PORT", "User")
+$parsedPort = 0
+$userPortRaw = [System.Environment]::GetEnvironmentVariable("CODEX_PROXY_PORT", "User")
+$proxyPort = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_PROXY_PORT) -and [int]::TryParse($env:CODEX_PROXY_PORT.Trim(), [ref]$parsedPort) -and $parsedPort -gt 0) {
+    $parsedPort
+} elseif (-not [string]::IsNullOrWhiteSpace($userPortRaw) -and [int]::TryParse($userPortRaw.Trim(), [ref]$parsedPort) -and $parsedPort -gt 0) {
+    $parsedPort
 } else {
     20129
 }
 
 # 3. Configure ~/.codex/config.toml (BOM-Free UTF-8)
-$codexDir = Join-Path $env:USERPROFILE ".codex"
+$codexDir = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) { $env:CODEX_HOME.Trim() } else { Join-Path $env:USERPROFILE ".codex" }
 if (-not (Test-Path $codexDir)) {
     New-Item -ItemType Directory -Path $codexDir -Force | Out-Null
 }
@@ -484,15 +486,19 @@ $dbCandidates = @(
     (Join-Path $codexDir "sqlite\codex-dev.db")
 )
 
-$hasPython = [bool](Get-Command python -ErrorAction SilentlyContinue)
+$hasPython = $false
+if (Get-Command python -ErrorAction SilentlyContinue) {
+    try {
+        & python -c "import sqlite3" 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { $hasPython = $true }
+    } catch {}
+}
 if ($hasPython) {
-    foreach ($db in $dbCandidates) {
-        if (Test-Path $db) {
-            $pyScript = @"
+    $pyScript = @'
 import sqlite3, sys
-db_path = r'$db'
-provider = r'$Provider'
-models = [r'$DefaultModel', r'$WorkerModel', r'$ExplorerModel', r'$ReviewerModel', 'implement', 'explore', 'review']
+db_path = sys.argv[1]
+provider = sys.argv[2]
+models = list(sys.argv[3:]) + ['implement', 'explore', 'review']
 def q(s):
     return "'" + s.replace("'", "''") + "'"
 unique_models = []
@@ -506,23 +512,27 @@ try:
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("DROP TRIGGER IF EXISTS fix_subagent_provider_trigger;")
-    cur.execute(f'''
-    CREATE TRIGGER fix_subagent_provider_trigger
-    AFTER INSERT ON threads
-    FOR EACH ROW
-    WHEN (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
-    BEGIN
-        UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
-    END;
-    ''')
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'")
+    if cur.fetchone() is not None:
+        cur.execute(f"""
+        CREATE TRIGGER fix_subagent_provider_trigger
+        AFTER INSERT ON threads
+        FOR EACH ROW
+        WHEN (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
+        BEGIN
+            UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
+        END;
+        """)
     conn.commit()
     conn.close()
     sys.exit(0)
 except Exception as e:
     sys.stderr.write(str(e))
     sys.exit(1)
-"@
-            python -c $pyScript
+'@
+    foreach ($db in $dbCandidates) {
+        if (Test-Path $db) {
+            & python -c $pyScript $db $Provider $DefaultModel $WorkerModel $ExplorerModel $ReviewerModel
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "[OK] Injected SQLite subagent trigger into $db." -ForegroundColor Green
             } else {
@@ -778,23 +788,21 @@ if (Safe-CopyExecutable -Source $releaseBinary -Destination $customCodex) {
     Write-Host "[OK] Deployed standalone proxy copy to $customCodex" -ForegroundColor Green
 }
 
-if ($storeResDir) {
+if ($storeResDir -and (Test-Path (Join-Path $storeResDir "codex.exe"))) {
     $storeCodex = Join-Path $storeResDir "codex.exe"
-    if (Test-Path $storeCodex) {
-        $storeItem = Get-Item $storeCodex
-        foreach ($origName in @("codex-9router-subagents.orig.exe", "codex.orig.exe")) {
-            $origDst = Join-Path $customDir $origName
-            $needsSync = (-not (Test-Path $origDst))
-            if (-not $needsSync) {
-                $dstItem = Get-Item $origDst
-                if (($dstItem.Length -ne $storeItem.Length) -or ($dstItem.LastWriteTimeUtc -ne $storeItem.LastWriteTimeUtc)) {
-                    $needsSync = $true
-                }
+    $storeItem = Get-Item $storeCodex
+    foreach ($origName in @("codex-9router-subagents.orig.exe", "codex.orig.exe")) {
+        $origDst = Join-Path $customDir $origName
+        $needsSync = (-not (Test-Path $origDst))
+        if (-not $needsSync) {
+            $dstItem = Get-Item $origDst
+            if (($dstItem.Length -ne $storeItem.Length) -or ($dstItem.LastWriteTimeUtc -ne $storeItem.LastWriteTimeUtc)) {
+                $needsSync = $true
             }
-            if ($needsSync) {
-                if (Safe-CopyExecutable -Source $storeCodex -Destination $origDst) {
-                    Write-Host "[OK] Synchronized $origName with Microsoft Store binary ($($storeItem.Length) bytes)." -ForegroundColor Green
-                }
+        }
+        if ($needsSync) {
+            if (Safe-CopyExecutable -Source $storeCodex -Destination $origDst) {
+                Write-Host "[OK] Synchronized $origName with Microsoft Store binary ($($storeItem.Length) bytes)." -ForegroundColor Green
             }
         }
     }
@@ -818,11 +826,14 @@ if ($storeResDir) {
         }
     }
 } else {
-    # Non-Microsoft-Store fallback: locate stock codex.exe (> 10 MB) from desktop bin, daemon releases, or Programs
+    # Non-Microsoft-Store fallback: locate stock codex.exe (> 10 MB) from desktop bin, custom/*.orig.exe, daemon releases, or Programs
     $fallbackStockItem = $null
     $fallbackCandidates = @()
     if (Test-Path $desktopBinRoot) {
         $fallbackCandidates += Get-ChildItem -Path "$desktopBinRoot\*\codex.orig.exe", "$desktopBinRoot\*\codex.exe" -File -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $customDir) {
+        $fallbackCandidates += Get-ChildItem -Path "$customDir\codex.orig.exe", "$customDir\codex-9router-subagents.orig.exe" -File -ErrorAction SilentlyContinue
     }
     if (Test-Path $daemonReleases) {
         $fallbackCandidates += Get-ChildItem -Path "$daemonReleases\*\bin\codex.orig.exe", "$daemonReleases\*\bin\codex.exe" -File -ErrorAction SilentlyContinue
@@ -836,7 +847,7 @@ if ($storeResDir) {
         $stockDir = $fallbackStockItem.DirectoryName
         foreach ($origName in @("codex-9router-subagents.orig.exe", "codex.orig.exe")) {
             $origDst = Join-Path $customDir $origName
-            if ((-not (Test-Path $origDst)) -or ((Get-Item $origDst).Length -lt 10000000)) {
+            if (($fallbackStockItem.FullName -ne $origDst) -and ((-not (Test-Path $origDst)) -or ((Get-Item $origDst).Length -lt 10000000))) {
                 if (Safe-CopyExecutable -Source $fallbackStockItem.FullName -Destination $origDst) {
                     Write-Host "[OK] Synchronized $origName from local stock binary ($($fallbackStockItem.Length) bytes)." -ForegroundColor Green
                 }
@@ -845,7 +856,7 @@ if ($storeResDir) {
         foreach ($helper in $customHelpers) {
             $hSrc = Join-Path $stockDir $helper
             $hDst = Join-Path $customDir $helper
-            if ((Test-Path $hSrc) -and -not (Test-Path $hDst)) {
+            if ((Test-Path $hSrc) -and ($hSrc -ne $hDst) -and -not (Test-Path $hDst)) {
                 if (Safe-CopyExecutable -Source $hSrc -Destination $hDst) {
                     Write-Host "[OK] Synchronized helper $helper to $customDir." -ForegroundColor Green
                 }
@@ -869,7 +880,17 @@ $syncScript = @"
 `$proxyPath = Join-Path `$customDir 'codex-9router-subagents.exe'
 `$customCodex = Join-Path `$customDir 'codex.exe'
 `$binRoot = Join-Path `$env:LOCALAPPDATA 'OpenAI\Codex\bin'
-`$proxyPort = if (`$env:CODEX_PROXY_PORT -and `$env:CODEX_PROXY_PORT.Trim()) { [int]`$env:CODEX_PROXY_PORT.Trim() } else { $proxyPort }
+`$codexDir = if (`$env:CODEX_HOME -and `$env:CODEX_HOME.Trim()) { `$env:CODEX_HOME.Trim() } else { Join-Path `$env:USERPROFILE '.codex' }
+`$daemonReleases = Join-Path `$codexDir 'packages\app-server-daemon\releases'
+`$parsedPort = 0
+`$userPortRaw = [System.Environment]::GetEnvironmentVariable('CODEX_PROXY_PORT', 'User')
+`$proxyPort = if (`$env:CODEX_PROXY_PORT -and [int]::TryParse(`$env:CODEX_PROXY_PORT.Trim(), [ref]`$parsedPort) -and `$parsedPort -gt 0) {
+    `$parsedPort
+} elseif (`$userPortRaw -and [int]::TryParse(`$userPortRaw.Trim(), [ref]`$parsedPort) -and `$parsedPort -gt 0) {
+    `$parsedPort
+} else {
+    $proxyPort
+}
 
 function Sync-Executable {
     param(
@@ -924,16 +945,14 @@ if (-not `$resDir -or -not (Test-Path `$resDir)) {
 `$binHelpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe')
 `$customHelpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe', 'rg.exe')
 
-# 3. Refresh custom\codex.orig.exe, custom\codex-9router-subagents.orig.exe, and custom\ helpers when MS Store package updates (or fallback to binRoot stock binary)
-if (`$resDir -and (Test-Path `$resDir)) {
+# 3. Refresh custom\codex.orig.exe, custom\codex-9router-subagents.orig.exe, and custom\ helpers when MS Store package updates (or fallback to local stock binary)
+if (`$resDir -and (Test-Path (Join-Path `$resDir 'codex.exe'))) {
     `$storeCodex = Join-Path `$resDir 'codex.exe'
-    if (Test-Path `$storeCodex) {
-        `$storeItem = Get-Item `$storeCodex
-        foreach (`$origName in @('codex-9router-subagents.orig.exe', 'codex.orig.exe')) {
-            `$origDst = Join-Path `$customDir `$origName
-            if ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -ne `$storeItem.Length) -or ((Get-Item `$origDst).LastWriteTimeUtc -ne `$storeItem.LastWriteTimeUtc)) {
-                Sync-Executable -Source `$storeCodex -Destination `$origDst | Out-Null
-            }
+    `$storeItem = Get-Item `$storeCodex
+    foreach (`$origName in @('codex-9router-subagents.orig.exe', 'codex.orig.exe')) {
+        `$origDst = Join-Path `$customDir `$origName
+        if ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -ne `$storeItem.Length) -or ((Get-Item `$origDst).LastWriteTimeUtc -ne `$storeItem.LastWriteTimeUtc)) {
+            Sync-Executable -Source `$storeCodex -Destination `$origDst | Out-Null
         }
     }
     foreach (`$h in `$customHelpers) {
@@ -946,13 +965,34 @@ if (`$resDir -and (Test-Path `$resDir)) {
             }
         }
     }
-} elseif (Test-Path `$binRoot) {
-    `$fbStock = Get-ChildItem -Path "`$binRoot\*\codex.orig.exe", "`$binRoot\*\codex.exe" -File | Where-Object { `$_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+} else {
+    `$fbCandidates = @()
+    if (Test-Path `$binRoot) {
+        `$fbCandidates += Get-ChildItem -Path "`$binRoot\*\codex.orig.exe", "`$binRoot\*\codex.exe" -File
+    }
+    if (Test-Path `$customDir) {
+        `$fbCandidates += Get-ChildItem -Path "`$customDir\codex.orig.exe", "`$customDir\codex-9router-subagents.orig.exe" -File
+    }
+    if (Test-Path `$daemonReleases) {
+        `$fbCandidates += Get-ChildItem -Path "`$daemonReleases\*\bin\codex.orig.exe", "`$daemonReleases\*\bin\codex.exe" -File
+    }
+    `$progCodex = Join-Path `$env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin\codex.exe'
+    if (Test-Path `$progCodex) {
+        `$fbCandidates += Get-Item `$progCodex
+    }
+    `$fbStock = `$fbCandidates | Where-Object { `$_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     if (`$fbStock) {
         foreach (`$origName in @('codex-9router-subagents.orig.exe', 'codex.orig.exe')) {
             `$origDst = Join-Path `$customDir `$origName
-            if ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -lt 10000000)) {
+            if ((`$fbStock.FullName -ne `$origDst) -and ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -lt 10000000))) {
                 Sync-Executable -Source `$fbStock.FullName -Destination `$origDst | Out-Null
+            }
+        }
+        foreach (`$h in `$customHelpers) {
+            `$hs = Join-Path `$fbStock.DirectoryName `$h
+            `$hd = Join-Path `$customDir `$h
+            if ((Test-Path `$hs) -and (`$hs -ne `$hd) -and -not (Test-Path `$hd)) {
+                Sync-Executable -Source `$hs -Destination `$hd | Out-Null
             }
         }
     }
