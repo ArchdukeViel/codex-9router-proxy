@@ -4536,6 +4536,7 @@ pub fn create_router(state: Arc<ProxyAppState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/health/", get(health_handler))
+        .route("/__codex_9router_proxy_healthz", get(health_handler))
         .route(
             "/backend-api/codex/responses",
             get(ws_responses_handler).post(proxy_handler),
@@ -4683,8 +4684,8 @@ pub fn spawn_reverse_proxy_standby_thread(bind_addr: String, tls_acceptor: TlsAc
             if let Ok(l) = TcpListener::bind(&bind_addr) {
                 if l.set_nonblocking(true).is_ok() {
                     spawn_reverse_proxy_accept_thread(l, tls_acceptor);
+                    break;
                 }
-                break;
             }
         }
     });
@@ -4718,27 +4719,35 @@ pub fn spawn_embedded_reverse_proxy_with_port(bind_addr: &str) -> io::Result<(Pa
                 spawn_reverse_proxy_standby_thread(bind_addr.to_string(), tls_acceptor);
                 return Ok((cert_path, requested_port));
             }
-            let mut fallback_listener: Option<(TcpListener, String)> = None;
-            for candidate_port in 20130..=20139u16 {
-                let candidate_addr = format!("127.0.0.1:{}", candidate_port);
-                if let Ok(l) = TcpListener::bind(&candidate_addr) {
-                    fallback_listener = Some((l, candidate_port.to_string()));
-                    break;
-                } else if verify_existing_tls_proxy_listener(&candidate_addr, &cert_path) {
-                    spawn_reverse_proxy_standby_thread(candidate_addr, tls_acceptor);
-                    return Ok((cert_path, candidate_port.to_string()));
-                }
-            }
-            if fallback_listener.is_none() {
-                if let Ok(l) = TcpListener::bind("127.0.0.1:0") {
-                    if let Ok(addr) = l.local_addr() {
-                        fallback_listener = Some((l, addr.port().to_string()));
+            if let Ok(l) = TcpListener::bind(bind_addr) {
+                let bound_port = l
+                    .local_addr()
+                    .map(|a| a.port().to_string())
+                    .unwrap_or_else(|_| requested_port.clone());
+                (l, bound_port)
+            } else {
+                let mut fallback_listener: Option<(TcpListener, String)> = None;
+                for candidate_port in 20130..=20139u16 {
+                    let candidate_addr = format!("127.0.0.1:{}", candidate_port);
+                    if let Ok(l) = TcpListener::bind(&candidate_addr) {
+                        fallback_listener = Some((l, candidate_port.to_string()));
+                        break;
+                    } else if verify_existing_tls_proxy_listener(&candidate_addr, &cert_path) {
+                        spawn_reverse_proxy_standby_thread(candidate_addr, tls_acceptor);
+                        return Ok((cert_path, candidate_port.to_string()));
                     }
                 }
-            }
-            match fallback_listener {
-                Some(pair) => pair,
-                None => return Err(e),
+                if fallback_listener.is_none() {
+                    if let Ok(l) = TcpListener::bind("127.0.0.1:0") {
+                        if let Ok(addr) = l.local_addr() {
+                            fallback_listener = Some((l, addr.port().to_string()));
+                        }
+                    }
+                }
+                match fallback_listener {
+                    Some(pair) => pair,
+                    None => return Err(e),
+                }
             }
         }
         Err(e) => return Err(e),
@@ -4779,8 +4788,31 @@ pub fn default_proxy_daemon_lockfile_path(port: &str) -> PathBuf {
     proxy_daemon_lockfile_path_in_dir(&custom_dir, port)
 }
 
+/// Check whether `lock_path` is currently held by a running `--proxy-daemon` instance
+/// by probing with `share_mode(0)` without truncating or overwriting the file.
+pub fn is_proxy_daemon_lock_held_at(lock_path: &Path) -> bool {
+    if !lock_path.exists() {
+        return false;
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
+    match opts.open(lock_path) {
+        Ok(probe_handle) => {
+            drop(probe_handle);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 /// Attempt to open `lock_path` with an exclusive OS lock (`share_mode(0)` on Windows).
-/// Returns `Some(File)` if acquired, or `None` if another `--proxy-daemon` instance holds the lock.
+/// Retries briefly to ride through sub-millisecond liveness probes, returning `Some(File)`
+/// if acquired or `None` if another `--proxy-daemon` instance holds the lock.
 pub fn try_acquire_proxy_daemon_lock_at(lock_path: &Path) -> Option<fs::File> {
     if let Some(parent) = lock_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -4792,7 +4824,21 @@ pub fn try_acquire_proxy_daemon_lock_at(lock_path: &Path) -> Option<fs::File> {
         use std::os::windows::fs::OpenOptionsExt;
         opts.share_mode(0);
     }
-    let mut file = opts.open(lock_path).ok()?;
+    let mut file_opt = None;
+    for attempt in 0..4 {
+        match opts.open(lock_path) {
+            Ok(f) => {
+                file_opt = Some(f);
+                break;
+            }
+            Err(_) => {
+                if attempt + 1 < 4 {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+    let mut file = file_opt?;
     let _ = file.set_len(0);
     let _ = writeln!(file, "{}", std::process::id());
     let _ = file.flush();
@@ -4832,14 +4878,12 @@ pub fn resolve_proxy_daemon_exe_path() -> Option<PathBuf> {
 }
 
 /// Ensure a detached background `--proxy-daemon` process is running for `port`.
-/// If `proxy-daemon-<port>.lock` can be opened with `share_mode(0)` (meaning no `--proxy-daemon`
-/// is currently holding the lock), drops the test handle and spawns a detached `--proxy-daemon`.
+/// If `proxy-daemon-<port>.lock` is not currently held with `share_mode(0)`, spawns a detached `--proxy-daemon`.
 pub fn ensure_background_proxy_daemon_running(port: &str) {
     let lock_path = default_proxy_daemon_lockfile_path(port);
-    let Some(test_lock) = try_acquire_proxy_daemon_lock_at(&lock_path) else {
+    if is_proxy_daemon_lock_held_at(&lock_path) {
         return;
-    };
-    drop(test_lock);
+    }
 
     let Some(daemon_exe) = resolve_proxy_daemon_exe_path() else {
         return;
@@ -4847,6 +4891,7 @@ pub fn ensure_background_proxy_daemon_running(port: &str) {
 
     let mut cmd = Command::new(daemon_exe);
     cmd.arg("--proxy-daemon")
+        .env("CODEX_PROXY_PORT", port)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -5708,9 +5753,6 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let _ = sync_custom_codex_binaries();
-    let _ = sync_codex_models_cache();
-
     if args.iter().any(|a| a.eq_ignore_ascii_case("--proxy-daemon")) {
         let port = get_proxy_port();
         let Some(_daemon_lock) = try_acquire_proxy_daemon_lock(&port) else {
@@ -5718,10 +5760,15 @@ fn main() -> io::Result<()> {
         };
         let bind_addr = format!("127.0.0.1:{}", port);
         let _ = spawn_embedded_reverse_proxy_with_port(&bind_addr)?;
+        let _ = sync_custom_codex_binaries();
+        let _ = sync_codex_models_cache();
         loop {
             thread::park();
         }
     }
+
+    let _ = sync_custom_codex_binaries();
+    let _ = sync_codex_models_cache();
 
     let real_codex = find_real_codex();
     let is_lightweight_command = is_lightweight_cli_invocation(&args);
@@ -8876,12 +8923,16 @@ auditor = "claude-3-7-sonnet-audit"
         assert_eq!(fs::read(ag_ext_bin.join("codex.orig.exe")).unwrap().len(), 5000);
         assert_eq!(fs::read(ag_ext_bin.join("codex.exe")).unwrap().len(), 200);
 
-        // 2. Verify single-instance --proxy-daemon exclusive lockfile acquisition
+        // 2. Verify single-instance --proxy-daemon exclusive lockfile acquisition & non-mutating probe
         let lock_path = proxy_daemon_lockfile_path_in_dir(&tmp_dir, "20129");
         assert_eq!(lock_path, tmp_dir.join("proxy-daemon-20129.lock"));
         assert_eq!(
             proxy_daemon_lockfile_path_in_dir(&tmp_dir, "   "),
             tmp_dir.join("proxy-daemon-20129.lock")
+        );
+        assert!(
+            !is_proxy_daemon_lock_held_at(&lock_path),
+            "non-existent lockfile must not be reported as held"
         );
 
         let lock1 = try_acquire_proxy_daemon_lock_at(&lock_path);
@@ -8891,6 +8942,10 @@ auditor = "claude-3-7-sonnet-audit"
         );
         #[cfg(windows)]
         {
+            assert!(
+                is_proxy_daemon_lock_held_at(&lock_path),
+                "lockfile must be reported as held while handle is open"
+            );
             let lock2 = try_acquire_proxy_daemon_lock_at(&lock_path);
             assert!(
                 lock2.is_none(),
@@ -8898,14 +8953,36 @@ auditor = "claude-3-7-sonnet-audit"
             );
         }
         drop(lock1);
+        assert!(
+            !is_proxy_daemon_lock_held_at(&lock_path),
+            "unlocked lockfile must not be reported as held after handle is dropped"
+        );
+
+        // Simulate a brief 5ms probe holding share_mode(0) while try_acquire_proxy_daemon_lock_at starts:
+        let probe_lock_path = lock_path.clone();
+        let probe_thread = thread::spawn(move || {
+            let mut opts = fs::OpenOptions::new();
+            opts.read(true).write(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                opts.share_mode(0);
+            }
+            if let Ok(h) = opts.open(&probe_lock_path) {
+                thread::sleep(Duration::from_millis(8));
+                drop(h);
+            }
+        });
+        thread::sleep(Duration::from_millis(2));
         let lock3 = try_acquire_proxy_daemon_lock_at(&lock_path);
+        probe_thread.join().unwrap();
         assert!(
             lock3.is_some(),
-            "--proxy-daemon lock acquisition must succeed immediately after previous handle is dropped"
+            "--proxy-daemon lock acquisition must ride through transient probe and succeed"
         );
         drop(lock3);
 
-        // 3. Verify in-process standby failover thread takes over within ~300ms when primary listener closes
+        // 3. Verify 5 concurrent standby failover threads contending on AddrInUse when primary listener closes
         let (cert_path, key_path) = default_cert_paths();
         let primary_acceptor = create_tls_acceptor(&cert_path, &key_path).unwrap();
         let primary_std = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -8962,22 +9039,55 @@ auditor = "claude-3-7-sonnet-audit"
             "primary TLS proxy listener must be healthy before standby registration"
         );
 
-        // Call spawn_embedded_reverse_proxy_with_port on the already-bound primary_addr:
-        // it must detect the healthy primary listener, return the same port, and spawn the standby failover thread.
-        let (standby_cert, standby_port) =
-            spawn_embedded_reverse_proxy_with_port(&primary_addr).unwrap();
-        assert_eq!(standby_port, primary_port);
+        // Register 5 concurrent standby failover threads against the already-bound primary_addr
+        // (simulating 5 concurrent app-server / CLI processes all in standby mode).
+        let mut standby_cert = cert_path.clone();
+        for _ in 0..5 {
+            let (c, standby_port) =
+                spawn_embedded_reverse_proxy_with_port(&primary_addr).unwrap();
+            assert_eq!(standby_port, primary_port);
+            standby_cert = c;
+        }
 
         // Now close the primary listener (simulating closing the ChatGPT Desktop app).
         let _ = shutdown_tx.send(());
         primary_handle.join().unwrap();
 
-        // Wait ~300ms for the 250ms standby failover thread to bind primary_addr and start serving.
+        // Wait ~320ms for one of the 5 standby failover threads to win TcpListener::bind(primary_addr) and start serving.
         thread::sleep(Duration::from_millis(320));
         assert!(
             verify_existing_tls_proxy_listener(&primary_addr, &standby_cert),
-            "standby failover thread must take over {} within ~300ms after primary listener exits",
+            "one of the 5 standby failover threads must take over {} within ~300ms after primary listener exits",
             primary_addr
+        );
+
+        // Verify /__codex_9router_proxy_healthz is also served with 200 OK by the standby listener
+        // and that the remaining 4 standby threads stay cleanly in their 250ms loop across another cycle.
+        thread::sleep(Duration::from_millis(300));
+        let cert_bytes = fs::read(&standby_cert).unwrap();
+        let healthz_url = format!("https://{}/__codex_9router_proxy_healthz", primary_addr);
+        let healthz_ok = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let cert = reqwest::Certificate::from_pem(&cert_bytes).unwrap();
+                let client = reqwest::Client::builder()
+                    .add_root_certificate(cert)
+                    .timeout(Duration::from_millis(800))
+                    .build()
+                    .unwrap();
+                let resp = client.get(&healthz_url).send().await.unwrap();
+                resp.status() == reqwest::StatusCode::OK
+                    && resp.text().await.unwrap().contains("codex-9router-proxy")
+            })
+        })
+        .join()
+        .unwrap();
+        assert!(
+            healthz_ok,
+            "/__codex_9router_proxy_healthz must return 200 OK on standby listener after multi-thread contention"
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);

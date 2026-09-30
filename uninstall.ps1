@@ -54,29 +54,37 @@ $exactCodexProcessNames = @(
     "codex-windows-sandbox-service",
     "codex-code-mode-host"
 )
-if (-not ([System.Management.Automation.PSTypeName]'CodexProcessNative').Type) {
+if (-not ("CodexProcessNative" -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
-public static class CodexProcessNative {
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-    public static extern bool QueryFullProcessImageNameW(IntPtr hProcess, int dwFlags, StringBuilder exeName, ref int lpdwSize);
-    [DllImport("kernel32.dll")]
+public class CodexProcessNative {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr hObject);
-    public static string GetLiveImagePath(int pid) {
-        IntPtr h = OpenProcess(0x1000, false, pid);
-        if (h == IntPtr.Zero) return null;
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize);
+
+    public static string GetProcessImagePath(int pid) {
+        if (pid <= 0) return null;
+        IntPtr hProc = OpenProcess(0x1000, false, pid);
+        if (hProc == IntPtr.Zero) return null;
         try {
-            int cap = 2048;
-            StringBuilder sb = new StringBuilder(cap);
-            if (QueryFullProcessImageNameW(h, 0, sb, ref cap)) return sb.ToString();
+            StringBuilder sb = new StringBuilder(2048);
+            uint size = (uint)sb.Capacity;
+            if (QueryFullProcessImageNameW(hProc, 0, sb, ref size) && size > 0) {
+                return sb.ToString();
+            }
             return null;
         } finally {
-            CloseHandle(h);
+            CloseHandle(hProc);
         }
+    }
+
+    public static string GetLiveImagePath(int pid) {
+        return GetProcessImagePath(pid);
     }
 }
 "@ -ErrorAction SilentlyContinue
@@ -84,8 +92,10 @@ public static class CodexProcessNative {
 function Get-LiveProcessImagePath([System.Diagnostics.Process]$proc) {
     if (-not $proc) { return $null }
     try {
-        $livePath = [CodexProcessNative]::GetLiveImagePath([int]$proc.Id)
-        if ($livePath) { return $livePath }
+        if ("CodexProcessNative" -as [type]) {
+            $livePath = [CodexProcessNative]::GetProcessImagePath([int]$proc.Id)
+            if ($livePath) { return $livePath }
+        }
     } catch {}
     try { return $proc.Path } catch { return $null }
 }
@@ -94,7 +104,8 @@ Get-NetTCPConnection -LocalPort $proxyPort -ErrorAction SilentlyContinue | ForEa
     $procId = $_.OwningProcess
     if ($procId -gt 0 -and -not $excludedPids.Contains([int]$procId)) {
         $ownerProc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-        if ($ownerProc -and (($exactCodexProcessNames -contains $ownerProc.Name) -or ($ownerProc.Name -like "codex*.old*"))) {
+        $ownerLivePath = Get-LiveProcessImagePath $ownerProc
+        if ($ownerProc -and (($exactCodexProcessNames -contains $ownerProc.Name) -or ($ownerProc.Name -like "codex*.old*") -or ($ownerLivePath -and $ownerLivePath -like "*.old.*"))) {
             Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
         }
     }

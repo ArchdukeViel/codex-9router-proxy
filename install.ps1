@@ -619,7 +619,7 @@ public class CodexProcessNative {
         IntPtr hProc = OpenProcess(0x1000, false, pid);
         if (hProc == IntPtr.Zero) return null;
         try {
-            StringBuilder sb = new StringBuilder(1024);
+            StringBuilder sb = new StringBuilder(2048);
             uint size = (uint)sb.Capacity;
             if (QueryFullProcessImageNameW(hProc, 0, sb, ref size) && size > 0) {
                 return sb.ToString();
@@ -628,6 +628,10 @@ public class CodexProcessNative {
         } finally {
             CloseHandle(hProc);
         }
+    }
+
+    public static string GetLiveImagePath(int pid) {
+        return GetProcessImagePath(pid);
     }
 }
 "@ -ErrorAction SilentlyContinue
@@ -652,7 +656,7 @@ function Test-ProxyDaemonRunning {
     $lockFile = Join-Path $CustomDir "proxy-daemon-$Port.lock"
     if (Test-Path $lockFile) {
         try {
-            $fs = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $fs = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
             $fs.Close()
             $fs.Dispose()
         } catch {
@@ -1341,7 +1345,7 @@ if (Test-Path `$binRoot) {
 
 # 6. Terminate any stale .old.* processes (via Win32 QueryFullProcessImageNameW), hidden-desktop ChatGPT.exe instances, and clean up leftover .old.* / lockfile files
 if (-not ('CodexProcessNative' -as [type])) {
-    `$csProc = 'using System; using System.Text; using System.Runtime.InteropServices; public class CodexProcessNative { [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId); [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr hObject); [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize); public static string GetProcessImagePath(int pid) { if (pid <= 0) return null; IntPtr hProc = OpenProcess(0x1000, false, pid); if (hProc == IntPtr.Zero) return null; try { StringBuilder sb = new StringBuilder(1024); uint size = (uint)sb.Capacity; if (QueryFullProcessImageNameW(hProc, 0, sb, ref size) && size > 0) return sb.ToString(); return null; } finally { CloseHandle(hProc); } } }'
+    `$csProc = 'using System; using System.Text; using System.Runtime.InteropServices; public class CodexProcessNative { [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId); [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr hObject); [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize); public static string GetProcessImagePath(int pid) { if (pid <= 0) return null; IntPtr hProc = OpenProcess(0x1000, false, pid); if (hProc == IntPtr.Zero) return null; try { StringBuilder sb = new StringBuilder(2048); uint size = (uint)sb.Capacity; if (QueryFullProcessImageNameW(hProc, 0, sb, ref size) && size > 0) return sb.ToString(); return null; } finally { CloseHandle(hProc); } } public static string GetLiveImagePath(int pid) { return GetProcessImagePath(pid); } }'
     Add-Type -TypeDefinition `$csProc
 }
 function Get-LiveProcessImagePath {
@@ -1370,12 +1374,16 @@ function Get-AncestorProcessIds {
     return `$ancestors
 }
 `$ancestorPids = Get-AncestorProcessIds
-Get-Process | Where-Object {
+`$staleOldProcs = @(Get-Process | Where-Object {
     (-not `$ancestorPids.Contains([int]`$_.Id)) -and (
         `$_.Name -like 'codex*.old*' -or
         (`$_.Name -like 'codex*' -and ((Get-LiveProcessImagePath `$_) -like '*.old.*'))
     )
-} | Stop-Process -Force
+})
+if (`$staleOldProcs.Count -gt 0) {
+    `$staleOldProcs | Stop-Process -Force
+    Start-Sleep -Milliseconds 500
+}
 Get-ChildItem "`$binRoot\*\*.old.*", "`$customDir\*.old.*" | Remove-Item -Force
 foreach (`$ed in `$extraDirs) {
     if (Test-Path `$ed) {
@@ -1476,7 +1484,7 @@ function Test-ProxyDaemonRunning {
     `$lockFile = Join-Path `$CustomDir "proxy-daemon-`$Port.lock"
     if (Test-Path `$lockFile) {
         try {
-            `$fs = [System.IO.File]::Open(`$lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            `$fs = [System.IO.File]::Open(`$lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
             `$fs.Close()
             `$fs.Dispose()
         } catch {
