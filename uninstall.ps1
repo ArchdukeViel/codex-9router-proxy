@@ -350,12 +350,13 @@ import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1], timeout=5.0)
 cur = conn.cursor()
 cur.execute("DROP TRIGGER IF EXISTS fix_subagent_provider_trigger;")
+cur.execute("DROP TRIGGER IF EXISTS fix_subagent_provider_update_trigger;")
 conn.commit()
 conn.close()
 '@
         foreach ($dbFile in $dbCandidates) {
             try {
-                & python -c $pyDropScript $dbFile 2>&1 | Out-Null
+                $pyDropScript | & python - $dbFile 2>&1 | Out-Null
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host "[OK] Removed SQLite subagent provider trigger from $dbFile" -ForegroundColor Green
                 }

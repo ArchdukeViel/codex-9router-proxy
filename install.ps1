@@ -535,6 +535,7 @@ try:
     conn = sqlite3.connect(db_path, timeout=5.0)
     cur = conn.cursor()
     cur.execute("DROP TRIGGER IF EXISTS fix_subagent_provider_trigger;")
+    cur.execute("DROP TRIGGER IF EXISTS fix_subagent_provider_update_trigger;")
     cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'")
     if cur.fetchone() is not None:
         cur.execute("PRAGMA table_info(threads);")
@@ -544,7 +545,19 @@ try:
             CREATE TRIGGER fix_subagent_provider_trigger
             AFTER INSERT ON threads
             FOR EACH ROW
-            WHEN (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
+            WHEN COALESCE(NEW.agent_role, '') NOT IN ('guardian_classifier', 'guardian_review')
+             AND (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.thread_source LIKE '%subagent%' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
+            BEGIN
+                UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
+            END;
+            """)
+            cur.execute(f"""
+            CREATE TRIGGER fix_subagent_provider_update_trigger
+            AFTER UPDATE OF model_provider, model ON threads
+            FOR EACH ROW
+            WHEN NEW.model_provider != {provider_lit}
+             AND COALESCE(NEW.agent_role, '') NOT IN ('guardian_classifier', 'guardian_review')
+             AND (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.thread_source LIKE '%subagent%' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
             BEGIN
                 UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
             END;
@@ -558,7 +571,7 @@ except Exception as e:
 '@
     foreach ($db in $dbCandidates) {
         if (Test-Path $db) {
-            & python -c $pyScript $db $Provider $DefaultModel $WorkerModel $ExplorerModel $ReviewerModel
+            $pyScript | & python - $db $Provider $DefaultModel $WorkerModel $ExplorerModel $ReviewerModel
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "[OK] Injected SQLite subagent trigger into $db." -ForegroundColor Green
             } else {
@@ -1094,6 +1107,57 @@ if ($storeResDir -and (Test-Path (Join-Path $storeResDir "codex.exe"))) {
     }
 }
 
+# Propagate freshest custom\codex.orig.exe and companion helpers to hooked CLI / IDE extension / daemon directories
+$customOrigStock = Join-Path $customDir "codex.orig.exe"
+if ((Test-Path $customOrigStock) -and ((Get-Item $customOrigStock).Length -gt 10000000)) {
+    $customOrigItem = Get-Item $customOrigStock
+    $hookTargetDirs = New-Object System.Collections.Generic.List[string]
+    foreach ($ehDir in $extraHookDirs) {
+        if (-not $hookTargetDirs.Contains($ehDir)) { $hookTargetDirs.Add($ehDir) }
+    }
+    if (Test-Path $daemonReleases) {
+        Get-ChildItem -Path $daemonReleases -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $dBin = Join-Path $_.FullName "bin"
+            if ((Test-Path $dBin) -and -not $hookTargetDirs.Contains($dBin)) { $hookTargetDirs.Add($dBin) }
+        }
+    }
+    foreach ($hDir in $hookTargetDirs) {
+        $cExe = Join-Path $hDir "codex.exe"
+        $cOrig = Join-Path $hDir "codex.orig.exe"
+        if ((Test-Path $cExe) -or (Test-Path $cOrig)) {
+            $needsOrigSync = (-not (Test-Path $cOrig))
+            if (-not $needsOrigSync) {
+                $oItem = Get-Item $cOrig
+                if (($oItem.Length -lt 10000000) -or ($oItem.LastWriteTimeUtc -lt $customOrigItem.LastWriteTimeUtc)) {
+                    $needsOrigSync = $true
+                }
+            }
+            if ($needsOrigSync -and ($customOrigItem.FullName -ne $cOrig)) {
+                if (Safe-CopyExecutable -Source $customOrigStock -Destination $cOrig) {
+                    Write-Host "[OK] Refreshed hooked engine $cOrig from $customOrigStock ($($customOrigItem.Length) bytes)." -ForegroundColor Green
+                }
+            }
+            foreach ($helper in $binHelpers) {
+                $hSrc = Join-Path $customDir $helper
+                $hDst = Join-Path $hDir $helper
+                if ((Test-Path $hSrc) -and ($hSrc -ne $hDst)) {
+                    $srcItem = Get-Item $hSrc
+                    $needsHelperSync = (-not (Test-Path $hDst))
+                    if (-not $needsHelperSync) {
+                        $dstItem = Get-Item $hDst
+                        if (($dstItem.Length -ne $srcItem.Length) -or ($dstItem.LastWriteTimeUtc -lt $srcItem.LastWriteTimeUtc)) {
+                            $needsHelperSync = $true
+                        }
+                    }
+                    if ($needsHelperSync) {
+                        Safe-CopyExecutable -Source $hSrc -Destination $hDst | Out-Null
+                    }
+                }
+            }
+        }
+    }
+}
+
 # Synchronize ~/.codex/models_cache.json in place with active parent model subagent metadata
 $modelsCache = Join-Path $codexDir "models_cache.json"
 if (Test-Path $modelsCache) {
@@ -1306,6 +1370,38 @@ if (`$resDir -and (Test-Path (Join-Path `$resDir 'codex.exe'))) {
     }
 }
 
+# 4b. Propagate freshest custom\codex.orig.exe and companion helpers to hooked CLI / IDE extension / daemon directories
+`$customOrigStock = Join-Path `$customDir 'codex.orig.exe'
+if ((Test-Path `$customOrigStock) -and ((Get-Item `$customOrigStock).Length -gt 10000000)) {
+    `$customOrigItem = Get-Item `$customOrigStock
+    `$hookTargetDirs = New-Object System.Collections.Generic.List[string]
+    foreach (`$ed in `$extraDirs) {
+        if (-not `$hookTargetDirs.Contains(`$ed)) { `$hookTargetDirs.Add(`$ed) }
+    }
+    if (Test-Path `$daemonReleases) {
+        Get-ChildItem -Path `$daemonReleases -Directory | ForEach-Object {
+            `$dBin = Join-Path `$_.FullName 'bin'
+            if ((Test-Path `$dBin) -and -not `$hookTargetDirs.Contains(`$dBin)) { `$hookTargetDirs.Add(`$dBin) }
+        }
+    }
+    foreach (`$hDir in `$hookTargetDirs) {
+        `$cExe = Join-Path `$hDir 'codex.exe'
+        `$cOrig = Join-Path `$hDir 'codex.orig.exe'
+        if ((Test-Path `$cExe) -or (Test-Path `$cOrig)) {
+            if (((-not (Test-Path `$cOrig)) -or ((Get-Item `$cOrig).Length -lt 10000000) -or ((Get-Item `$cOrig).LastWriteTimeUtc -lt `$customOrigItem.LastWriteTimeUtc)) -and (`$customOrigItem.FullName -ne `$cOrig)) {
+                Sync-Executable -Source `$customOrigStock -Destination `$cOrig | Out-Null
+            }
+            foreach (`$h in `$binHelpers) {
+                `$hs = Join-Path `$customDir `$h
+                `$hd = Join-Path `$hDir `$h
+                if ((Test-Path `$hs) -and (`$hs -ne `$hd) -and ((-not (Test-Path `$hd)) -or ((Get-Item `$hd).Length -ne (Get-Item `$hs).Length) -or ((Get-Item `$hd).LastWriteTimeUtc -lt (Get-Item `$hs).LastWriteTimeUtc))) {
+                    Sync-Executable -Source `$hs -Destination `$hd | Out-Null
+                }
+            }
+        }
+    }
+}
+
 # 5. Keep bin\<hash>\codex.exe as the unmodified stock binary so Electron never deletes bin\<hash>
 if (Test-Path `$binRoot) {
     Get-ChildItem -Path `$binRoot -Directory | ForEach-Object {
@@ -1420,7 +1516,7 @@ if (-not (Get-Process -Name 'ChatGPT*')) {
     `$lockCandidates | Where-Object { Test-Path `$_ } | Remove-Item -Force
 }
 
-# 7. Ensure SQLite trigger is installed across all state_*.sqlite databases in `$codexDir` and `$codexDir\sqlite`
+# 7. Ensure SQLite triggers are installed across all state_*.sqlite databases in `$codexDir` and `$codexDir\sqlite`
 `$dbPaths = New-Object System.Collections.Generic.List[string]
 foreach (`$sDir in @(`$codexDir, (Join-Path `$codexDir 'sqlite'))) {
     if (Test-Path `$sDir) {
@@ -1459,24 +1555,36 @@ for db_path in db_paths:
         if not required_cols.issubset(existing_cols):
             conn.close()
             continue
-        cur.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='fix_subagent_provider_trigger'")
-        if cur.fetchone() is None:
-            cur.execute(f"""
-            CREATE TRIGGER fix_subagent_provider_trigger
-            AFTER INSERT ON threads
-            FOR EACH ROW
-            WHEN (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
-            BEGIN
-                UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
-            END;
-            """)
-            conn.commit()
+        cur.execute("DROP TRIGGER IF EXISTS fix_subagent_provider_trigger;")
+        cur.execute("DROP TRIGGER IF EXISTS fix_subagent_provider_update_trigger;")
+        cur.execute(f"""
+        CREATE TRIGGER fix_subagent_provider_trigger
+        AFTER INSERT ON threads
+        FOR EACH ROW
+        WHEN COALESCE(NEW.agent_role, '') NOT IN ('guardian_classifier', 'guardian_review')
+         AND (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.thread_source LIKE '%subagent%' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
+        BEGIN
+            UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
+        END;
+        """)
+        cur.execute(f"""
+        CREATE TRIGGER fix_subagent_provider_update_trigger
+        AFTER UPDATE OF model_provider, model ON threads
+        FOR EACH ROW
+        WHEN NEW.model_provider != {provider_lit}
+         AND COALESCE(NEW.agent_role, '') NOT IN ('guardian_classifier', 'guardian_review')
+         AND (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.thread_source LIKE '%subagent%' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
+        BEGIN
+            UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
+        END;
+        """)
+        conn.commit()
         conn.close()
     except Exception:
         pass
 '@
-    `$pyArgs = @('-c', `$pyTrig, '$($Provider -replace "'","''")', '$($DefaultModel -replace "'","''")', '$($WorkerModel -replace "'","''")', '$($ExplorerModel -replace "'","''")', '$($ReviewerModel -replace "'","''")') + @(`$dbPaths)
-    & python @pyArgs 2>&1 | Out-Null
+    `$pyArgs = @('-', '$($Provider -replace "'","''")', '$($DefaultModel -replace "'","''")', '$($WorkerModel -replace "'","''")', '$($ExplorerModel -replace "'","''")', '$($ReviewerModel -replace "'","''")') + @(`$dbPaths)
+    `$pyTrig | & python @pyArgs 2>&1 | Out-Null
 }
 
 function Test-ProxyDaemonRunning {

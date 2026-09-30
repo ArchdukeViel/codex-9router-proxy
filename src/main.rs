@@ -24,22 +24,214 @@ use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 
-/// Check if a given role name indicates a subagent.
-/// Strictly excludes OpenAI message roles (`developer`, `user`, `assistant`, `system`, `tool`, `function`)
-/// and root/main thread names (`main`, `primary`, `root`, `/root`).
-pub fn is_subagent_role_name(r: &str) -> bool {
-    let lower = r.trim().to_lowercase();
+/// Check if an `x-openai-subagent` or role value is Codex's internal Guardian safety classifier
+/// (`"guardian_classifier"` or `"guardian_review"`), which must stay on the parent ChatGPT account.
+pub fn is_guardian_internal_subagent(val: &str) -> bool {
+    let lower = val.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return false;
     }
-    match lower.as_str() {
-        "user" | "assistant" | "system" | "developer" | "tool" | "function" | "main"
-        | "primary" | "root" | "/root" => false,
-        "worker" | "explorer" | "default" | "subagent" | "sub-agent" | "sub_agent" | "reviewer"
-        | "collab_spawn" | "review" => true,
-        _ => true,
-    }
+    let segment = lower
+        .strip_prefix("/root/")
+        .or_else(|| lower.strip_prefix("root/"))
+        .or_else(|| lower.strip_prefix('/'))
+        .unwrap_or(lower.as_str())
+        .split('/')
+        .next_back()
+        .unwrap_or("")
+        .trim();
+    matches!(lower.as_str(), "guardian_classifier" | "guardian_review")
+        || matches!(segment, "guardian_classifier" | "guardian_review")
 }
+
+/// Check if a lowercase role token matches one of the known built-in subagent role names.
+pub fn is_builtin_subagent_role_token(token: &str) -> bool {
+    matches!(
+        token,
+        "worker"
+            | "implement"
+            | "implementer"
+            | "explorer"
+            | "explore"
+            | "reviewer"
+            | "review"
+            | "default"
+            | "subagent"
+            | "sub-agent"
+            | "sub_agent"
+            | "collab_spawn"
+            | "thread_spawn"
+            | "researcher"
+            | "research"
+            | "planner"
+            | "plan"
+            | "tester"
+            | "test"
+            | "debugger"
+            | "debug"
+            | "fixer"
+            | "fix"
+            | "coder"
+            | "architect"
+            | "auditor"
+            | "audit"
+            | "verifier"
+            | "verify"
+            | "compact"
+            | "memory_consolidation"
+    )
+}
+
+/// Discover custom subagent role names configured in `<codex_home>/agents/*.toml` or `[subagent_models]` in `<codex_home>/config.toml`.
+pub fn discover_configured_custom_roles_in_dir(codex_home: Option<&Path>) -> Vec<String> {
+    let Some(dir) = codex_home else {
+        return Vec::new();
+    };
+    let mut roles: Vec<String> = Vec::new();
+    let mut push_role = |r: &str| {
+        let lower = r.trim().to_lowercase();
+        if lower.is_empty()
+            || is_guardian_internal_subagent(&lower)
+            || matches!(
+                lower.as_str(),
+                "user"
+                    | "assistant"
+                    | "system"
+                    | "developer"
+                    | "tool"
+                    | "function"
+                    | "main"
+                    | "primary"
+                    | "root"
+                    | "/root"
+                    | "parent"
+            )
+        {
+            return;
+        }
+        if !roles.iter().any(|existing| existing == &lower) {
+            roles.push(lower);
+        }
+    };
+
+    let agents_dir = dir.join("agents");
+    if let Ok(entries) = fs::read_dir(&agents_dir) {
+        let mut toml_files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+            })
+            .collect();
+        toml_files.sort();
+        for path in toml_files {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                push_role(stem);
+            }
+        }
+    }
+
+    let config_path = dir.join("config.toml");
+    if let Ok(content) = fs::read_to_string(&config_path) {
+        let mut in_subagent_models = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                let section = trimmed.trim_matches(|c| c == '[' || c == ']').trim();
+                in_subagent_models = section.eq_ignore_ascii_case("subagent_models");
+                continue;
+            }
+            if in_subagent_models {
+                if let Some((k, _v)) = parse_toml_key_value(trimmed) {
+                    push_role(&k);
+                }
+            }
+        }
+    }
+
+    roles
+}
+
+/// Discover custom subagent role names configured in `~/.codex/agents/*.toml` or `[subagent_models]` in `~/.codex/config.toml`.
+pub fn discover_configured_custom_roles() -> Vec<String> {
+    discover_configured_custom_roles_in_dir(get_codex_home_dir().as_deref())
+}
+
+/// Check if a given role name indicates a subagent inside an optional `<codex_home>`.
+/// Strictly excludes OpenAI message roles (`developer`, `user`, `assistant`, `system`, `tool`, `function`),
+/// root/main thread names (`main`, `primary`, `root`, `/root`, `parent`), Guardian internal classifiers,
+/// and arbitrary unknown strings not present in built-in roles or configured custom roles.
+pub fn is_subagent_role_name_in_dir(r: &str, codex_home: Option<&Path>) -> bool {
+    let lower = r.trim().to_lowercase();
+    if lower.is_empty() || is_guardian_internal_subagent(&lower) {
+        return false;
+    }
+    if matches!(
+        lower.as_str(),
+        "user"
+            | "assistant"
+            | "system"
+            | "developer"
+            | "tool"
+            | "function"
+            | "main"
+            | "primary"
+            | "root"
+            | "/root"
+            | "parent"
+    ) {
+        return false;
+    }
+    let segment = lower
+        .strip_prefix("/root/")
+        .or_else(|| lower.strip_prefix("root/"))
+        .or_else(|| lower.strip_prefix('/'))
+        .unwrap_or(lower.as_str())
+        .split('/')
+        .next_back()
+        .unwrap_or("")
+        .trim();
+    if segment.is_empty()
+        || matches!(
+            segment,
+            "user"
+                | "assistant"
+                | "system"
+                | "developer"
+                | "tool"
+                | "function"
+                | "main"
+                | "primary"
+                | "root"
+                | "parent"
+        )
+    {
+        return false;
+    }
+    let base_segment = segment
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .trim_end_matches(['_', '-']);
+    if is_builtin_subagent_role_token(segment)
+        || (!base_segment.is_empty() && is_builtin_subagent_role_token(base_segment))
+    {
+        return true;
+    }
+    let custom_roles = discover_configured_custom_roles_in_dir(codex_home);
+    custom_roles
+        .iter()
+        .any(|c| c == segment || (!base_segment.is_empty() && c == base_segment))
+}
+
+/// Check if a given role name indicates a subagent.
+pub fn is_subagent_role_name(r: &str) -> bool {
+    is_subagent_role_name_in_dir(r, get_codex_home_dir().as_deref())
+}
+
 
 /// Locate the active Codex home directory (~/.codex).
 pub fn get_codex_home_dir() -> Option<PathBuf> {
@@ -599,8 +791,14 @@ pub fn builtin_role_model(_role: &str) -> &'static str {
 /// 4. Built-in default: `9router-subagent`
 pub fn map_role_to_model(role: Option<&str>) -> String {
     let role_str = role.unwrap_or("default");
-    let role_lower =
-        normalize_subagent_role_token(role_str).unwrap_or_else(|| role_str.trim().to_lowercase());
+    let role_lower = normalize_subagent_role_token(role_str).unwrap_or_else(|| {
+        let candidate = role_str.trim().to_lowercase();
+        if is_subagent_role_name(&candidate) {
+            candidate
+        } else {
+            "default".to_string()
+        }
+    });
 
     let env_role = format!("CODEX_{}_MODEL", role_lower.to_uppercase());
     let proc_role_val = env::var(&env_role)
@@ -709,18 +907,30 @@ pub fn decode_base64_utf8(input: &str) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-/// Normalize a raw subagent role or `agent_name` path (e.g. `"/root/explorer"`, `"review"`, `"collab_spawn"`)
-/// into a canonical role name (`"worker"`, `"explorer"`, `"reviewer"`, `"default"`, or custom role).
-pub fn normalize_subagent_role_token(raw: &str) -> Option<String> {
+/// Infer a canonical subagent role name (`"worker"`, `"explorer"`, `"reviewer"`, `"default"`, or a configured custom role)
+/// from a role token or agent path without accepting arbitrary Multi-Agents V2 nicknames like `"Gauss"`.
+pub fn infer_subagent_role_from_name_in_dir(
+    raw: &str,
+    codex_home: Option<&Path>,
+) -> Option<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || is_guardian_internal_subagent(trimmed) {
         return None;
     }
     let lower = trimmed.to_lowercase();
     if matches!(
         lower.as_str(),
-        "user" | "assistant" | "system" | "developer" | "tool" | "function" | "main"
-            | "primary" | "root" | "/root"
+        "user"
+            | "assistant"
+            | "system"
+            | "developer"
+            | "tool"
+            | "function"
+            | "main"
+            | "primary"
+            | "root"
+            | "/root"
+            | "parent"
     ) {
         return None;
     }
@@ -736,36 +946,138 @@ pub fn normalize_subagent_role_token(raw: &str) -> Option<String> {
     if segment.is_empty()
         || matches!(
             segment,
-            "user" | "assistant" | "system" | "developer" | "tool" | "function" | "main"
-                | "primary" | "root"
+            "user"
+                | "assistant"
+                | "system"
+                | "developer"
+                | "tool"
+                | "function"
+                | "main"
+                | "primary"
+                | "root"
+                | "parent"
         )
     {
         return None;
     }
+    let custom_roles = discover_configured_custom_roles_in_dir(codex_home);
+    if custom_roles.iter().any(|c| c == segment)
+        && !matches!(
+            segment,
+            "review"
+                | "reviewer"
+                | "worker"
+                | "implement"
+                | "implementer"
+                | "explorer"
+                | "explore"
+                | "default"
+        )
+    {
+        return Some(segment.to_string());
+    }
     let base_segment = segment
         .trim_end_matches(|c: char| c.is_ascii_digit())
         .trim_end_matches(['_', '-']);
-    let effective = if matches!(
-        base_segment,
-        "review" | "reviewer" | "worker" | "implement" | "explorer" | "explore" | "default"
-    ) {
+    let effective = if !base_segment.is_empty()
+        && (is_builtin_subagent_role_token(base_segment)
+            || custom_roles.iter().any(|c| c == base_segment))
+    {
         base_segment
     } else {
         segment
     };
     match effective {
         "review" | "reviewer" => Some("reviewer".to_string()),
-        "worker" | "implement" => Some("worker".to_string()),
+        "worker" | "implement" | "implementer" => Some("worker".to_string()),
         "explorer" | "explore" => Some("explorer".to_string()),
-        "collab_spawn" | "thread_spawn" | "subagent" | "sub-agent" | "sub_agent" | "compact"
-        | "memory_consolidation" | "default" => Some("default".to_string()),
-        other if is_subagent_role_name(other) => Some(other.to_string()),
+        "collab_spawn"
+        | "thread_spawn"
+        | "subagent"
+        | "sub-agent"
+        | "sub_agent"
+        | "compact"
+        | "memory_consolidation"
+        | "default" => Some("default".to_string()),
+        other
+            if is_builtin_subagent_role_token(other)
+                || custom_roles.iter().any(|c| c == other) =>
+        {
+            Some(other.to_string())
+        }
         _ => None,
     }
 }
 
+/// Infer a canonical subagent role name using the active Codex home directory.
+pub fn infer_subagent_role_from_name(raw: &str) -> Option<String> {
+    infer_subagent_role_from_name_in_dir(raw, get_codex_home_dir().as_deref())
+}
+
+/// Normalize a raw subagent role or `agent_name` path (e.g. `"/root/explorer"`, `"/root/Gauss"`, `"review"`, `"collab_spawn"`)
+/// into a canonical role name (`"worker"`, `"explorer"`, `"reviewer"`, `"default"`, or custom role).
+pub fn normalize_subagent_role_token(raw: &str) -> Option<String> {
+    if let Some(role) = infer_subagent_role_from_name(raw) {
+        return Some(role);
+    }
+    let lower = raw.trim().to_lowercase();
+    if is_guardian_internal_subagent(&lower) {
+        return None;
+    }
+    // Multi-Agents V2 subagent path carrying a custom nickname (e.g. "/root/Gauss" -> "default")
+    if let Some(rest) = lower
+        .strip_prefix("/root/")
+        .or_else(|| lower.strip_prefix("root/"))
+    {
+        let leaf = rest.split('/').next_back().unwrap_or("").trim();
+        if !leaf.is_empty()
+            && !matches!(
+                leaf,
+                "root"
+                    | "main"
+                    | "primary"
+                    | "parent"
+                    | "user"
+                    | "assistant"
+                    | "system"
+                    | "developer"
+                    | "tool"
+                    | "function"
+            )
+        {
+            return Some("default".to_string());
+        }
+    }
+    None
+}
+
 fn extract_role_from_turn_metadata_value(parsed: &Value) -> Option<String> {
     let obj = parsed.as_object()?;
+    for key in [
+        "x-openai-subagent",
+        "subagent_kind",
+        "subagentKind",
+        "agent_role",
+        "agentRole",
+        "agent_type",
+        "agentType",
+        "subagent_role",
+        "subagentRole",
+        "agent_name",
+        "agentName",
+        "agent_path",
+        "agentPath",
+    ] {
+        if obj
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(is_guardian_internal_subagent)
+        {
+            return None;
+        }
+    }
+
+    let mut fallback_default = false;
     for key in [
         "agent_role",
         "agentRole",
@@ -775,10 +1087,15 @@ fn extract_role_from_turn_metadata_value(parsed: &Value) -> Option<String> {
         "subagentRole",
         "agent_name",
         "agentName",
+        "agent_path",
+        "agentPath",
     ] {
         if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
             if let Some(norm) = normalize_subagent_role_token(s) {
-                return Some(norm);
+                if norm != "default" {
+                    return Some(norm);
+                }
+                fallback_default = true;
             }
         }
     }
@@ -788,10 +1105,17 @@ fn extract_role_from_turn_metadata_value(parsed: &Value) -> Option<String> {
         .and_then(|v| v.as_str())
     {
         if let Some(norm) = normalize_subagent_role_token(s) {
-            return Some(norm);
+            if norm != "default" {
+                return Some(norm);
+            }
+            fallback_default = true;
         }
     }
-    None
+    if fallback_default {
+        Some("default".to_string())
+    } else {
+        None
+    }
 }
 
 fn extract_role_from_turn_metadata_str(raw: &str) -> Option<String> {
@@ -813,9 +1137,27 @@ fn extract_role_from_turn_metadata_str(raw: &str) -> Option<String> {
     None
 }
 
-/// Extract the most specific subagent role from HTTP headers (`x-codex-turn-metadata` and `x-openai-subagent`).
+/// Extract the most specific subagent role from HTTP headers (`x-openai-subagent`, `x-codex-subagent`,
+/// `x-subagent-role`, and `x-codex-turn-metadata`).
+/// Explicit role headers (`x-openai-subagent: explorer`) take precedence over V2 nicknames (`agent_name: /root/Gauss`)
+/// in `x-codex-turn-metadata`.
 pub fn extract_role_from_http_headers(headers: &HeaderMap) -> Option<String> {
     let mut fallback_default = false;
+    for key in ["x-openai-subagent", "x-codex-subagent", "x-subagent-role"] {
+        if let Some(sub_hdr) = headers.get(key).and_then(|v| v.to_str().ok()) {
+            if is_guardian_internal_subagent(sub_hdr) {
+                return None;
+            }
+            if let Some(role) = normalize_subagent_role_token(sub_hdr) {
+                if role != "default" {
+                    return Some(role);
+                }
+                fallback_default = true;
+            } else if !sub_hdr.trim().is_empty() {
+                fallback_default = true;
+            }
+        }
+    }
     for val in headers.get_all("x-codex-turn-metadata") {
         if let Ok(turn_meta) = val.to_str() {
             if let Some(role) = extract_role_from_turn_metadata_str(turn_meta) {
@@ -824,14 +1166,6 @@ pub fn extract_role_from_http_headers(headers: &HeaderMap) -> Option<String> {
                 }
                 fallback_default = true;
             }
-        }
-    }
-    if let Some(sub_hdr) = headers.get("x-openai-subagent").and_then(|v| v.to_str().ok()) {
-        if let Some(role) = normalize_subagent_role_token(sub_hdr) {
-            if role != "default" {
-                return Some(role);
-            }
-            fallback_default = true;
         }
     }
     if fallback_default {
@@ -845,6 +1179,25 @@ fn is_subagent_turn_metadata_value(parsed: &Value) -> bool {
     let Some(obj) = parsed.as_object() else {
         return false;
     };
+    for key in [
+        "x-openai-subagent",
+        "subagent_kind",
+        "subagentKind",
+        "agent_role",
+        "agentRole",
+        "agent_name",
+        "agentName",
+        "agent_path",
+        "agentPath",
+    ] {
+        if obj
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(is_guardian_internal_subagent)
+        {
+            return false;
+        }
+    }
     if let Some(src) = obj.get("thread_source").or_else(|| obj.get("threadSource")) {
         if src
             .as_str()
@@ -856,7 +1209,9 @@ fn is_subagent_turn_metadata_value(parsed: &Value) -> bool {
     }
     if let Some(kind) = obj.get("subagent_kind").or_else(|| obj.get("subagentKind")) {
         match kind {
-            Value::String(s) if !s.trim().is_empty() => return true,
+            Value::String(s) if !s.trim().is_empty() && !is_guardian_internal_subagent(s) => {
+                return true
+            }
             Value::Object(m) if !m.is_empty() => return true,
             _ => {}
         }
@@ -866,9 +1221,6 @@ fn is_subagent_turn_metadata_value(parsed: &Value) -> bool {
         "parentThreadId",
         "parent_turn_id",
         "parentTurnId",
-        "forked_from_thread_id",
-        "forkedFromThreadId",
-        "x-openai-subagent",
         "x-codex-parent-thread-id",
     ] {
         if obj
@@ -876,6 +1228,11 @@ fn is_subagent_turn_metadata_value(parsed: &Value) -> bool {
             .and_then(|v| v.as_str())
             .is_some_and(|s| !s.trim().is_empty())
         {
+            return true;
+        }
+    }
+    if let Some(sub) = obj.get("x-openai-subagent").and_then(|v| v.as_str()) {
+        if !sub.trim().is_empty() && !is_guardian_internal_subagent(sub) {
             return true;
         }
     }
@@ -899,6 +1256,9 @@ fn is_subagent_turn_metadata_str(turn_meta: &str) -> bool {
         }
     }
     let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("guardian_classifier") || lower.contains("guardian_review") {
+        return false;
+    }
     lower.contains("\"thread_source\":\"subagent\"")
         || lower.contains("\"thread_source\": \"subagent\"")
         || lower.contains("\"thread_source\":\"thread_spawn\"")
@@ -911,18 +1271,29 @@ fn is_subagent_turn_metadata_str(turn_meta: &str) -> bool {
         || lower.contains("\"parent_thread_id\": \"")
         || lower.contains("\"parent_turn_id\":\"")
         || lower.contains("\"parent_turn_id\": \"")
-        || lower.contains("\"forked_from_thread_id\":\"")
-        || lower.contains("\"forked_from_thread_id\": \"")
 }
 
 /// Check if HTTP headers indicate a spawned subagent request (`x-openai-subagent`, `x-codex-parent-thread-id`,
 /// or `x-codex-turn-metadata` carrying subagent metadata in raw JSON or base64).
+/// Explicitly excludes internal Guardian safety classifier calls (`guardian_classifier` / `guardian_review`).
 pub fn is_subagent_http_headers(headers: &HeaderMap) -> bool {
-    for key in ["x-openai-subagent", "x-codex-parent-thread-id"] {
+    for key in ["x-openai-subagent", "x-codex-subagent", "x-subagent-role"] {
         if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
-            if !val.trim().is_empty() {
+            let trimmed = val.trim();
+            if is_guardian_internal_subagent(trimmed) {
+                return false;
+            }
+            if !trimmed.is_empty() {
                 return true;
             }
+        }
+    }
+    if let Some(val) = headers
+        .get("x-codex-parent-thread-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        if !val.trim().is_empty() {
+            return true;
         }
     }
     for val in headers.get_all("x-codex-turn-metadata") {
@@ -936,17 +1307,30 @@ pub fn is_subagent_http_headers(headers: &HeaderMap) -> bool {
 }
 
 /// Check if a JSON value contains markers indicating a subagent thread source or subagent `client_metadata`.
+/// User-initiated `thread/fork` conversations (carrying only `forked_from_thread_id` without subagent markers)
+/// and internal Guardian safety classifier calls are strictly excluded.
 pub fn contains_subagent_source(v: &Value) -> bool {
     match v {
         Value::String(s) => {
+            if is_guardian_internal_subagent(s) {
+                return false;
+            }
             let lower = s.to_lowercase();
             lower.contains("subagent")
                 || lower.contains("sub_agent")
                 || lower.contains("sub-agent")
                 || lower.contains("thread_spawn")
                 || lower.contains("collab_spawn")
+                || lower.contains("spawn_agent")
         }
         Value::Object(map) => {
+            if map
+                .get("x-openai-subagent")
+                .and_then(|x| x.as_str())
+                .is_some_and(is_guardian_internal_subagent)
+            {
+                return false;
+            }
             if map.contains_key("subAgent")
                 || map.contains_key("subagent")
                 || map.contains_key("sub_agent")
@@ -955,15 +1339,17 @@ pub fn contains_subagent_source(v: &Value) -> bool {
             {
                 return true;
             }
+            if let Some(s) = map.get("x-openai-subagent").and_then(|x| x.as_str()) {
+                if !s.trim().is_empty() && !is_guardian_internal_subagent(s) {
+                    return true;
+                }
+            }
             for k in [
-                "x-openai-subagent",
                 "x-codex-parent-thread-id",
                 "parent_turn_id",
                 "parentTurnId",
                 "parent_thread_id",
                 "parentThreadId",
-                "forked_from_thread_id",
-                "forkedFromThreadId",
             ] {
                 if let Some(s) = map.get(k).and_then(|x| x.as_str()) {
                     if !s.trim().is_empty() {
@@ -987,6 +1373,13 @@ pub fn contains_subagent_source(v: &Value) -> bool {
                     return true;
                 }
             }
+            for path_key in ["agent_path", "agentPath", "agent_name", "agentName"] {
+                if let Some(p) = map.get(path_key).and_then(|x| x.as_str()) {
+                    if normalize_subagent_role_token(p).is_some() {
+                        return true;
+                    }
+                }
+            }
             if let Some(src) = map.get("threadSource").or_else(|| map.get("thread_source")) {
                 if contains_subagent_source(src) {
                     return true;
@@ -1002,6 +1395,7 @@ pub fn contains_subagent_source(v: &Value) -> bool {
         _ => false,
     }
 }
+
 
 /// Retrieve the configured target model provider for an optional subagent role inside an explicit `<codex_home>` (defaults to "9router").
 pub fn get_target_model_provider_for_role_in_dir(
@@ -1637,7 +2031,8 @@ pub fn sync_custom_codex_binaries_from_candidates_with_min_size(
 
 /// Auto-hook standalone CLI (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`) and IDE extensions
 /// (`openai.chatgpt-*\bin\windows-*\codex.exe`) by backing up stock `> min_stock_bytes` binaries to
-/// `codex.orig.exe`, replacing `codex.exe` with `proxy_shim`, and cleaning up unlocked `.old.*` files.
+/// `codex.orig.exe`, refreshing stale `codex.orig.exe` (and companion helpers) when `proxy_shim`'s parent
+/// directory has a newer stock `.orig.exe`, replacing `codex.exe` with `proxy_shim`, and cleaning up unlocked `.old.*` files.
 pub fn sync_hooked_surface_binaries_with_min_size(
     proxy_shim: &Path,
     hook_dirs: &[PathBuf],
@@ -1650,6 +2045,23 @@ pub fn sync_hooked_surface_binaries_with_min_size(
         return 0;
     }
     let shim_len = shim_meta.len();
+    let best_custom_orig = proxy_shim
+        .parent()
+        .and_then(|p| {
+            pick_best_orig_candidate_across_dirs_with_min_size(
+                &[p.to_path_buf()],
+                min_stock_bytes,
+            )
+        })
+        .and_then(|p| {
+            let meta = p.metadata().ok()?;
+            if meta.is_file() && meta.len() > min_stock_bytes {
+                Some((p, meta.len(), meta.modified().ok()))
+            } else {
+                None
+            }
+        });
+
     let mut hooked = 0;
 
     for hdir in hook_dirs {
@@ -1673,6 +2085,7 @@ pub fn sync_hooked_surface_binaries_with_min_size(
         if !exe_meta.is_file() {
             continue;
         }
+        let mut dir_updated = false;
         if exe_meta.len() > min_stock_bytes {
             let needs_backup = match codex_orig.metadata() {
                 Err(_) => true,
@@ -1684,15 +2097,70 @@ pub fn sync_hooked_surface_binaries_with_min_size(
             if (!needs_backup || safe_copy_or_rename_locked(&codex_exe, &codex_orig).is_ok())
                 && safe_copy_or_rename_locked(proxy_shim, &codex_exe).is_ok()
             {
-                hooked += 1;
+                dir_updated = true;
             }
-        } else if codex_orig
-            .metadata()
-            .is_ok_and(|m| m.is_file() && m.len() > min_stock_bytes)
-            && (exe_meta.len() != shim_len
-                || exe_meta.modified().ok() != shim_meta.modified().ok())
-            && safe_copy_or_rename_locked(proxy_shim, &codex_exe).is_ok()
-        {
+            if let Some((ref best_orig_path, best_len, best_mod)) = best_custom_orig {
+                if let Ok(orig_meta) = codex_orig.metadata() {
+                    let orig_mod = orig_meta.modified().ok();
+                    if best_mod.is_some() && orig_mod < best_mod && orig_meta.len() != best_len {
+                        let _ = safe_copy_or_rename_locked(best_orig_path, &codex_orig);
+                    }
+                }
+            }
+        } else {
+            if let Some((ref best_orig_path, best_len, best_mod)) = best_custom_orig {
+                let orig_needs_refresh = match codex_orig.metadata() {
+                    Err(_) => true,
+                    Ok(orig_meta) => {
+                        let orig_len = orig_meta.len();
+                        let orig_mod = orig_meta.modified().ok();
+                        orig_len <= min_stock_bytes
+                            || (best_mod.is_some() && orig_mod < best_mod)
+                            || (orig_len != best_len && orig_mod <= best_mod)
+                    }
+                };
+                if orig_needs_refresh
+                    && safe_copy_or_rename_locked(best_orig_path, &codex_orig).is_ok()
+                {
+                    dir_updated = true;
+                }
+            }
+
+            if codex_orig
+                .metadata()
+                .is_ok_and(|m| m.is_file() && m.len() > min_stock_bytes)
+                && (exe_meta.len() != shim_len
+                    || exe_meta.modified().ok() != shim_meta.modified().ok())
+                && safe_copy_or_rename_locked(proxy_shim, &codex_exe).is_ok()
+            {
+                dir_updated = true;
+            }
+        }
+
+        if let Some(custom_dir) = proxy_shim.parent() {
+            for helper in [
+                "rg.exe",
+                "codex-command-runner.exe",
+                "codex-code-mode-host.exe",
+                "codex-windows-sandbox-setup.exe",
+                "codex-windows-sandbox-service.exe",
+            ] {
+                let src_h = custom_dir.join(helper);
+                let dst_h = hdir.join(helper);
+                if let (Ok(src_m), Ok(dst_m)) = (src_h.metadata(), dst_h.metadata()) {
+                    if src_m.is_file()
+                        && dst_m.is_file()
+                        && src_m.len() > 0
+                        && src_m.modified().ok() > dst_m.modified().ok()
+                        && src_m.len() != dst_m.len()
+                    {
+                        let _ = safe_copy_or_rename_locked(&src_h, &dst_h);
+                    }
+                }
+            }
+        }
+
+        if dir_updated {
             hooked += 1;
         }
     }
@@ -1746,45 +2214,60 @@ pub fn sync_custom_codex_binaries() -> usize {
     count
 }
 
-/// Select the best official `.orig.exe` candidate inside `dir`, preferring files > 10 MB
-/// (stock Codex binary) and sorting by most recent modification time.
-pub fn pick_best_orig_candidate(dir: &Path) -> Option<PathBuf> {
+/// Select the best official `.orig.exe` candidate across `dirs`, preferring files `> min_stock_bytes`
+/// (stock Codex binary) and sorting by most recent `(modified, len)`.
+pub fn pick_best_orig_candidate_across_dirs_with_min_size(
+    dirs: &[PathBuf],
+    min_stock_bytes: u64,
+) -> Option<PathBuf> {
     let cur_canon = env::current_exe().ok().and_then(|p| p.canonicalize().ok());
     let mut valid_candidates: Vec<(PathBuf, u64, Option<std::time::SystemTime>)> = Vec::new();
 
-    for candidate_name in ["codex-9router-subagents.orig.exe", "codex.orig.exe"] {
-        let orig = dir.join(candidate_name);
-        if !orig.is_file() {
-            continue;
-        }
-        if let (Some(ref c1), Ok(c2)) = (&cur_canon, orig.canonicalize()) {
-            if c1 == &c2 {
+    for dir in dirs {
+        for candidate_name in ["codex-9router-subagents.orig.exe", "codex.orig.exe"] {
+            let orig = dir.join(candidate_name);
+            if !orig.is_file() {
                 continue;
             }
+            if let (Some(ref c1), Ok(c2)) = (&cur_canon, orig.canonicalize()) {
+                if c1 == &c2 {
+                    continue;
+                }
+            }
+            let meta = orig.metadata().ok();
+            let len = meta.as_ref().map_or(0, |m| m.len());
+            if len == 0 {
+                continue;
+            }
+            let modified = meta.and_then(|m| m.modified().ok());
+            valid_candidates.push((orig, len, modified));
         }
-        let meta = orig.metadata().ok();
-        let len = meta.as_ref().map_or(0, |m| m.len());
-        if len == 0 {
-            continue;
-        }
-        let modified = meta.and_then(|m| m.modified().ok());
-        valid_candidates.push((orig, len, modified));
     }
 
     if valid_candidates.is_empty() {
         return None;
     }
 
-    let has_full_stock = valid_candidates.iter().any(|(_, len, _)| *len > 10_000_000);
+    let has_full_stock = valid_candidates
+        .iter()
+        .any(|(_, len, _)| *len > min_stock_bytes);
     if has_full_stock {
-        valid_candidates.retain(|(_, len, _)| *len > 10_000_000);
+        valid_candidates.retain(|(_, len, _)| *len > min_stock_bytes);
     }
 
-    valid_candidates.sort_by_key(|a| std::cmp::Reverse(a.2));
+    valid_candidates.sort_by_key(|a| std::cmp::Reverse((a.2, a.1)));
     valid_candidates.into_iter().next().map(|(p, _, _)| p)
 }
 
-/// Automatically locate the real official codex executable.
+/// Select the best official `.orig.exe` candidate inside `dir`, preferring files > 10 MB
+/// (stock Codex binary) and sorting by most recent modification time.
+pub fn pick_best_orig_candidate(dir: &Path) -> Option<PathBuf> {
+    pick_best_orig_candidate_across_dirs_with_min_size(&[dir.to_path_buf()], 10_000_000)
+}
+
+/// Automatically locate the real official codex executable, preferring the newest `> 10 MB` `.orig.exe`
+/// across both `current_exe().parent()` and `%LOCALAPPDATA%\OpenAI\Codex\custom` so IDE extensions and
+/// Desktop / CLI always run the newest unified Codex engine.
 pub fn find_real_codex() -> PathBuf {
     // 1. Explicit override via REAL_CODEX_PATH
     if let Ok(p) = env::var("REAL_CODEX_PATH") {
@@ -1794,28 +2277,32 @@ pub fn find_real_codex() -> PathBuf {
         }
     }
 
-    // 2. Check if codex-9router-subagents.orig.exe or codex.orig.exe exists in the directory of the current executable
+    // 2. Compare .orig.exe candidates across both current_exe.parent() and %LOCALAPPDATA%\OpenAI\Codex\custom
+    //    and pick the newest valid stock binary (> 10 MB) so an older IDE extension .orig.exe never shadows
+    //    a newer engine synced into %LOCALAPPDATA%\OpenAI\Codex\custom.
+    let mut primary_dirs: Vec<PathBuf> = Vec::new();
     if let Ok(current_exe) = env::current_exe() {
         if let Some(parent) = current_exe.parent() {
-            if let Some(orig) = pick_best_orig_candidate(parent) {
-                return orig;
-            }
+            primary_dirs.push(parent.to_path_buf());
         }
     }
-
-    // 3. Check custom directory and discovered Store / bin/<hash> / Programs / extension candidates
     if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
         let custom_dir = Path::new(&local_app_data)
             .join("OpenAI")
             .join("Codex")
             .join("custom");
-        if let Some(orig) = pick_best_orig_candidate(&custom_dir) {
-            return orig;
+        if !primary_dirs.iter().any(|d| d == &custom_dir) {
+            primary_dirs.push(custom_dir);
         }
     }
+    if let Some(orig) = pick_best_orig_candidate_across_dirs_with_min_size(&primary_dirs, 10_000_000)
+    {
+        return orig;
+    }
 
+    // 3. Fall back to discovered Store / bin/<hash> / Programs / extension candidates
     let cur_canon = env::current_exe().ok().and_then(|p| p.canonicalize().ok());
-    let mut stock_candidates: Vec<(PathBuf, Option<std::time::SystemTime>)> = Vec::new();
+    let mut stock_candidates: Vec<(PathBuf, u64, Option<std::time::SystemTime>)> = Vec::new();
     for dir in discover_codex_binary_candidate_dirs() {
         for name in ["codex.orig.exe", "codex.exe"] {
             let p = dir.join(name);
@@ -1829,20 +2316,21 @@ pub fn find_real_codex() -> PathBuf {
             }
             if let Ok(meta) = p.metadata() {
                 if meta.len() > 10_000_000 {
-                    stock_candidates.push((p, meta.modified().ok()));
+                    stock_candidates.push((p, meta.len(), meta.modified().ok()));
                 }
             }
         }
     }
-    stock_candidates.sort_by_key(|a| std::cmp::Reverse(a.1));
-    if let Some((first, _)) = stock_candidates.into_iter().next() {
+    stock_candidates.sort_by_key(|a| std::cmp::Reverse((a.2, a.1)));
+    if let Some((first, _, _)) = stock_candidates.into_iter().next() {
         return first;
     }
 
     PathBuf::from("codex.orig.exe")
 }
 
-/// Reset any rate limit errors or spend control blocks in local UI responses,
+/// Reset any rate limit errors or spend control blocks in local UI responses while preserving
+/// real ChatGPT account quota `usedPercent` values, populate a valid default `secondary` window when `null`,
 /// and rewrite loopback `backendOrigin` back to `https://chatgpt.com` so the Electron GUI
 /// (`AuthService` / `electron.net.fetch`) connects directly to ChatGPT with valid public TLS.
 pub fn sanitize_rate_limits(val: &mut Value) -> bool {
@@ -1876,11 +2364,22 @@ pub fn sanitize_rate_limits(val: &mut Value) -> bool {
         if let Some(rl) = obj.get_mut("rateLimits").and_then(|r| r.as_object_mut()) {
             rl.insert("rateLimitReachedType".to_string(), Value::Null);
             rl.insert("spendControlReached".to_string(), Value::Bool(false));
-            if let Some(p) = rl.get_mut("primary").and_then(|p| p.as_object_mut()) {
-                p.insert("usedPercent".to_string(), serde_json::json!(0));
-            }
-            if let Some(s) = rl.get_mut("secondary").and_then(|s| s.as_object_mut()) {
-                s.insert("usedPercent".to_string(), serde_json::json!(0));
+            if rl.get("primary").is_some_and(|p| p.is_object())
+                && !rl.get("secondary").is_some_and(|s| s.is_object())
+            {
+                let resets_at = rl
+                    .get("primary")
+                    .and_then(|p| p.get("resetsAt"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                rl.insert(
+                    "secondary".to_string(),
+                    serde_json::json!({
+                        "usedPercent": 0,
+                        "resetsAt": resets_at,
+                        "windowDurationMins": 10080
+                    }),
+                );
             }
             modified = true;
         }
@@ -1892,11 +2391,22 @@ pub fn sanitize_rate_limits(val: &mut Value) -> bool {
                 if let Some(vo) = item.as_object_mut() {
                     vo.insert("rateLimitReachedType".to_string(), Value::Null);
                     vo.insert("spendControlReached".to_string(), Value::Bool(false));
-                    if let Some(p) = vo.get_mut("primary").and_then(|p| p.as_object_mut()) {
-                        p.insert("usedPercent".to_string(), serde_json::json!(0));
-                    }
-                    if let Some(s) = vo.get_mut("secondary").and_then(|s| s.as_object_mut()) {
-                        s.insert("usedPercent".to_string(), serde_json::json!(0));
+                    if vo.get("primary").is_some_and(|p| p.is_object())
+                        && !vo.get("secondary").is_some_and(|s| s.is_object())
+                    {
+                        let resets_at = vo
+                            .get("primary")
+                            .and_then(|p| p.get("resetsAt"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        vo.insert(
+                            "secondary".to_string(),
+                            serde_json::json!({
+                                "usedPercent": 0,
+                                "resetsAt": resets_at,
+                                "windowDurationMins": 10080
+                            }),
+                        );
                     }
                 }
             }
@@ -1918,10 +2428,20 @@ pub fn sanitize_rate_limits(val: &mut Value) -> bool {
 }
 
 /// Recursively search for an agent role in a JSON structure.
-/// Never inspects chat message `"role"` fields or `"input"` / `"messages"` / `"instructions"` / `"tools"` arrays.
+/// Never inspects chat message `"role"` fields or prompt/schema/history containers.
 pub fn find_agent_role(v: &Value) -> Option<String> {
     match v {
         Value::Object(map) => {
+            for guard_key in ["x-openai-subagent", "agentRole", "agent_role", "agentName", "agent_name", "agentPath", "agent_path"] {
+                if map
+                    .get(guard_key)
+                    .and_then(|x| x.as_str())
+                    .is_some_and(is_guardian_internal_subagent)
+                {
+                    return None;
+                }
+            }
+
             let mut fallback_role: Option<String> = None;
             for key in [
                 "agentRole",
@@ -1932,6 +2452,8 @@ pub fn find_agent_role(v: &Value) -> Option<String> {
                 "subagentRole",
                 "agentName",
                 "agent_name",
+                "agentPath",
+                "agent_path",
             ] {
                 if let Some(r) = map.get(key).and_then(|x| x.as_str()) {
                     if let Some(norm) = normalize_subagent_role_token(r) {
@@ -1958,6 +2480,9 @@ pub fn find_agent_role(v: &Value) -> Option<String> {
             }
             if let Some(r) = map.get("x-openai-subagent").and_then(|x| x.as_str()) {
                 let trimmed = r.trim();
+                if is_guardian_internal_subagent(trimmed) {
+                    return None;
+                }
                 if let Some(norm) = normalize_subagent_role_token(trimmed) {
                     if norm != "default" {
                         return Some(norm);
@@ -1988,6 +2513,21 @@ pub fn find_agent_role(v: &Value) -> Option<String> {
                         | "functions"
                         | "input_schema"
                         | "parameters"
+                        | "items"
+                        | "additionalContext"
+                        | "additional_context"
+                        | "history"
+                        | "initialTurnsPage"
+                        | "initial_turns_page"
+                        | "dynamicTools"
+                        | "dynamic_tools"
+                        | "collaborationMode"
+                        | "collaboration_mode"
+                        | "codex_output_schema"
+                        | "text"
+                        | "schema"
+                        | "output_schema"
+                        | "response_format"
                 ) {
                     continue;
                 }
@@ -2747,7 +3287,6 @@ pub fn inspect_and_route_http_request_with_headers(
         return (false, body.to_vec());
     };
 
-    let header_is_subagent = is_subagent_http_headers(headers);
     let current_model = json
         .get("model")
         .and_then(|m| m.as_str())
@@ -2755,6 +3294,33 @@ pub fn inspect_and_route_http_request_with_headers(
     let model_is_subagent = current_model
         .as_deref()
         .is_some_and(is_subagent_model_name);
+
+    let header_is_guardian = ["x-openai-subagent", "x-codex-subagent", "x-subagent-role"]
+        .iter()
+        .any(|k| {
+            headers
+                .get(*k)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(is_guardian_internal_subagent)
+        });
+    let body_is_guardian = json
+        .get("x-openai-subagent")
+        .or_else(|| {
+            json.get("client_metadata")
+                .and_then(|cm| cm.get("x-openai-subagent"))
+        })
+        .or_else(|| {
+            json.get("clientMetadata")
+                .and_then(|cm| cm.get("x-openai-subagent"))
+        })
+        .and_then(|v| v.as_str())
+        .is_some_and(is_guardian_internal_subagent);
+
+    if (header_is_guardian || body_is_guardian) && !model_is_subagent {
+        return (false, body.to_vec());
+    }
+
+    let header_is_subagent = is_subagent_http_headers(headers);
     let has_subagent_marker = contains_subagent_source(&json);
     let detected_role = find_agent_role(&json);
     let role_is_subagent = detected_role
@@ -2783,10 +3349,11 @@ pub fn inspect_and_route_http_request_with_headers(
 
     if needs_model_rewrite {
         let header_role = extract_role_from_http_headers(headers);
-        let effective_role = match (detected_role.as_deref(), header_role.as_deref()) {
-            (Some("default" | "subagent"), Some(hr)) => Some(hr),
-            (Some(dr), _) => Some(dr),
-            (None, hr) => hr,
+        let effective_role = match (header_role.as_deref(), detected_role.as_deref()) {
+            (Some(hr), _) if hr != "default" && hr != "subagent" => Some(hr),
+            (_, Some(dr)) if dr != "default" && dr != "subagent" => Some(dr),
+            (Some(hr), _) => Some(hr),
+            (None, dr) => dr,
         };
         let mapped_model = map_role_to_model(effective_role);
         if let Some(obj) = json.as_object_mut() {
@@ -2799,6 +3366,7 @@ pub fn inspect_and_route_http_request_with_headers(
     let out_body = serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec());
     (true, out_body)
 }
+
 
 /// Convenience wrapper for inspecting an HTTP request body without custom headers.
 pub fn inspect_and_route_http_request(path: &str, body: &[u8]) -> (bool, Vec<u8>) {
@@ -3333,6 +3901,8 @@ pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
     ] {
         obj.remove(key);
     }
+    obj.insert("stream".to_string(), Value::Bool(false));
+
 
     let instruction_item = serde_json::json!({
         "type": "message",
@@ -3774,6 +4344,7 @@ pub fn build_deterministic_local_summary_from_bytes(body: &[u8]) -> String {
 /// `response.output_item.done` (`"item": {"type": "compaction", "id": "cmp_...", "encrypted_content": "<summary>"}`),
 /// and `response.completed`.
 pub fn build_compaction_sse_stream(summary: &str, model: &str) -> String {
+    static COMPACT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let effective_summary = if summary.trim().is_empty() {
         "Context compacted locally by Codex 9Router Proxy."
     } else {
@@ -3784,8 +4355,13 @@ pub fn build_compaction_sse_stream(summary: &str, model: &str) -> String {
     } else {
         model.trim()
     };
-    let resp_id = "resp_9router_compact";
-    let item_id = "cmp_9router_compact";
+    let seq = COMPACT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let resp_id = format!("resp_9router_compact_{}_{}", nanos, seq);
+    let item_id = format!("cmp_9router_compact_{}_{}", nanos, seq);
 
     let created = serde_json::json!({
         "type": "response.created",
@@ -3854,7 +4430,8 @@ pub fn build_compaction_sse_response(summary: &str, model: &str) -> Response {
 }
 
 /// Handle a subagent remote-compaction request (`"generate": false` or `x-codex-turn-metadata` compaction)
-/// strictly via 9Router with a deterministic local fallback summary if 9Router returns an error or empty summary.
+/// strictly via 9Router with a bounded 120s timeout and a deterministic local fallback summary
+/// if 9Router times out, returns an error, or returns an empty summary.
 pub async fn handle_subagent_compaction(
     client: &reqwest::Client,
     target_url: &str,
@@ -3873,15 +4450,19 @@ pub async fn handle_subagent_compaction(
         .unwrap_or_else(|| map_role_to_model(Some("default")));
 
     if let Some(sum_body) = build_9router_compaction_request_body(routed_body) {
-        if let Ok((mut upstream_res, _)) = send_upstream_with_retry(
-            client,
-            Method::POST,
-            target_url,
-            forward_headers.clone(),
-            Bytes::from(sum_body.clone()),
-        )
-        .await
-        {
+        if let Ok(Some(summary)) = tokio::time::timeout(Duration::from_secs(120), async {
+            let Ok((mut upstream_res, _)) = send_upstream_with_retry(
+                client,
+                Method::POST,
+                target_url,
+                forward_headers.clone(),
+                Bytes::from(sum_body.clone()),
+            )
+            .await
+            else {
+                return None;
+            };
+
             if upstream_res.status().as_u16() >= 400 {
                 if let Some(fallback_body) = rewrite_body_model_to_fallback(&sum_body) {
                     if let Ok((retry_res, _)) = send_upstream_with_retry(
@@ -3900,17 +4481,21 @@ pub async fn handle_subagent_compaction(
 
             if upstream_res.status() == reqwest::StatusCode::OK {
                 if let Ok(resp_bytes) = upstream_res.bytes().await {
-                    if let Some(summary) = extract_summary_from_9router_response(&resp_bytes) {
-                        return build_compaction_sse_response(&summary, &model_name);
-                    }
+                    return extract_summary_from_9router_response(&resp_bytes);
                 }
             }
+            None
+        })
+        .await
+        {
+            return build_compaction_sse_response(&summary, &model_name);
         }
     }
 
     let fallback_summary = build_deterministic_local_summary_from_bytes(routed_body);
     build_compaction_sse_response(&fallback_summary, &model_name)
 }
+
 
 /// Resolve the forward target URL for a given path, routing classification, and optional subagent role.
 pub fn resolve_forward_url_for_role(
@@ -4915,7 +5500,7 @@ pub struct ChatGptWindowEntry {
     pub rect: (i32, i32, i32, i32),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChatGptDesktopClassification {
     pub default_visible_windows: Vec<ChatGptWindowEntry>,
     pub default_any_pids: Vec<u32>,
@@ -5314,9 +5899,43 @@ mod win_desktop {
         }
     }
 
+    pub fn is_ide_extension_originator() -> bool {
+        for var_name in [
+            "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+            "TERM_PROGRAM",
+            "VSCODE_PID",
+            "VSCODE_IPC_HOOK",
+            "VSCODE_CWD",
+        ] {
+            if let Ok(val) = env::var(var_name) {
+                let trimmed = val.trim().to_ascii_lowercase();
+                if !trimmed.is_empty()
+                    && (var_name.starts_with("VSCODE_")
+                        || trimmed.contains("vscode")
+                        || trimmed.contains("cursor")
+                        || trimmed.contains("windsurf")
+                        || trimmed.contains("antigravity"))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn heal_hidden_desktop_codex(
         relaunch_if_no_default: bool,
     ) -> (ChatGptDesktopClassification, bool) {
+        if relaunch_if_no_default && is_ide_extension_originator() {
+            return (ChatGptDesktopClassification::default(), false);
+        }
+
+        let cur_desk = current_thread_desktop_name();
+        let on_hidden_desktop = cur_desk.as_deref().is_some_and(|d| {
+            !d.eq_ignore_ascii_case("Default")
+                && !d.to_ascii_lowercase().starts_with("sbox_alternate_desktop")
+        });
+
         let mut entries = enumerate_chatgpt_desktop_windows();
         let mut class = classify_chatgpt_desktop_windows(&entries);
 
@@ -5325,18 +5944,11 @@ mod win_desktop {
         if relaunch_if_no_default
             && class.hidden_desktop_pids.is_empty()
             && class.default_visible_windows.is_empty()
+            && on_hidden_desktop
         {
-            if let Some(cur_desk) = current_thread_desktop_name() {
-                if !cur_desk.eq_ignore_ascii_case("Default")
-                    && !cur_desk
-                        .to_ascii_lowercase()
-                        .starts_with("sbox_alternate_desktop")
-                {
-                    thread::sleep(Duration::from_millis(250));
-                    entries = enumerate_chatgpt_desktop_windows();
-                    class = classify_chatgpt_desktop_windows(&entries);
-                }
-            }
+            thread::sleep(Duration::from_millis(250));
+            entries = enumerate_chatgpt_desktop_windows();
+            class = classify_chatgpt_desktop_windows(&entries);
         }
 
         let mut healed = false;
@@ -5359,7 +5971,7 @@ mod win_desktop {
                         let _ = fs::remove_file(&lockfile);
                     }
                 }
-                if relaunch_if_no_default {
+                if relaunch_if_no_default && on_hidden_desktop {
                     let stamp_path = env::temp_dir().join("codex-9router-desktop-heal.stamp");
                     let allow_relaunch = stamp_path
                         .metadata()
@@ -5394,6 +6006,7 @@ mod win_desktop {
         (class, healed)
     }
 }
+
 
 /// Run full system health diagnostics and print report.
 pub fn run_doctor() {
@@ -5763,7 +6376,9 @@ fn main() -> io::Result<()> {
         let _ = sync_custom_codex_binaries();
         let _ = sync_codex_models_cache();
         loop {
-            thread::park();
+            thread::sleep(Duration::from_secs(15));
+            let _ = sync_custom_codex_binaries();
+            let _ = sync_codex_models_cache();
         }
     }
 
@@ -5852,7 +6467,9 @@ fn main() -> io::Result<()> {
                     | "thread/fork"
                     | "thread/resume"
                     | "thread/settings/update"
-                    | "turn/start",
+                    | "turn/start"
+                    | "turn/steer"
+                    | "turn/settings/update",
                 ) = json.get("method").and_then(|m| m.as_str())
                 {
                     if let Some(params) = json.get_mut("params").and_then(|p| p.as_object_mut()) {
@@ -5861,6 +6478,7 @@ fn main() -> io::Result<()> {
                         }
                     }
                 }
+
 
                 if modified {
                     if let Ok(s) = serde_json::to_string(&json) {
@@ -6417,8 +7035,16 @@ default_subagent_model = "9router-subagent"
             "rateLimits": {
                 "rateLimitReachedType": "spend",
                 "spendControlReached": true,
-                "primary": { "usedPercent": 100 },
-                "secondary": { "usedPercent": 95 }
+                "primary": { "usedPercent": 42, "resetsAt": 1775000000 },
+                "secondary": { "usedPercent": 15, "resetsAt": 1775600000 }
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "rateLimitReachedType": "rate_limit",
+                    "spendControlReached": true,
+                    "primary": { "usedPercent": 60, "resetsAt": 1775000000 },
+                    "secondary": null
+                }
             }
         });
         let modded = sanitize_rate_limits(&mut val);
@@ -6427,9 +7053,28 @@ default_subagent_model = "9router-subagent"
         assert_eq!(val["rateLimitUpsell"], Value::Null);
         assert_eq!(val["rateLimits"]["rateLimitReachedType"], Value::Null);
         assert_eq!(val["rateLimits"]["spendControlReached"], false);
-        assert_eq!(val["rateLimits"]["primary"]["usedPercent"], 0);
-        assert_eq!(val["rateLimits"]["secondary"]["usedPercent"], 0);
+        // Real ChatGPT quota percentages must be preserved, not overwritten to 0
+        assert_eq!(val["rateLimits"]["primary"]["usedPercent"], 42);
+        assert_eq!(val["rateLimits"]["secondary"]["usedPercent"], 15);
+        // Null secondary must be populated with a valid default object
+        assert_eq!(
+            val["rateLimitsByLimitId"]["codex"]["primary"]["usedPercent"],
+            60
+        );
+        assert_eq!(
+            val["rateLimitsByLimitId"]["codex"]["secondary"]["usedPercent"],
+            0
+        );
+        assert_eq!(
+            val["rateLimitsByLimitId"]["codex"]["secondary"]["resetsAt"],
+            1775000000
+        );
+        assert_eq!(
+            val["rateLimitsByLimitId"]["codex"]["secondary"]["windowDurationMins"],
+            10080
+        );
     }
+
 
     #[test]
     fn test_is_subagent_model_name() {
@@ -9092,4 +9737,231 @@ auditor = "claude-3-7-sonnet-audit"
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
+
+    #[test]
+    fn test_user_thread_fork_not_hijacked_while_subagent_fork_is_routed() {
+        // F-01: User-forked main conversation ("Fork from here" in Desktop or VS Code)
+        // carries forked_from_thread_id, thread_source="user", agent_name="/root", and parent ChatGPT model.
+        let mut user_fork_headers = HeaderMap::new();
+        user_fork_headers.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(
+                r#"{"turn_id":"t_user_fork","thread_source":"user","forked_from_thread_id":"019d3e00-1111-2222-3333-444455556666","agent_name":"/root"}"#,
+            ),
+        );
+        assert!(
+            !is_subagent_http_headers(&user_fork_headers),
+            "user-forked thread must NOT be classified as subagent by HTTP headers"
+        );
+
+        let user_fork_body = serde_json::json!({
+            "model": "gpt-5.4",
+            "forked_from_thread_id": "019d3e00-1111-2222-3333-444455556666",
+            "thread_source": "user",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Continue from forked turn"}]}
+            ]
+        });
+        let (is_sub, routed_bytes) = inspect_and_route_http_request_with_headers(
+            "/backend-api/codex/responses",
+            &user_fork_headers,
+            &serde_json::to_vec(&user_fork_body).unwrap(),
+        );
+        assert!(
+            !is_sub,
+            "user-forked main conversation must stay on ChatGPT and never be routed to 9Router"
+        );
+        let parsed: Value = serde_json::from_slice(&routed_bytes).unwrap();
+        assert_eq!(parsed["model"], "gpt-5.4");
+
+        // JSON-RPC thread/fork params for a user-forked main conversation
+        let mut rpc_user_fork = serde_json::Map::new();
+        rpc_user_fork.insert("model".to_string(), Value::String("gpt-5.4".to_string()));
+        rpc_user_fork.insert(
+            "forkedFromThreadId".to_string(),
+            Value::String("019d3e00-1111-2222-3333-444455556666".to_string()),
+        );
+        rpc_user_fork.insert(
+            "threadSource".to_string(),
+            Value::String("user".to_string()),
+        );
+        route_thread_params(&mut rpc_user_fork);
+        assert_eq!(rpc_user_fork["modelProvider"], "openai");
+        assert_eq!(rpc_user_fork["model_provider"], "openai");
+        assert_eq!(rpc_user_fork["model"], "gpt-5.4");
+
+        // Forked subagent (carries forked_from_thread_id PLUS parent_turn_id / agent_name="/root/explorer")
+        let mut sub_fork_headers = HeaderMap::new();
+        sub_fork_headers.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(
+                r#"{"turn_id":"t_sub_fork","forked_from_thread_id":"019d3e00-1111-2222-3333-444455556666","parent_turn_id":"pt_1","agent_name":"/root/explorer"}"#,
+            ),
+        );
+        assert!(is_subagent_http_headers(&sub_fork_headers));
+    }
+
+    #[test]
+    fn test_strict_role_whitelist_guardian_exclusion_and_v2_nickname_precedence() {
+        // F-02: Arbitrary unknown strings must NOT be treated as subagent roles
+        assert!(!is_subagent_role_name("arbitrary_tool_type"));
+        assert!(!is_subagent_role_name("Gauss"));
+        assert!(!is_subagent_role_name("Noether"));
+        assert!(!is_subagent_role_name("guardian_classifier"));
+        assert!(!is_subagent_role_name("guardian_review"));
+        assert!(!is_subagent_role_name("parent"));
+
+        // Prompt / schema containers ("items", "additionalContext", "history", "dynamicTools", "schema")
+        // containing agent_type or agentRole in user text/schemas must NOT hijack main agent
+        let main_body_with_schema = serde_json::json!({
+            "model": "gpt-5.4",
+            "items": [
+                {"type": "text", "text": " discussing agentRole", "agent_type": "custom_widget"}
+            ],
+            "additionalContext": {
+                "agentRole": "explorer"
+            },
+            "dynamicTools": [
+                {"name": "spawn_agent", "agent_type": "worker"}
+            ],
+            "codex_output_schema": {
+                "schema": {"agentRole": "reviewer"}
+            },
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+            ]
+        });
+        assert_eq!(find_agent_role(&main_body_with_schema), None);
+        let (is_sub_schema, _) = inspect_and_route_http_request(
+            "/backend-api/codex/responses",
+            &serde_json::to_vec(&main_body_with_schema).unwrap(),
+        );
+        assert!(!is_sub_schema);
+
+        // F-03: Internal Guardian safety classifier ("guardian_classifier" / "guardian_review")
+        // must stay on ChatGPT and never be routed to 9Router
+        for guardian_tag in ["guardian_classifier", "guardian_review"] {
+            let mut g_headers = HeaderMap::new();
+            g_headers.insert(
+                header::HeaderName::from_static("x-openai-subagent"),
+                HeaderValue::from_str(guardian_tag).unwrap(),
+            );
+            assert!(!is_subagent_http_headers(&g_headers));
+            assert_eq!(extract_role_from_http_headers(&g_headers), None);
+
+            let g_body = serde_json::json!({
+                "model": "gpt-5.4",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Classify safety"}]}]
+            });
+            let (is_sub_g, routed_g) = inspect_and_route_http_request_with_headers(
+                "/backend-api/codex/responses",
+                &g_headers,
+                &serde_json::to_vec(&g_body).unwrap(),
+            );
+            assert!(
+                !is_sub_g,
+                "Guardian internal classifier ({}) must remain on ChatGPT",
+                guardian_tag
+            );
+            let parsed_g: Value = serde_json::from_slice(&routed_g).unwrap();
+            assert_eq!(parsed_g["model"], "gpt-5.4");
+        }
+
+        // F-05: Multi-Agents V2 nickname ("/root/Gauss") paired with explicit role header ("x-openai-subagent: explorer")
+        // must resolve to "explorer", not "gauss" or "default"
+        let mut v2_headers = HeaderMap::new();
+        v2_headers.insert(
+            header::HeaderName::from_static("x-openai-subagent"),
+            HeaderValue::from_static("explorer"),
+        );
+        v2_headers.insert(
+            header::HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static(
+                r#"{"turn_id":"t_v2","thread_source":"subagent","agent_name":"/root/Gauss","agent_path":"/root/Gauss"}"#,
+            ),
+        );
+        assert!(is_subagent_http_headers(&v2_headers));
+        assert_eq!(
+            extract_role_from_http_headers(&v2_headers).as_deref(),
+            Some("explorer"),
+            "explicit x-openai-subagent role header must take precedence over V2 nickname /root/Gauss"
+        );
+
+        // V2 nickname "/root/Gauss" without a specific role header normalizes cleanly to "default"
+        assert_eq!(
+            normalize_subagent_role_token("/root/Gauss").as_deref(),
+            Some("default")
+        );
+        assert_eq!(normalize_subagent_role_token("Gauss"), None);
+    }
+
+    #[test]
+    fn test_compaction_sets_stream_false_and_unique_ids_and_cross_dir_orig_selection() {
+        // F-08: build_9router_compaction_request_body sets "stream": false,
+        // and build_compaction_sse_stream generates distinct IDs across calls
+        let req = serde_json::json!({
+            "model": "9router-subagent",
+            "generate": false,
+            "stream": true,
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Compact me"}]}]
+        });
+        let out_bytes =
+            build_9router_compaction_request_body(&serde_json::to_vec(&req).unwrap()).unwrap();
+        let out_json: Value = serde_json::from_slice(&out_bytes).unwrap();
+        assert_eq!(out_json["stream"], false);
+
+        let sse1 = build_compaction_sse_stream("Summary 1", "9router-subagent");
+        let sse2 = build_compaction_sse_stream("Summary 2", "9router-subagent");
+        assert_ne!(
+            sse1, sse2,
+            "consecutive compaction SSE streams must have unique response and item IDs"
+        );
+
+        // F-10: pick_best_orig_candidate_across_dirs_with_min_size selects the newest > min_stock_bytes binary
+        // across multiple directories, and sync_hooked_surface_binaries_with_min_size refreshes stale codex.orig.exe
+        let tmp_dir = env::temp_dir().join(format!(
+            "codex_cross_dir_orig_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let ext_dir = tmp_dir.join("vscode_ext");
+        let custom_dir = tmp_dir.join("custom");
+        fs::create_dir_all(&ext_dir).unwrap();
+        fs::create_dir_all(&custom_dir).unwrap();
+
+        let ext_orig = ext_dir.join("codex.orig.exe");
+        fs::write(&ext_orig, vec![b'A'; 4_000]).unwrap();
+        thread::sleep(Duration::from_millis(30));
+
+        let custom_orig = custom_dir.join("codex.orig.exe");
+        fs::write(&custom_orig, vec![b'B'; 6_000]).unwrap();
+        let custom_shim = custom_dir.join("codex-9router-subagents.exe");
+        fs::write(&custom_shim, vec![b'P'; 200]).unwrap();
+        fs::write(ext_dir.join("codex.exe"), vec![b'P'; 200]).unwrap();
+
+        let best = pick_best_orig_candidate_across_dirs_with_min_size(
+            &[ext_dir.clone(), custom_dir.clone()],
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            best, custom_orig,
+            "must select the newer custom/codex.orig.exe over the older extension codex.orig.exe"
+        );
+
+        let refreshed = sync_hooked_surface_binaries_with_min_size(
+            &custom_shim,
+            std::slice::from_ref(&ext_dir),
+            1_000,
+        );
+        assert_eq!(refreshed, 1);
+        assert_eq!(
+            fs::read(&ext_orig).unwrap().len(),
+            6_000,
+            "hooked extension directory's stale codex.orig.exe must be refreshed to match custom_dir's newer stock binary"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
 }
+
