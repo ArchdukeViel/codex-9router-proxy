@@ -54,12 +54,47 @@ $exactCodexProcessNames = @(
     "codex-windows-sandbox-service",
     "codex-code-mode-host"
 )
+if (-not ([System.Management.Automation.PSTypeName]'CodexProcessNative').Type) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class CodexProcessNative {
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool QueryFullProcessImageNameW(IntPtr hProcess, int dwFlags, StringBuilder exeName, ref int lpdwSize);
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr hObject);
+    public static string GetLiveImagePath(int pid) {
+        IntPtr h = OpenProcess(0x1000, false, pid);
+        if (h == IntPtr.Zero) return null;
+        try {
+            int cap = 2048;
+            StringBuilder sb = new StringBuilder(cap);
+            if (QueryFullProcessImageNameW(h, 0, sb, ref cap)) return sb.ToString();
+            return null;
+        } finally {
+            CloseHandle(h);
+        }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+}
+function Get-LiveProcessImagePath([System.Diagnostics.Process]$proc) {
+    if (-not $proc) { return $null }
+    try {
+        $livePath = [CodexProcessNative]::GetLiveImagePath([int]$proc.Id)
+        if ($livePath) { return $livePath }
+    } catch {}
+    try { return $proc.Path } catch { return $null }
+}
 Write-Host "[*] Stopping running codex processes and verified port $proxyPort listeners..." -ForegroundColor Gray
 Get-NetTCPConnection -LocalPort $proxyPort -ErrorAction SilentlyContinue | ForEach-Object {
     $procId = $_.OwningProcess
     if ($procId -gt 0 -and -not $excludedPids.Contains([int]$procId)) {
         $ownerProc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-        if ($ownerProc -and ($exactCodexProcessNames -contains $ownerProc.Name)) {
+        if ($ownerProc -and (($exactCodexProcessNames -contains $ownerProc.Name) -or ($ownerProc.Name -like "codex*.old*"))) {
             Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
         }
     }
@@ -70,10 +105,13 @@ foreach ($procName in $exactCodexProcessNames) {
     }
 }
 Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    (-not $excludedPids.Contains([int]$_.Id)) -and (
-        $_.Name -like "codex*.old*" -or
-        ($_.Path -and ($_.Path -like "*\OpenAI\Codex\*.old.*" -or $_.Path -like "*\openai.chatgpt-*\*.old.*"))
-    )
+    if ($excludedPids.Contains([int]$_.Id)) { return $false }
+    if ($_.Name -like "codex*.old*") { return $true }
+    if ($exactCodexProcessNames -contains $_.Name -or $_.Name -like "codex*") {
+        $livePath = Get-LiveProcessImagePath $_
+        if ($livePath -and $livePath -like "*.old.*") { return $true }
+    }
+    return $false
 } | ForEach-Object {
     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
 }
@@ -379,7 +417,7 @@ if (Test-Path $desktopBinRoot) {
 }
 Get-ChildItem "$desktopBinRoot\*\*.old.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-# 6. Restore Standalone CLI and VS Code / Cursor / Windsurf Extension Binaries
+# 6. Restore Standalone CLI and VS Code / Cursor / Windsurf / Antigravity Extension Binaries
 $externalBinDirs = New-Object System.Collections.Generic.List[string]
 $standaloneCliBin = Join-Path $env:LOCALAPPDATA "Programs\OpenAI\Codex\bin"
 if (Test-Path $standaloneCliBin) {
@@ -389,7 +427,9 @@ foreach ($extRoot in @(
     (Join-Path $env:USERPROFILE ".vscode\extensions"),
     (Join-Path $env:USERPROFILE ".vscode-insiders\extensions"),
     (Join-Path $env:USERPROFILE ".cursor\extensions"),
-    (Join-Path $env:USERPROFILE ".windsurf\extensions")
+    (Join-Path $env:USERPROFILE ".windsurf\extensions"),
+    (Join-Path $env:USERPROFILE ".antigravity\extensions"),
+    (Join-Path $env:USERPROFILE ".antigravity-ide\extensions")
 )) {
     if (Test-Path $extRoot) {
         Get-ChildItem -Path $extRoot -Directory -Filter "openai.chatgpt-*" -ErrorAction SilentlyContinue | ForEach-Object {

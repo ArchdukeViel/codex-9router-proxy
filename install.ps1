@@ -601,6 +601,69 @@ if (-not (Test-Path $releaseBinary)) {
 Write-Host "[OK] Release binary ready ($((Get-Item $releaseBinary).Length) bytes)." -ForegroundColor Green
 
 # 6. Stop running codex processes (excluding ancestor PIDs in ParentProcessId chain), hidden-desktop ChatGPT.exe instances, and verified port listeners before hooking
+if (-not ("CodexProcessNative" -as [type])) {
+    Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public class CodexProcessNative {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize);
+
+    public static string GetProcessImagePath(int pid) {
+        if (pid <= 0) return null;
+        IntPtr hProc = OpenProcess(0x1000, false, pid);
+        if (hProc == IntPtr.Zero) return null;
+        try {
+            StringBuilder sb = new StringBuilder(1024);
+            uint size = (uint)sb.Capacity;
+            if (QueryFullProcessImageNameW(hProc, 0, sb, ref size) && size > 0) {
+                return sb.ToString();
+            }
+            return null;
+        } finally {
+            CloseHandle(hProc);
+        }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+}
+
+function Get-LiveProcessImagePath {
+    param($Process)
+    if (-not $Process) { return $null }
+    try {
+        if ("CodexProcessNative" -as [type]) {
+            $livePath = [CodexProcessNative]::GetProcessImagePath([int]$Process.Id)
+            if (-not [string]::IsNullOrWhiteSpace($livePath)) {
+                return $livePath
+            }
+        }
+    } catch {}
+    try { return $Process.Path } catch { return $null }
+}
+
+function Test-ProxyDaemonRunning {
+    param([string]$CustomDir, [int]$Port)
+    $lockFile = Join-Path $CustomDir "proxy-daemon-$Port.lock"
+    if (Test-Path $lockFile) {
+        try {
+            $fs = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $fs.Close()
+            $fs.Dispose()
+        } catch {
+            return $true
+        }
+    }
+    $daemonProc = Get-CimInstance Win32_Process -Filter "Name = 'codex-9router-subagents.exe' OR Name = 'codex-9router-proxy.exe' OR Name = 'codex.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match '--proxy-daemon' }
+    return [bool]$daemonProc
+}
+
 function Get-AncestorProcessIds {
     $ancestors = New-Object 'System.Collections.Generic.HashSet[int]'
     $curPid = $PID
@@ -638,12 +701,19 @@ Get-NetTCPConnection -LocalPort $proxyPort -ErrorAction SilentlyContinue | ForEa
     $procId = [int]$_.OwningProcess
     if ($procId -gt 0 -and -not $ancestorPids.Contains($procId)) {
         $ownerProc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-        if ($ownerProc -and ($exactCodexProcessNames -contains $ownerProc.Name -or $ownerProc.Name -like "codex*.old*")) {
+        $ownerLivePath = Get-LiveProcessImagePath $ownerProc
+        if ($ownerProc -and ($exactCodexProcessNames -contains $ownerProc.Name -or $ownerProc.Name -like "codex*.old*" -or ($ownerLivePath -and $ownerLivePath -like "*.old.*"))) {
             Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
         }
     }
 }
-Get-Process -Name $exactCodexProcessNames -ErrorAction SilentlyContinue | Where-Object { -not $ancestorPids.Contains([int]$_.Id) } | ForEach-Object {
+Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    (-not $ancestorPids.Contains([int]$_.Id)) -and (
+        $exactCodexProcessNames -contains $_.Name -or
+        $_.Name -like "codex*.old*" -or
+        ($_.Name -like "codex*" -and ((Get-LiveProcessImagePath $_) -like "*.old.*"))
+    )
+} | ForEach-Object {
     Write-Host "    Stopping process $($_.Name) (PID $($_.Id))..." -ForegroundColor Gray
     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
 }
@@ -875,7 +945,9 @@ foreach ($ideRoot in @(
     (Join-Path $env:USERPROFILE ".vscode\extensions"),
     (Join-Path $env:USERPROFILE ".vscode-insiders\extensions"),
     (Join-Path $env:USERPROFILE ".cursor\extensions"),
-    (Join-Path $env:USERPROFILE ".windsurf\extensions")
+    (Join-Path $env:USERPROFILE ".windsurf\extensions"),
+    (Join-Path $env:USERPROFILE ".antigravity\extensions"),
+    (Join-Path $env:USERPROFILE ".antigravity-ide\extensions")
 )) {
     if (Test-Path $ideRoot) {
         Get-ChildItem -Path $ideRoot -Directory -Filter "openai.chatgpt-*" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -1138,7 +1210,7 @@ if ((`$candDirs.Count -eq 0) -and (Test-Path `$winApps)) {
 `$binHelpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe')
 `$customHelpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe', 'rg.exe')
 
-# 3. Hook Standalone CLI (Programs\OpenAI\Codex\bin) and VS Code / Cursor / Windsurf Extensions on update
+# 3. Hook Standalone CLI (Programs\OpenAI\Codex\bin) and VS Code / Cursor / Windsurf / Antigravity Extensions on update
 `$extraDirs = New-Object System.Collections.Generic.List[string]
 `$progBin = Join-Path `$env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin'
 if (Test-Path `$progBin) { `$extraDirs.Add(`$progBin) }
@@ -1146,7 +1218,9 @@ foreach (`$ideRoot in @(
     (Join-Path `$env:USERPROFILE '.vscode\extensions'),
     (Join-Path `$env:USERPROFILE '.vscode-insiders\extensions'),
     (Join-Path `$env:USERPROFILE '.cursor\extensions'),
-    (Join-Path `$env:USERPROFILE '.windsurf\extensions')
+    (Join-Path `$env:USERPROFILE '.windsurf\extensions'),
+    (Join-Path `$env:USERPROFILE '.antigravity\extensions'),
+    (Join-Path `$env:USERPROFILE '.antigravity-ide\extensions')
 )) {
     if (Test-Path `$ideRoot) {
         Get-ChildItem -Path `$ideRoot -Directory -Filter 'openai.chatgpt-*' | ForEach-Object {
@@ -1265,9 +1339,49 @@ if (Test-Path `$binRoot) {
     }
 }
 
-# 6. Terminate any stale .old.* processes, hidden-desktop ChatGPT.exe instances, and clean up leftover .old.* / lockfile files
-Get-Process | Where-Object { `$_.Name -like 'codex*.old*' -or (`$_.Path -and (`$_.Path -like '*\OpenAI\Codex\*.old.*' -or `$_.Path -like '*\openai.chatgpt-*\*.old.*')) } | Stop-Process -Force
+# 6. Terminate any stale .old.* processes (via Win32 QueryFullProcessImageNameW), hidden-desktop ChatGPT.exe instances, and clean up leftover .old.* / lockfile files
+if (-not ('CodexProcessNative' -as [type])) {
+    `$csProc = 'using System; using System.Text; using System.Runtime.InteropServices; public class CodexProcessNative { [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId); [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr hObject); [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize); public static string GetProcessImagePath(int pid) { if (pid <= 0) return null; IntPtr hProc = OpenProcess(0x1000, false, pid); if (hProc == IntPtr.Zero) return null; try { StringBuilder sb = new StringBuilder(1024); uint size = (uint)sb.Capacity; if (QueryFullProcessImageNameW(hProc, 0, sb, ref size) && size > 0) return sb.ToString(); return null; } finally { CloseHandle(hProc); } } }'
+    Add-Type -TypeDefinition `$csProc
+}
+function Get-LiveProcessImagePath {
+    param(`$Process)
+    if (-not `$Process) { return `$null }
+    try {
+        if ('CodexProcessNative' -as [type]) {
+            `$lp = [CodexProcessNative]::GetProcessImagePath([int]`$Process.Id)
+            if (-not [string]::IsNullOrWhiteSpace(`$lp)) { return `$lp }
+        }
+    } catch {}
+    try { return `$Process.Path } catch { return `$null }
+}
+function Get-AncestorProcessIds {
+    `$ancestors = New-Object 'System.Collections.Generic.HashSet[int]'
+    `$curPid = `$PID
+    for (`$depth = 0; `$depth -lt 32 -and `$curPid -gt 0; `$depth++) {
+        [void]`$ancestors.Add([int]`$curPid)
+        try {
+            `$procInfo = Get-CimInstance Win32_Process -Filter "ProcessId = `$curPid"
+            if (`$procInfo -and `$procInfo.ParentProcessId -gt 0 -and -not `$ancestors.Contains([int]`$procInfo.ParentProcessId)) {
+                `$curPid = [int]`$procInfo.ParentProcessId
+            } else { break }
+        } catch { break }
+    }
+    return `$ancestors
+}
+`$ancestorPids = Get-AncestorProcessIds
+Get-Process | Where-Object {
+    (-not `$ancestorPids.Contains([int]`$_.Id)) -and (
+        `$_.Name -like 'codex*.old*' -or
+        (`$_.Name -like 'codex*' -and ((Get-LiveProcessImagePath `$_) -like '*.old.*'))
+    )
+} | Stop-Process -Force
 Get-ChildItem "`$binRoot\*\*.old.*", "`$customDir\*.old.*" | Remove-Item -Force
+foreach (`$ed in `$extraDirs) {
+    if (Test-Path `$ed) {
+        Get-ChildItem (Join-Path `$ed '*.old.*') | Remove-Item -Force
+    }
+}
 
 `$chatGptPids = [int[]]@(Get-Process -Name 'ChatGPT*' | Select-Object -ExpandProperty Id)
 if (`$chatGptPids.Count -gt 0) {
@@ -1357,9 +1471,26 @@ for db_path in db_paths:
     & python @pyArgs 2>&1 | Out-Null
 }
 
+function Test-ProxyDaemonRunning {
+    param([string]`$CustomDir, [int]`$Port)
+    `$lockFile = Join-Path `$CustomDir "proxy-daemon-`$Port.lock"
+    if (Test-Path `$lockFile) {
+        try {
+            `$fs = [System.IO.File]::Open(`$lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            `$fs.Close()
+            `$fs.Dispose()
+        } catch {
+            return `$true
+        }
+    }
+    `$daemonProc = Get-CimInstance Win32_Process -Filter "Name = 'codex-9router-subagents.exe' OR Name = 'codex-9router-proxy.exe' OR Name = 'codex.exe'" |
+        Where-Object { `$_.CommandLine -match '--proxy-daemon' }
+    return [bool]`$daemonProc
+}
+
 if (Test-Path `$proxyPath) {
     & `$proxyPath --doctor 2>&1 | Out-Null
-    if (-not (Get-NetTCPConnection -LocalPort `$proxyPort -State Listen -ErrorAction SilentlyContinue)) {
+    if ((-not (Test-ProxyDaemonRunning -CustomDir `$customDir -Port `$proxyPort)) -or (-not (Get-NetTCPConnection -LocalPort `$proxyPort -State Listen -ErrorAction SilentlyContinue))) {
         Start-Process -FilePath `$proxyPath -ArgumentList "--proxy-daemon" -WindowStyle Hidden
     }
 }
@@ -1374,19 +1505,33 @@ Write-Host "[OK] Registered self-healing startup hook in $startupCmd." -Foregrou
 
 # 11. Terminate any stale .old.* processes that respawned during copy and clean up .old.* files
 Get-NetTCPConnection -LocalPort $proxyPort -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
-    $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
-    if ($p -and ($p.Name -like "codex*.old*" -or ($p.Path -and ($p.Path -like "*\OpenAI\Codex\*.old.*" -or $p.Path -like "*\openai.chatgpt-*\*.old.*")))) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    $procId = [int]$_.OwningProcess
+    if ($procId -gt 0 -and -not $ancestorPids.Contains($procId)) {
+        $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        $livePath = Get-LiveProcessImagePath $p
+        if ($p -and ($p.Name -like "codex*.old*" -or ($livePath -and $livePath -like "*.old.*"))) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        }
     }
 }
-Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "codex*.old*" -or ($_.Path -and ($_.Path -like "*\OpenAI\Codex\*.old.*" -or $_.Path -like "*\openai.chatgpt-*\*.old.*")) } | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    (-not $ancestorPids.Contains([int]$_.Id)) -and (
+        $_.Name -like "codex*.old*" -or
+        ($_.Name -like "codex*" -and ((Get-LiveProcessImagePath $_) -like "*.old.*"))
+    )
+} | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 600
 Get-ChildItem "$desktopBinRoot\*\*.old.*", "$customDir\*.old.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+foreach ($ehDir in $extraHookDirs) {
+    if (Test-Path $ehDir) {
+        Get-ChildItem (Join-Path $ehDir "*.old.*") -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # 12. Ensure background reverse-proxy listener (:$proxyPort) and app-server daemon are running
 Write-Host "[*] Ensuring reverse proxy listener on 127.0.0.1:$proxyPort..." -ForegroundColor Gray
 try {
-    if (-not (Get-NetTCPConnection -LocalPort $proxyPort -State Listen -ErrorAction SilentlyContinue)) {
+    if ((-not (Test-ProxyDaemonRunning -CustomDir $customDir -Port $proxyPort)) -or (-not (Get-NetTCPConnection -LocalPort $proxyPort -State Listen -ErrorAction SilentlyContinue))) {
         Start-Process -FilePath $customShim -ArgumentList "--proxy-daemon" -WindowStyle Hidden
         Start-Sleep -Milliseconds 500
     }

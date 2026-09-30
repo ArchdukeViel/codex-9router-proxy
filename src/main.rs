@@ -1422,12 +1422,7 @@ pub fn discover_codex_binary_candidate_dirs() -> Vec<PathBuf> {
                 push_dir(entry.path().join("bin"));
             }
         }
-        for ext_root in [
-            ".vscode\\extensions",
-            ".vscode-insiders\\extensions",
-            ".cursor\\extensions",
-            ".windsurf\\extensions",
-        ] {
+        for ext_root in IDE_EXTENSION_ROOTS {
             let ext_dir = Path::new(&userprofile).join(ext_root);
             if let Ok(entries) = fs::read_dir(&ext_dir) {
                 for entry in entries.flatten() {
@@ -1447,6 +1442,16 @@ pub fn discover_codex_binary_candidate_dirs() -> Vec<PathBuf> {
 
     dirs
 }
+
+/// IDE extension roots under `%USERPROFILE%` that may host `openai.chatgpt-*` extensions.
+pub const IDE_EXTENSION_ROOTS: [&str; 6] = [
+    ".vscode\\extensions",
+    ".vscode-insiders\\extensions",
+    ".cursor\\extensions",
+    ".windsurf\\extensions",
+    ".antigravity\\extensions",
+    ".antigravity-ide\\extensions",
+];
 
 /// Copy `src` to `dst`, renaming `dst` to `<filename>.old.<pid>` first if `dst` is locked in use.
 pub fn safe_copy_or_rename_locked(src: &Path, dst: &Path) -> io::Result<()> {
@@ -1632,7 +1637,7 @@ pub fn sync_custom_codex_binaries_from_candidates_with_min_size(
 
 /// Auto-hook standalone CLI (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`) and IDE extensions
 /// (`openai.chatgpt-*\bin\windows-*\codex.exe`) by backing up stock `> min_stock_bytes` binaries to
-/// `codex.orig.exe` and replacing `codex.exe` with `proxy_shim`.
+/// `codex.orig.exe`, replacing `codex.exe` with `proxy_shim`, and cleaning up unlocked `.old.*` files.
 pub fn sync_hooked_surface_binaries_with_min_size(
     proxy_shim: &Path,
     hook_dirs: &[PathBuf],
@@ -1648,6 +1653,18 @@ pub fn sync_hooked_surface_binaries_with_min_size(
     let mut hooked = 0;
 
     for hdir in hook_dirs {
+        if let Ok(entries) = fs::read_dir(hdir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.contains(".old."))
+                {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+
         let codex_exe = hdir.join("codex.exe");
         let codex_orig = hdir.join("codex.orig.exe");
         let Ok(exe_meta) = codex_exe.metadata() else {
@@ -1707,12 +1724,7 @@ pub fn sync_custom_codex_binaries() -> usize {
         .join("Codex")
         .join("bin")];
     if let Ok(userprofile) = env::var("USERPROFILE") {
-        for ext_root in [
-            ".vscode\\extensions",
-            ".vscode-insiders\\extensions",
-            ".cursor\\extensions",
-            ".windsurf\\extensions",
-        ] {
+        for ext_root in IDE_EXTENSION_ROOTS {
             let ext_dir = Path::new(&userprofile).join(ext_root);
             if let Ok(entries) = fs::read_dir(&ext_dir) {
                 for entry in entries.flatten() {
@@ -4585,57 +4597,10 @@ pub fn verify_existing_tls_proxy_listener(bind_addr: &str, cert_path: &Path) -> 
     .unwrap_or(false)
 }
 
-/// Bind and spawn the embedded dual-stack HTTP/HTTPS reverse proxy in a background thread,
-/// returning `(cert_path, bound_port)`. If `bind_addr` is already in use, verifies that the
-/// listener completes a TLS `/health` check trusted by `cert_path`; otherwise binds a fallback port.
-pub fn spawn_embedded_reverse_proxy_with_port(bind_addr: &str) -> io::Result<(PathBuf, String)> {
-    let (cert_path, key_path) = default_cert_paths();
-    let tls_acceptor = create_tls_acceptor(&cert_path, &key_path)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let requested_port = bind_addr
-        .rsplit(':')
-        .next()
-        .unwrap_or("20129")
-        .to_string();
-
-    let (std_listener, actual_port) = match TcpListener::bind(bind_addr) {
-        Ok(l) => {
-            let bound_port = l
-                .local_addr()
-                .map(|a| a.port().to_string())
-                .unwrap_or_else(|_| requested_port.clone());
-            (l, bound_port)
-        }
-        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-            if verify_existing_tls_proxy_listener(bind_addr, &cert_path) {
-                return Ok((cert_path, requested_port));
-            }
-            let mut fallback_listener: Option<(TcpListener, String)> = None;
-            for candidate_port in 20130..=20139u16 {
-                let candidate_addr = format!("127.0.0.1:{}", candidate_port);
-                if let Ok(l) = TcpListener::bind(&candidate_addr) {
-                    fallback_listener = Some((l, candidate_port.to_string()));
-                    break;
-                } else if verify_existing_tls_proxy_listener(&candidate_addr, &cert_path) {
-                    return Ok((cert_path, candidate_port.to_string()));
-                }
-            }
-            if fallback_listener.is_none() {
-                if let Ok(l) = TcpListener::bind("127.0.0.1:0") {
-                    if let Ok(addr) = l.local_addr() {
-                        fallback_listener = Some((l, addr.port().to_string()));
-                    }
-                }
-            }
-            match fallback_listener {
-                Some(pair) => pair,
-                None => return Err(e),
-            }
-        }
-        Err(e) => return Err(e),
-    };
-    std_listener.set_nonblocking(true)?;
+/// Spawn a background Tokio runtime thread that accepts and serves dual-stack TLS + plain HTTP
+/// requests on an already-bound `std::net::TcpListener`.
+pub fn spawn_reverse_proxy_accept_thread(std_listener: TcpListener, tls_acceptor: TlsAcceptor) {
+    let _ = std_listener.set_nonblocking(true);
 
     thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -4707,6 +4672,79 @@ pub fn spawn_embedded_reverse_proxy_with_port(bind_addr: &str) -> io::Result<(Pa
             }
         });
     });
+}
+
+/// Spawn a lightweight background standby failover thread that polls `TcpListener::bind(&bind_addr)`
+/// every `250ms` and immediately starts `spawn_reverse_proxy_accept_thread` if the primary listener exits.
+pub fn spawn_reverse_proxy_standby_thread(bind_addr: String, tls_acceptor: TlsAcceptor) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            if let Ok(l) = TcpListener::bind(&bind_addr) {
+                if l.set_nonblocking(true).is_ok() {
+                    spawn_reverse_proxy_accept_thread(l, tls_acceptor);
+                }
+                break;
+            }
+        }
+    });
+}
+
+/// Bind and spawn the embedded dual-stack HTTP/HTTPS reverse proxy in a background thread,
+/// returning `(cert_path, bound_port)`. If `bind_addr` is already in use, verifies that the
+/// listener completes a TLS `/health` check trusted by `cert_path` and spawns an in-process
+/// standby failover thread; otherwise binds a fallback port.
+pub fn spawn_embedded_reverse_proxy_with_port(bind_addr: &str) -> io::Result<(PathBuf, String)> {
+    let (cert_path, key_path) = default_cert_paths();
+    let tls_acceptor = create_tls_acceptor(&cert_path, &key_path)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let requested_port = bind_addr
+        .rsplit(':')
+        .next()
+        .unwrap_or("20129")
+        .to_string();
+
+    let (std_listener, actual_port) = match TcpListener::bind(bind_addr) {
+        Ok(l) => {
+            let bound_port = l
+                .local_addr()
+                .map(|a| a.port().to_string())
+                .unwrap_or_else(|_| requested_port.clone());
+            (l, bound_port)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            if verify_existing_tls_proxy_listener(bind_addr, &cert_path) {
+                spawn_reverse_proxy_standby_thread(bind_addr.to_string(), tls_acceptor);
+                return Ok((cert_path, requested_port));
+            }
+            let mut fallback_listener: Option<(TcpListener, String)> = None;
+            for candidate_port in 20130..=20139u16 {
+                let candidate_addr = format!("127.0.0.1:{}", candidate_port);
+                if let Ok(l) = TcpListener::bind(&candidate_addr) {
+                    fallback_listener = Some((l, candidate_port.to_string()));
+                    break;
+                } else if verify_existing_tls_proxy_listener(&candidate_addr, &cert_path) {
+                    spawn_reverse_proxy_standby_thread(candidate_addr, tls_acceptor);
+                    return Ok((cert_path, candidate_port.to_string()));
+                }
+            }
+            if fallback_listener.is_none() {
+                if let Ok(l) = TcpListener::bind("127.0.0.1:0") {
+                    if let Ok(addr) = l.local_addr() {
+                        fallback_listener = Some((l, addr.port().to_string()));
+                    }
+                }
+            }
+            match fallback_listener {
+                Some(pair) => pair,
+                None => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    };
+    std_listener.set_nonblocking(true)?;
+    spawn_reverse_proxy_accept_thread(std_listener, tls_acceptor);
 
     Ok((cert_path, actual_port))
 }
@@ -4714,6 +4752,112 @@ pub fn spawn_embedded_reverse_proxy_with_port(bind_addr: &str) -> io::Result<(Pa
 /// Bind and spawn the embedded dual-stack HTTP/HTTPS reverse proxy in a background thread.
 pub fn spawn_embedded_reverse_proxy(bind_addr: &str) -> io::Result<PathBuf> {
     spawn_embedded_reverse_proxy_with_port(bind_addr).map(|(cert_path, _)| cert_path)
+}
+
+/// Compute the `--proxy-daemon` single-instance lockfile path inside `custom_dir` for `port`.
+pub fn proxy_daemon_lockfile_path_in_dir(custom_dir: &Path, port: &str) -> PathBuf {
+    let clean_port: String = port
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let effective_port = if clean_port.is_empty() {
+        "20129"
+    } else {
+        &clean_port
+    };
+    custom_dir.join(format!("proxy-daemon-{}.lock", effective_port))
+}
+
+/// Compute the default `--proxy-daemon` single-instance lockfile path (`%LOCALAPPDATA%\OpenAI\Codex\custom\proxy-daemon-<port>.lock`).
+pub fn default_proxy_daemon_lockfile_path(port: &str) -> PathBuf {
+    let (cert_path, _) = default_cert_paths();
+    let custom_dir = cert_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(env::temp_dir);
+    proxy_daemon_lockfile_path_in_dir(&custom_dir, port)
+}
+
+/// Attempt to open `lock_path` with an exclusive OS lock (`share_mode(0)` on Windows).
+/// Returns `Some(File)` if acquired, or `None` if another `--proxy-daemon` instance holds the lock.
+pub fn try_acquire_proxy_daemon_lock_at(lock_path: &Path) -> Option<fs::File> {
+    if let Some(parent) = lock_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
+    let mut file = opts.open(lock_path).ok()?;
+    let _ = file.set_len(0);
+    let _ = writeln!(file, "{}", std::process::id());
+    let _ = file.flush();
+    Some(file)
+}
+
+/// Attempt to acquire the default `--proxy-daemon` single-instance lockfile for `port`.
+pub fn try_acquire_proxy_daemon_lock(port: &str) -> Option<fs::File> {
+    let lock_path = default_proxy_daemon_lockfile_path(port);
+    try_acquire_proxy_daemon_lock_at(&lock_path)
+}
+
+/// Resolve the executable path to use when spawning a detached `--proxy-daemon` background process,
+/// preferring `%LOCALAPPDATA%\OpenAI\Codex\custom\codex-9router-subagents.exe` and falling back to
+/// `env::current_exe()` only when it is not a renamed `.old.*` file.
+pub fn resolve_proxy_daemon_exe_path() -> Option<PathBuf> {
+    if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
+        let custom_shim = Path::new(&local_app_data)
+            .join("OpenAI")
+            .join("Codex")
+            .join("custom")
+            .join("codex-9router-subagents.exe");
+        if custom_shim.is_file() {
+            return Some(custom_shim);
+        }
+    }
+    if let Ok(cur) = env::current_exe() {
+        let is_old = cur
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.to_ascii_lowercase().contains(".old."));
+        if !is_old && cur.is_file() {
+            return Some(cur);
+        }
+    }
+    None
+}
+
+/// Ensure a detached background `--proxy-daemon` process is running for `port`.
+/// If `proxy-daemon-<port>.lock` can be opened with `share_mode(0)` (meaning no `--proxy-daemon`
+/// is currently holding the lock), drops the test handle and spawns a detached `--proxy-daemon`.
+pub fn ensure_background_proxy_daemon_running(port: &str) {
+    let lock_path = default_proxy_daemon_lockfile_path(port);
+    let Some(test_lock) = try_acquire_proxy_daemon_lock_at(&lock_path) else {
+        return;
+    };
+    drop(test_lock);
+
+    let Some(daemon_exe) = resolve_proxy_daemon_exe_path() else {
+        return;
+    };
+
+    let mut cmd = Command::new(daemon_exe);
+    cmd.arg("--proxy-daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+    let _ = cmd.spawn();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5569,6 +5713,9 @@ fn main() -> io::Result<()> {
 
     if args.iter().any(|a| a.eq_ignore_ascii_case("--proxy-daemon")) {
         let port = get_proxy_port();
+        let Some(_daemon_lock) = try_acquire_proxy_daemon_lock(&port) else {
+            return Ok(());
+        };
         let bind_addr = format!("127.0.0.1:{}", port);
         let _ = spawn_embedded_reverse_proxy_with_port(&bind_addr)?;
         loop {
@@ -5598,6 +5745,7 @@ fn main() -> io::Result<()> {
             let bind_addr = format!("127.0.0.1:{}", port);
             if let Ok((cert_path, actual_port)) = spawn_embedded_reverse_proxy_with_port(&bind_addr)
             {
+                ensure_background_proxy_daemon_running(&actual_port);
                 cmd.env("CODEX_CA_CERTIFICATE", &cert_path);
                 forward_args = inject_loopback_base_url(&forward_args, &actual_port);
             }
@@ -5625,6 +5773,7 @@ fn main() -> io::Result<()> {
             (default_cert, port)
         }
     };
+    ensure_background_proxy_daemon_running(&actual_port);
 
     let child_args = inject_loopback_base_url(&args, &actual_port);
 
@@ -8690,5 +8839,147 @@ auditor = "claude-3-7-sonnet-audit"
             !is_doctor_cli_invocation(&["exec".to_string(), "doctor".to_string()]),
             "codex exec doctor must never be hijacked by run_doctor()"
         );
+    }
+
+    #[test]
+    fn test_standby_failover_takeover_and_proxy_daemon_single_instance_lock_and_antigravity_cleanup() {
+        // 1. Verify Antigravity extension roots & .old.* cleanup in sync_hooked_surface_binaries_with_min_size
+        assert!(IDE_EXTENSION_ROOTS.contains(&".antigravity\\extensions"));
+        assert!(IDE_EXTENSION_ROOTS.contains(&".antigravity-ide\\extensions"));
+        assert!(IDE_EXTENSION_ROOTS.contains(&".vscode\\extensions"));
+        assert!(IDE_EXTENSION_ROOTS.contains(&".cursor\\extensions"));
+        assert!(IDE_EXTENSION_ROOTS.contains(&".windsurf\\extensions"));
+
+        let tmp_dir = env::temp_dir().join(format!(
+            "codex_standby_failover_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let ag_ext_bin = tmp_dir.join("antigravity_ext_bin");
+        fs::create_dir_all(&ag_ext_bin).unwrap();
+        let proxy_shim = tmp_dir.join("codex-9router-subagents.exe");
+        fs::write(&proxy_shim, vec![b'P'; 200]).unwrap();
+        fs::write(ag_ext_bin.join("codex.exe"), vec![b'S'; 5000]).unwrap();
+        let stale_old_file = ag_ext_bin.join("codex.exe.old.99999");
+        fs::write(&stale_old_file, b"stale").unwrap();
+
+        let hooked = sync_hooked_surface_binaries_with_min_size(
+            &proxy_shim,
+            std::slice::from_ref(&ag_ext_bin),
+            1_000,
+        );
+        assert_eq!(hooked, 1);
+        assert!(
+            !stale_old_file.exists(),
+            "unlocked .old.* files in hooked surface directories must be cleaned up"
+        );
+        assert_eq!(fs::read(ag_ext_bin.join("codex.orig.exe")).unwrap().len(), 5000);
+        assert_eq!(fs::read(ag_ext_bin.join("codex.exe")).unwrap().len(), 200);
+
+        // 2. Verify single-instance --proxy-daemon exclusive lockfile acquisition
+        let lock_path = proxy_daemon_lockfile_path_in_dir(&tmp_dir, "20129");
+        assert_eq!(lock_path, tmp_dir.join("proxy-daemon-20129.lock"));
+        assert_eq!(
+            proxy_daemon_lockfile_path_in_dir(&tmp_dir, "   "),
+            tmp_dir.join("proxy-daemon-20129.lock")
+        );
+
+        let lock1 = try_acquire_proxy_daemon_lock_at(&lock_path);
+        assert!(
+            lock1.is_some(),
+            "first --proxy-daemon lock acquisition must succeed"
+        );
+        #[cfg(windows)]
+        {
+            let lock2 = try_acquire_proxy_daemon_lock_at(&lock_path);
+            assert!(
+                lock2.is_none(),
+                "second --proxy-daemon lock acquisition must fail while first handle is held"
+            );
+        }
+        drop(lock1);
+        let lock3 = try_acquire_proxy_daemon_lock_at(&lock_path);
+        assert!(
+            lock3.is_some(),
+            "--proxy-daemon lock acquisition must succeed immediately after previous handle is dropped"
+        );
+        drop(lock3);
+
+        // 3. Verify in-process standby failover thread takes over within ~300ms when primary listener closes
+        let (cert_path, key_path) = default_cert_paths();
+        let primary_acceptor = create_tls_acceptor(&cert_path, &key_path).unwrap();
+        let primary_std = TcpListener::bind("127.0.0.1:0").unwrap();
+        let primary_addr = primary_std.local_addr().unwrap().to_string();
+        let primary_port = primary_std.local_addr().unwrap().port().to_string();
+        primary_std.set_nonblocking(true).unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let primary_handle = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(primary_std).unwrap();
+                let app = create_router(Arc::new(ProxyAppState {
+                    http_client: build_upstream_http_client(),
+                }));
+                tokio::pin!(shutdown_rx);
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => {
+                            break;
+                        }
+                        res = listener.accept() => {
+                            let Ok((stream, _)) = res else { continue; };
+                            let acc = primary_acceptor.clone();
+                            let router = app.clone();
+                            tokio::spawn(async move {
+                                if let Ok(tls_stream) = acc.accept(stream).await {
+                                    let io = TokioIo::new(tls_stream);
+                                    let service = hyper::service::service_fn(
+                                        move |req: axum::http::Request<hyper::body::Incoming>| {
+                                            let mut r = router.clone();
+                                            async move {
+                                                let req = req.map(Body::new);
+                                                r.call(req).await
+                                            }
+                                        },
+                                    );
+                                    let _ = auto::Builder::new(TokioExecutor::new())
+                                        .serve_connection_with_upgrades(io, service)
+                                        .await;
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        });
+
+        assert!(
+            verify_existing_tls_proxy_listener(&primary_addr, &cert_path),
+            "primary TLS proxy listener must be healthy before standby registration"
+        );
+
+        // Call spawn_embedded_reverse_proxy_with_port on the already-bound primary_addr:
+        // it must detect the healthy primary listener, return the same port, and spawn the standby failover thread.
+        let (standby_cert, standby_port) =
+            spawn_embedded_reverse_proxy_with_port(&primary_addr).unwrap();
+        assert_eq!(standby_port, primary_port);
+
+        // Now close the primary listener (simulating closing the ChatGPT Desktop app).
+        let _ = shutdown_tx.send(());
+        primary_handle.join().unwrap();
+
+        // Wait ~300ms for the 250ms standby failover thread to bind primary_addr and start serving.
+        thread::sleep(Duration::from_millis(320));
+        assert!(
+            verify_existing_tls_proxy_listener(&primary_addr, &standby_cert),
+            "standby failover thread must take over {} within ~300ms after primary listener exits",
+            primary_addr
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
