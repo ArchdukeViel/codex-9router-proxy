@@ -1,6 +1,6 @@
 [package]
 name = "codex-9router-proxy"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 authors = ["ArchdukeViel"]
 description = "High-performance transparent proxy bridge hooking OpenAI Codex Desktop & CLI to route subagents natively to 9Router or custom LLM endpoints."

@@ -339,7 +339,7 @@ $customShim = Join-Path $customDir "codex-9router-subagents.exe"
 $env:CODEX_CLI_PATH = $customShim
 Write-Host "[OK] Saved CODEX_CLI_PATH -> $customShim (User Environment)." -ForegroundColor Green
 
-# Ensure %LOCALAPPDATA%\OpenAI\Codex\custom is in User PATH so `codex --doctor` and `codex exec` work in all terminals
+# Ensure %LOCALAPPDATA%\OpenAI\Codex\custom is at index 0 of User PATH (ahead of Programs\OpenAI\Codex\bin and .cargo\bin)
 $normalizedCustomDir = $customDir.TrimEnd('\')
 $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
 $userPathEntries = if ([string]::IsNullOrWhiteSpace($userPath)) {
@@ -347,23 +347,20 @@ $userPathEntries = if ([string]::IsNullOrWhiteSpace($userPath)) {
 } else {
     @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
-$alreadyInUserPath = $false
-foreach ($entry in $userPathEntries) {
-    if ($entry.Trim().TrimEnd('\') -ieq $normalizedCustomDir) {
-        $alreadyInUserPath = $true
-        break
-    }
-}
-if (-not $alreadyInUserPath) {
-    $newUserPath = (@($customDir) + $userPathEntries) -join ';'
+$remainingUserPathEntries = @(
+    $userPathEntries | Where-Object { $_.Trim().TrimEnd('\') -ine $normalizedCustomDir }
+)
+$newUserPath = (@($customDir) + $remainingUserPathEntries) -join ';'
+if ($newUserPath -ne $userPath) {
     [System.Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
-    Write-Host "[OK] Added $customDir to Windows User PATH." -ForegroundColor Green
+    Write-Host "[OK] Placed $customDir at index 0 of Windows User PATH." -ForegroundColor Green
 } else {
-    Write-Host "[OK] $customDir is already in Windows User PATH." -ForegroundColor Green
+    Write-Host "[OK] $customDir is already at index 0 of Windows User PATH." -ForegroundColor Green
 }
-if (-not (($env:Path -split ';') | Where-Object { $_.Trim().TrimEnd('\') -ieq $normalizedCustomDir })) {
-    $env:Path = "$customDir;$env:Path"
-}
+$procPathEntries = @(
+    ($env:Path -split ';') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and ($_.Trim().TrimEnd('\') -ine $normalizedCustomDir) }
+)
+$env:Path = (@($customDir) + $procPathEntries) -join ';'
 
 $parsedPort = 0
 $userPortRaw = [System.Environment]::GetEnvironmentVariable("CODEX_PROXY_PORT", "User")
@@ -373,6 +370,12 @@ $proxyPort = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_PROXY_PORT) -and [
     $parsedPort
 } else {
     20129
+}
+
+function ConvertTo-TomlEscapedString {
+    param([string]$Value)
+    if ($null -eq $Value) { return "" }
+    return $Value.Replace('\', '\\').Replace('"', '\"')
 }
 
 # 3. Configure ~/.codex/config.toml (BOM-Free UTF-8)
@@ -387,16 +390,21 @@ $configContent = if (Test-Path $configFile) {
     ""
 }
 
+$escapedProvider = ConvertTo-TomlEscapedString $Provider
+$escapedEndpoint = ConvertTo-TomlEscapedString $Endpoint
+$escapedDefaultModel = ConvertTo-TomlEscapedString $DefaultModel
+$providerRegexKey = [regex]::Escape($Provider)
+
 # Update or insert [model_providers.<Provider>]
 $providerSection = @"
 [model_providers.$Provider]
-name = "$Provider"
-base_url = "$Endpoint"
+name = "$escapedProvider"
+base_url = "$escapedEndpoint"
 env_key = "NINEROUTER_KEY"
 "@
-$pattern = "(?ms)\[model_providers\.$Provider\].*?(?=\n\[|\z)"
+$pattern = "(?ms)\[model_providers\.$providerRegexKey\].*?(?=\n\[|\z)"
 if ($configContent -match $pattern) {
-    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $pattern, $providerSection.Trim())
+    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $pattern, { $providerSection.Trim() })
 } else {
     $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $providerSection.Trim() + "`r`n"
 }
@@ -404,14 +412,13 @@ if ($configContent -match $pattern) {
 # Ensure [agents] default_subagent_model is set
 $agentsSection = @"
 [agents]
-default_subagent_model = "$DefaultModel"
+default_subagent_model = "$escapedDefaultModel"
 "@
-$patternAgents = "(?ms)\[agents\].*?(?=\n\[|\z)"
 if ($configContent -match "(?m)^\[agents\]") {
     if ($configContent -match "(?m)^default_subagent_model\s*=") {
-        $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, "(?m)^default_subagent_model\s*=.*", "default_subagent_model = `"$DefaultModel`"")
+        $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, "(?m)^default_subagent_model\s*=.*", { "default_subagent_model = `"$escapedDefaultModel`"" })
     } else {
-        $configContent = $configContent -replace "\[agents\]", "[agents]`r`ndefault_subagent_model = `"$DefaultModel`""
+        $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, "(?m)^\[agents\]", { "[agents]`r`ndefault_subagent_model = `"$escapedDefaultModel`"" })
     }
 } else {
     $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $agentsSection.Trim() + "`r`n"
@@ -445,13 +452,18 @@ $roleConfigs = @{
 foreach ($roleName in $roleConfigs.Keys) {
     $roleInfo = $roleConfigs[$roleName]
     $roleTomlPath = (Join-Path $agentsDir "$roleName.toml") -replace "\\", "/"
-    
+    $escapedRoleName = ConvertTo-TomlEscapedString $roleName
+    $escapedRoleDesc = ConvertTo-TomlEscapedString $roleInfo.Desc
+    $escapedRoleModel = ConvertTo-TomlEscapedString $roleInfo.Model
+    $escapedRoleTomlPath = ConvertTo-TomlEscapedString $roleTomlPath
+    $roleRegexKey = [regex]::Escape($roleName)
+
     # Write ~/.codex/agents/<role>.toml
     $roleTomlContent = @"
-name = "$roleName"
-description = "$($roleInfo.Desc)"
-model = "$($roleInfo.Model)"
-model_provider = "$Provider"
+name = "$escapedRoleName"
+description = "$escapedRoleDesc"
+model = "$escapedRoleModel"
+model_provider = "$escapedProvider"
 model_reasoning_effort = "high"
 "@
     $targetToml = Join-Path $agentsDir "$roleName.toml"
@@ -460,12 +472,12 @@ model_reasoning_effort = "high"
     # Link in config.toml
     $roleBlock = @"
 [agents.$roleName]
-description = "$($roleInfo.Desc)"
-config_file = "$roleTomlPath"
+description = "$escapedRoleDesc"
+config_file = "$escapedRoleTomlPath"
 "@
-    $patternRole = "(?ms)\[agents\.$roleName\].*?(?=\n\[|\z)"
+    $patternRole = "(?ms)\[agents\.$roleRegexKey\].*?(?=\n\[|\z)"
     if ($configContent -match $patternRole) {
-        $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternRole, $roleBlock.Trim())
+        $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternRole, { $roleBlock.Trim() })
     } else {
         $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $roleBlock.Trim() + "`r`n"
     }
@@ -574,16 +586,30 @@ if (-not (Test-Path $releaseBinary)) {
 }
 Write-Host "[OK] Release binary ready ($((Get-Item $releaseBinary).Length) bytes)." -ForegroundColor Green
 
-# 6. Stop running codex processes, hidden-desktop ChatGPT.exe instances, and port listeners before hooking
+# 6. Stop running codex processes, hidden-desktop ChatGPT.exe instances, and verified port listeners before hooking
+$exactCodexProcessNames = @(
+    "codex",
+    "codex.orig",
+    "codex-9router-proxy",
+    "codex-9router-subagents",
+    "codex-9router-subagents.orig",
+    "codex-command-runner",
+    "codex-code-mode-host",
+    "codex-windows-sandbox-setup",
+    "codex-windows-sandbox-service"
+)
 Write-Host "[*] Checking for running codex processes..." -ForegroundColor Gray
 Clear-HiddenDesktopCodexGui
 Get-NetTCPConnection -LocalPort $proxyPort -ErrorAction SilentlyContinue | ForEach-Object {
     $procId = $_.OwningProcess
     if ($procId -gt 0 -and $procId -ne $PID) {
-        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+        $ownerProc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        if ($ownerProc -and ($exactCodexProcessNames -contains $ownerProc.Name -or $ownerProc.Name -like "codex*.old*")) {
+            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+        }
     }
 }
-Get-Process -Name "*codex*" -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID } | ForEach-Object {
+Get-Process -Name $exactCodexProcessNames -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID } | ForEach-Object {
     Write-Host "    Stopping process $($_.Name) (PID $($_.Id))..." -ForegroundColor Gray
     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
 }
@@ -624,24 +650,42 @@ function Safe-CopyExecutable {
     return $false
 }
 
-# Locate Microsoft Store package resources for stock codex.exe and companion helper binaries
-$storeResDir = $null
-$storePkg = Get-AppxPackage -Name "*OpenAI.Codex*" -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
-if ($storePkg -and $storePkg.InstallLocation) {
-    $candidateRes = Join-Path $storePkg.InstallLocation "app\resources"
-    if (Test-Path $candidateRes) {
-        $storeResDir = $candidateRes
+function Get-CodexStoreResourceDirectories {
+    $dirs = New-Object System.Collections.Generic.List[string]
+    $appModelKey = "HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"
+    if (Test-Path $appModelKey) {
+        Get-ChildItem -Path $appModelKey -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -like "OpenAI.Codex*" } |
+            Sort-Object PSChildName -Descending |
+            ForEach-Object {
+                $rootFolder = (Get-ItemProperty -Path $_.PSPath -Name "PackageRootFolder" -ErrorAction SilentlyContinue).PackageRootFolder
+                if ($rootFolder -and (Test-Path $rootFolder)) {
+                    $appRes = Join-Path $rootFolder "app\resources"
+                    if ((Test-Path $appRes) -and -not $dirs.Contains($appRes)) { $dirs.Add($appRes) }
+                    if (-not $dirs.Contains($rootFolder)) { $dirs.Add($rootFolder) }
+                }
+            }
     }
-}
-if (-not $storeResDir) {
-    $winAppsCandidate = Get-ChildItem "C:\Program Files\WindowsApps\OpenAI.Codex*" -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($winAppsCandidate) {
-        $candidateRes = Join-Path $winAppsCandidate.FullName "app\resources"
-        if (Test-Path $candidateRes) {
-            $storeResDir = $candidateRes
+    $storePkgs = Get-AppxPackage -Name "*OpenAI.Codex*" -ErrorAction SilentlyContinue | Sort-Object Version -Descending
+    foreach ($pkg in $storePkgs) {
+        if ($pkg.InstallLocation -and (Test-Path $pkg.InstallLocation)) {
+            $appRes = Join-Path $pkg.InstallLocation "app\resources"
+            if ((Test-Path $appRes) -and -not $dirs.Contains($appRes)) { $dirs.Add($appRes) }
+            if (-not $dirs.Contains($pkg.InstallLocation)) { $dirs.Add($pkg.InstallLocation) }
         }
     }
+    $winApps = Get-ChildItem "C:\Program Files\WindowsApps\OpenAI.Codex*" -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+    foreach ($wa in $winApps) {
+        $appRes = Join-Path $wa.FullName "app\resources"
+        if ((Test-Path $appRes) -and -not $dirs.Contains($appRes)) { $dirs.Add($appRes) }
+        if (-not $dirs.Contains($wa.FullName)) { $dirs.Add($wa.FullName) }
+    }
+    return $dirs
 }
+
+# Locate Microsoft Store package resources for stock codex.exe and companion helper binaries
+$storeCandidateDirs = Get-CodexStoreResourceDirectories
+$storeResDir = $storeCandidateDirs | Where-Object { Test-Path (Join-Path $_ "codex.exe") } | Select-Object -First 1
 
 # IMPORTANT: Do NOT include rg.exe in $binHelpers for OpenAI\Codex\bin\<hash>!
 # Electron's ripgrep relocation (an -> Tn) deletes any 16-hex-char directory under OpenAI\Codex\bin
@@ -750,7 +794,7 @@ if (Test-Path $desktopBinRoot) {
     }
 }
 
-# 8. Hook Daemon Binaries
+# 8. Hook Daemon Binaries, Standalone CLI (Programs\OpenAI\Codex\bin), and VS Code / Cursor / Windsurf Extensions
 $daemonReleases = Join-Path $codexDir "packages\app-server-daemon\releases"
 if (Test-Path $daemonReleases) {
     Get-ChildItem -Path $daemonReleases -Directory | ForEach-Object {
@@ -761,8 +805,8 @@ if (Test-Path $daemonReleases) {
         if ((Test-Path $codexExe) -or (Test-Path $codexOrig)) {
             if (Test-Path $codexExe) {
                 $len = (Get-Item $codexExe).Length
-                if ($len -gt 10000000 -and -not (Test-Path $codexOrig)) {
-                    Copy-Item -Path $codexExe -Destination $codexOrig -Force
+                if ($len -gt 10000000) {
+                    Safe-CopyExecutable -Source $codexExe -Destination $codexOrig | Out-Null
                     Write-Host "[OK] Backed up daemon binary to $codexOrig" -ForegroundColor Green
                 }
             }
@@ -774,7 +818,55 @@ if (Test-Path $daemonReleases) {
     }
 }
 
-# 9. Deploy Custom Standalone Copy & Synchronize Store Binaries
+$extraHookDirs = New-Object System.Collections.Generic.List[string]
+$standaloneCliBin = Join-Path $localAppData "Programs\OpenAI\Codex\bin"
+if (Test-Path $standaloneCliBin) {
+    $extraHookDirs.Add($standaloneCliBin)
+}
+foreach ($ideRoot in @(
+    (Join-Path $env:USERPROFILE ".vscode\extensions"),
+    (Join-Path $env:USERPROFILE ".vscode-insiders\extensions"),
+    (Join-Path $env:USERPROFILE ".cursor\extensions"),
+    (Join-Path $env:USERPROFILE ".windsurf\extensions")
+)) {
+    if (Test-Path $ideRoot) {
+        Get-ChildItem -Path $ideRoot -Directory -Filter "openai.chatgpt-*" -ErrorAction SilentlyContinue | ForEach-Object {
+            $extBin = Join-Path $_.FullName "bin\windows-x86_64"
+            if (Test-Path $extBin) { $extraHookDirs.Add($extBin) }
+            $extBinArm = Join-Path $_.FullName "bin\windows-aarch64"
+            if (Test-Path $extBinArm) { $extraHookDirs.Add($extBinArm) }
+        }
+    }
+}
+
+foreach ($hDir in $extraHookDirs) {
+    $cExe = Join-Path $hDir "codex.exe"
+    $cOrig = Join-Path $hDir "codex.orig.exe"
+    if ((Test-Path $cExe) -or (Test-Path $cOrig)) {
+        if (Test-Path $cExe) {
+            $cItem = Get-Item $cExe
+            if ($cItem.Length -gt 10000000) {
+                $needsBackup = (-not (Test-Path $cOrig))
+                if (-not $needsBackup) {
+                    $oItem = Get-Item $cOrig
+                    if (($oItem.Length -ne $cItem.Length) -or ($oItem.LastWriteTimeUtc -ne $cItem.LastWriteTimeUtc)) {
+                        $needsBackup = $true
+                    }
+                }
+                if ($needsBackup) {
+                    Safe-CopyExecutable -Source $cExe -Destination $cOrig | Out-Null
+                    Write-Host "[OK] Backed up official binary to $cOrig" -ForegroundColor Green
+                }
+            }
+        }
+        if (Safe-CopyExecutable -Source $releaseBinary -Destination $cExe) {
+            Write-Host "[OK] Installed proxy hook to $cExe" -ForegroundColor Green
+            $hookedCount++
+        }
+    }
+}
+
+# 9. Deploy Custom Standalone Copy & Synchronize Store / Local Stock Binaries
 $customDir = Join-Path $localAppData "OpenAI\Codex\custom"
 if (-not (Test-Path $customDir)) {
     New-Item -ItemType Directory -Path $customDir -Force | Out-Null
@@ -807,9 +899,9 @@ if ($storeResDir -and (Test-Path (Join-Path $storeResDir "codex.exe"))) {
         }
     }
     foreach ($helper in $customHelpers) {
-        $hSrc = Join-Path $storeResDir $helper
+        $hSrc = $storeCandidateDirs | ForEach-Object { Join-Path $_ $helper } | Where-Object { Test-Path $_ } | Select-Object -First 1
         $hDst = Join-Path $customDir $helper
-        if (Test-Path $hSrc) {
+        if ($hSrc -and (Test-Path $hSrc)) {
             $srcItem = Get-Item $hSrc
             $needsHelperSync = (-not (Test-Path $hDst))
             if (-not $needsHelperSync) {
@@ -826,11 +918,13 @@ if ($storeResDir -and (Test-Path (Join-Path $storeResDir "codex.exe"))) {
         }
     }
 } else {
-    # Non-Microsoft-Store fallback: locate stock codex.exe (> 10 MB) from desktop bin, custom/*.orig.exe, daemon releases, or Programs
-    $fallbackStockItem = $null
+    # Non-Microsoft-Store fallback: locate stock codex.exe (> 10 MB) from desktop bin, custom/*.orig.exe, daemon releases, Programs, or IDE extensions
     $fallbackCandidates = @()
     if (Test-Path $desktopBinRoot) {
         $fallbackCandidates += Get-ChildItem -Path "$desktopBinRoot\*\codex.orig.exe", "$desktopBinRoot\*\codex.exe" -File -ErrorAction SilentlyContinue
+    }
+    foreach ($ehDir in $extraHookDirs) {
+        $fallbackCandidates += Get-ChildItem -Path "$ehDir\codex.orig.exe", "$ehDir\codex.exe" -File -ErrorAction SilentlyContinue
     }
     if (Test-Path $customDir) {
         $fallbackCandidates += Get-ChildItem -Path "$customDir\codex.orig.exe", "$customDir\codex-9router-subagents.orig.exe" -File -ErrorAction SilentlyContinue
@@ -838,16 +932,19 @@ if ($storeResDir -and (Test-Path (Join-Path $storeResDir "codex.exe"))) {
     if (Test-Path $daemonReleases) {
         $fallbackCandidates += Get-ChildItem -Path "$daemonReleases\*\bin\codex.orig.exe", "$daemonReleases\*\bin\codex.exe" -File -ErrorAction SilentlyContinue
     }
-    $progCodex = Join-Path $localAppData "Programs\OpenAI\Codex\bin\codex.exe"
-    if (Test-Path $progCodex) {
-        $fallbackCandidates += Get-Item $progCodex -ErrorAction SilentlyContinue
-    }
     $fallbackStockItem = $fallbackCandidates | Where-Object { $_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     if ($fallbackStockItem) {
         $stockDir = $fallbackStockItem.DirectoryName
         foreach ($origName in @("codex-9router-subagents.orig.exe", "codex.orig.exe")) {
             $origDst = Join-Path $customDir $origName
-            if (($fallbackStockItem.FullName -ne $origDst) -and ((-not (Test-Path $origDst)) -or ((Get-Item $origDst).Length -lt 10000000))) {
+            $needsSync = (-not (Test-Path $origDst))
+            if (-not $needsSync) {
+                $dstItem = Get-Item $origDst
+                if (($dstItem.Length -lt 10000000) -or ($dstItem.Length -ne $fallbackStockItem.Length) -or ($dstItem.LastWriteTimeUtc -lt $fallbackStockItem.LastWriteTimeUtc)) {
+                    $needsSync = $true
+                }
+            }
+            if (($fallbackStockItem.FullName -ne $origDst) -and $needsSync) {
                 if (Safe-CopyExecutable -Source $fallbackStockItem.FullName -Destination $origDst) {
                     Write-Host "[OK] Synchronized $origName from local stock binary ($($fallbackStockItem.Length) bytes)." -ForegroundColor Green
                 }
@@ -856,8 +953,16 @@ if ($storeResDir -and (Test-Path (Join-Path $storeResDir "codex.exe"))) {
         foreach ($helper in $customHelpers) {
             $hSrc = Join-Path $stockDir $helper
             $hDst = Join-Path $customDir $helper
-            if ((Test-Path $hSrc) -and ($hSrc -ne $hDst) -and -not (Test-Path $hDst)) {
-                if (Safe-CopyExecutable -Source $hSrc -Destination $hDst) {
+            if ((Test-Path $hSrc) -and ($hSrc -ne $hDst)) {
+                $srcItem = Get-Item $hSrc
+                $needsHelperSync = (-not (Test-Path $hDst))
+                if (-not $needsHelperSync) {
+                    $dstItem = Get-Item $hDst
+                    if (($dstItem.Length -ne $srcItem.Length) -or ($dstItem.LastWriteTimeUtc -lt $srcItem.LastWriteTimeUtc)) {
+                        $needsHelperSync = $true
+                    }
+                }
+                if ($needsHelperSync -and (Safe-CopyExecutable -Source $hSrc -Destination $hDst)) {
                     Write-Host "[OK] Synchronized helper $helper to $customDir." -ForegroundColor Green
                 }
             }
@@ -919,7 +1024,7 @@ function Sync-Executable {
     }
 }
 
-# 1. Ensure CODEX_CLI_PATH User environment override points to our custom shim
+# 1. Ensure CODEX_CLI_PATH User environment override and User PATH index-0 priority point to our custom shim
 if (Test-Path `$proxyPath) {
     `$curCli = [System.Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'User')
     if (`$curCli -ne `$proxyPath) {
@@ -929,23 +1034,77 @@ if (Test-Path `$proxyPath) {
     if ((-not (Test-Path `$customCodex)) -or ((Get-Item `$customCodex).Length -ne (Get-Item `$proxyPath).Length) -or ((Get-FileHash `$customCodex -Algorithm SHA256).Hash -ne (Get-FileHash `$proxyPath -Algorithm SHA256).Hash)) {
         Sync-Executable -Source `$proxyPath -Destination `$customCodex | Out-Null
     }
-}
-
-# 2. Locate latest Microsoft Store OpenAI.Codex app\resources directory
-`$pkg = Get-AppxPackage -Name '*OpenAI.Codex*' | Sort-Object Version -Descending | Select-Object -First 1
-`$resDir = if (`$pkg -and `$pkg.InstallLocation) { Join-Path `$pkg.InstallLocation 'app\resources' } else { `$null }
-if (-not `$resDir -or -not (Test-Path `$resDir)) {
-    `$wa = Get-ChildItem 'C:\Program Files\WindowsApps\OpenAI.Codex*' -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (`$wa) {
-        `$cand = Join-Path `$wa.FullName 'app\resources'
-        if (Test-Path `$cand) { `$resDir = `$cand }
+    `$normCustom = `$customDir.TrimEnd('\')
+    `$uPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+    `$uEntries = if (`$uPath) { @(`$uPath -split ';' | Where-Object { `$_.Trim() }) } else { @() }
+    if (`$uEntries.Count -eq 0 -or (`$uEntries[0].Trim().TrimEnd('\') -ine `$normCustom)) {
+        `$rest = @(`$uEntries | Where-Object { `$_.Trim().TrimEnd('\') -ine `$normCustom })
+        [System.Environment]::SetEnvironmentVariable('Path', ((@(`$customDir) + `$rest) -join ';'), 'User')
     }
 }
+
+# 2. Locate latest Microsoft Store OpenAI.Codex & OpenAI.CodexPrimaryRuntime resource directories
+`$candDirs = New-Object System.Collections.Generic.List[string]
+`$appModelKey = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages'
+if (Test-Path `$appModelKey) {
+    Get-ChildItem -Path `$appModelKey | Where-Object { `$_.PSChildName -like 'OpenAI.Codex*' } | Sort-Object PSChildName -Descending | ForEach-Object {
+        `$rf = (Get-ItemProperty -Path `$_.PSPath -Name 'PackageRootFolder').PackageRootFolder
+        if (`$rf -and (Test-Path `$rf)) {
+            `$ar = Join-Path `$rf 'app\resources'
+            if ((Test-Path `$ar) -and -not `$candDirs.Contains(`$ar)) { `$candDirs.Add(`$ar) }
+            if (-not `$candDirs.Contains(`$rf)) { `$candDirs.Add(`$rf) }
+        }
+    }
+}
+Get-AppxPackage -Name '*OpenAI.Codex*' | Sort-Object Version -Descending | ForEach-Object {
+    if (`$_.InstallLocation -and (Test-Path `$_.InstallLocation)) {
+        `$ar = Join-Path `$_.InstallLocation 'app\resources'
+        if ((Test-Path `$ar) -and -not `$candDirs.Contains(`$ar)) { `$candDirs.Add(`$ar) }
+        if (-not `$candDirs.Contains(`$_.InstallLocation)) { `$candDirs.Add(`$_.InstallLocation) }
+    }
+}
+`$resDir = `$candDirs | Where-Object { Test-Path (Join-Path `$_ 'codex.exe') } | Select-Object -First 1
 
 `$binHelpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe')
 `$customHelpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe', 'rg.exe')
 
-# 3. Refresh custom\codex.orig.exe, custom\codex-9router-subagents.orig.exe, and custom\ helpers when MS Store package updates (or fallback to local stock binary)
+# 3. Hook Standalone CLI (Programs\OpenAI\Codex\bin) and VS Code / Cursor / Windsurf Extensions on update
+`$extraDirs = New-Object System.Collections.Generic.List[string]
+`$progBin = Join-Path `$env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin'
+if (Test-Path `$progBin) { `$extraDirs.Add(`$progBin) }
+foreach (`$ideRoot in @(
+    (Join-Path `$env:USERPROFILE '.vscode\extensions'),
+    (Join-Path `$env:USERPROFILE '.vscode-insiders\extensions'),
+    (Join-Path `$env:USERPROFILE '.cursor\extensions'),
+    (Join-Path `$env:USERPROFILE '.windsurf\extensions')
+)) {
+    if (Test-Path `$ideRoot) {
+        Get-ChildItem -Path `$ideRoot -Directory -Filter 'openai.chatgpt-*' | ForEach-Object {
+            `$eb = Join-Path `$_.FullName 'bin\windows-x86_64'
+            if (Test-Path `$eb) { `$extraDirs.Add(`$eb) }
+            `$eba = Join-Path `$_.FullName 'bin\windows-aarch64'
+            if (Test-Path `$eba) { `$extraDirs.Add(`$eba) }
+        }
+    }
+}
+if (Test-Path `$proxyPath) {
+    `$proxyLen = (Get-Item `$proxyPath).Length
+    foreach (`$ed in `$extraDirs) {
+        `$ce = Join-Path `$ed 'codex.exe'
+        `$co = Join-Path `$ed 'codex.orig.exe'
+        if (Test-Path `$ce) {
+            `$ci = Get-Item `$ce
+            if (`$ci.Length -gt 10000000) {
+                Sync-Executable -Source `$ce -Destination `$co | Out-Null
+            }
+            if (`$ci.Length -ne `$proxyLen) {
+                Sync-Executable -Source `$proxyPath -Destination `$ce | Out-Null
+            }
+        }
+    }
+}
+
+# 4. Refresh custom\codex.orig.exe, custom\codex-9router-subagents.orig.exe, and custom\ helpers when MS Store or CLI updates
 if (`$resDir -and (Test-Path (Join-Path `$resDir 'codex.exe'))) {
     `$storeCodex = Join-Path `$resDir 'codex.exe'
     `$storeItem = Get-Item `$storeCodex
@@ -956,9 +1115,9 @@ if (`$resDir -and (Test-Path (Join-Path `$resDir 'codex.exe'))) {
         }
     }
     foreach (`$h in `$customHelpers) {
-        `$hs = Join-Path `$resDir `$h
+        `$hs = `$candDirs | ForEach-Object { Join-Path `$_ `$h } | Where-Object { Test-Path `$_ } | Select-Object -First 1
         `$hd = Join-Path `$customDir `$h
-        if (Test-Path `$hs) {
+        if (`$hs -and (Test-Path `$hs)) {
             `$hItem = Get-Item `$hs
             if ((-not (Test-Path `$hd)) -or ((Get-Item `$hd).Length -ne `$hItem.Length) -or ((Get-Item `$hd).LastWriteTimeUtc -ne `$hItem.LastWriteTimeUtc)) {
                 Sync-Executable -Source `$hs -Destination `$hd | Out-Null
@@ -970,35 +1129,34 @@ if (`$resDir -and (Test-Path (Join-Path `$resDir 'codex.exe'))) {
     if (Test-Path `$binRoot) {
         `$fbCandidates += Get-ChildItem -Path "`$binRoot\*\codex.orig.exe", "`$binRoot\*\codex.exe" -File
     }
+    foreach (`$ed in `$extraDirs) {
+        `$fbCandidates += Get-ChildItem -Path "`$ed\codex.orig.exe", "`$ed\codex.exe" -File
+    }
     if (Test-Path `$customDir) {
         `$fbCandidates += Get-ChildItem -Path "`$customDir\codex.orig.exe", "`$customDir\codex-9router-subagents.orig.exe" -File
     }
     if (Test-Path `$daemonReleases) {
         `$fbCandidates += Get-ChildItem -Path "`$daemonReleases\*\bin\codex.orig.exe", "`$daemonReleases\*\bin\codex.exe" -File
     }
-    `$progCodex = Join-Path `$env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin\codex.exe'
-    if (Test-Path `$progCodex) {
-        `$fbCandidates += Get-Item `$progCodex
-    }
     `$fbStock = `$fbCandidates | Where-Object { `$_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     if (`$fbStock) {
         foreach (`$origName in @('codex-9router-subagents.orig.exe', 'codex.orig.exe')) {
             `$origDst = Join-Path `$customDir `$origName
-            if ((`$fbStock.FullName -ne `$origDst) -and ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -lt 10000000))) {
+            if ((`$fbStock.FullName -ne `$origDst) -and ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -lt 10000000) -or ((Get-Item `$origDst).Length -ne `$fbStock.Length))) {
                 Sync-Executable -Source `$fbStock.FullName -Destination `$origDst | Out-Null
             }
         }
         foreach (`$h in `$customHelpers) {
             `$hs = Join-Path `$fbStock.DirectoryName `$h
             `$hd = Join-Path `$customDir `$h
-            if ((Test-Path `$hs) -and (`$hs -ne `$hd) -and -not (Test-Path `$hd)) {
+            if ((Test-Path `$hs) -and (`$hs -ne `$hd) -and ((-not (Test-Path `$hd)) -or ((Get-Item `$hd).Length -ne (Get-Item `$hs).Length))) {
                 Sync-Executable -Source `$hs -Destination `$hd | Out-Null
             }
         }
     }
 }
 
-# 4. Keep bin\<hash>\codex.exe as the unmodified stock binary so Electron never deletes bin\<hash>
+# 5. Keep bin\<hash>\codex.exe as the unmodified stock binary so Electron never deletes bin\<hash>
 if (Test-Path `$binRoot) {
     Get-ChildItem -Path `$binRoot -Directory | ForEach-Object {
         `$c = Join-Path `$_.FullName 'codex.exe'
@@ -1024,9 +1182,9 @@ if (Test-Path `$binRoot) {
             }
             if (`$resDir -and (Test-Path `$resDir)) {
                 foreach (`$h in `$binHelpers) {
-                    `$hs = Join-Path `$resDir `$h
+                    `$hs = `$candDirs | ForEach-Object { Join-Path `$_ `$h } | Where-Object { Test-Path `$_ } | Select-Object -First 1
                     `$hd = Join-Path `$_.FullName `$h
-                    if ((Test-Path `$hs) -and -not (Test-Path `$hd)) {
+                    if (`$hs -and (Test-Path `$hs) -and -not (Test-Path `$hd)) {
                         Sync-Executable -Source `$hs -Destination `$hd | Out-Null
                     }
                 }
@@ -1035,8 +1193,8 @@ if (Test-Path `$binRoot) {
     }
 }
 
-# 5. Terminate any stale .old.* processes, hidden-desktop ChatGPT.exe instances, and clean up leftover .old.* / lockfile files
-Get-Process -Name '*.old*' | Stop-Process -Force
+# 6. Terminate any stale .old.* processes, hidden-desktop ChatGPT.exe instances, and clean up leftover .old.* / lockfile files
+Get-Process | Where-Object { `$_.Name -like 'codex*.old*' -or (`$_.Path -and (`$_.Path -like '*\OpenAI\Codex\*.old.*' -or `$_.Path -like '*\openai.chatgpt-*\*.old.*')) } | Stop-Process -Force
 Get-ChildItem "`$binRoot\*\*.old.*", "`$customDir\*.old.*" | Remove-Item -Force
 
 `$chatGptPids = [int[]]@(Get-Process -Name 'ChatGPT*' | Select-Object -ExpandProperty Id)
@@ -1086,11 +1244,11 @@ Write-Host "[OK] Registered self-healing startup hook in $startupCmd." -Foregrou
 # 11. Terminate any stale .old.* processes that respawned during copy and clean up .old.* files
 Get-NetTCPConnection -LocalPort $proxyPort -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
     $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
-    if ($p -and ($p.Name -like "*.old*" -or $p.Path -like "*.old.*")) {
+    if ($p -and ($p.Name -like "codex*.old*" -or ($p.Path -and ($p.Path -like "*\OpenAI\Codex\*.old.*" -or $p.Path -like "*\openai.chatgpt-*\*.old.*")))) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     }
 }
-Get-Process -Name "*.old*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "codex*.old*" -or ($_.Path -and ($_.Path -like "*\OpenAI\Codex\*.old.*" -or $_.Path -like "*\openai.chatgpt-*\*.old.*")) } | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 600
 Get-ChildItem "$desktopBinRoot\*\*.old.*", "$customDir\*.old.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 

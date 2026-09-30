@@ -68,13 +68,13 @@ When using the official OpenAI Codex Desktop App signed into a personal or Pro C
 
 ## 🖥️ Tested Environment & Version Compatibility Matrix
 
-`codex-9router-proxy` `v0.2.5` is developed and verified against the following environment:
+`codex-9router-proxy` `v0.2.6` is developed and verified against the following environment:
 
 | Component | Verified Version | Notes |
 | :--- | :--- | :--- |
 | **Operating System** | **Windows 11 Pro** (`10.0.26200` / Build `26200`) | Compatible with Windows 10 & Windows 11 (`x86_64`) |
-| **OpenAI Codex Desktop App** | **`26.924.1866.0`** ([Microsoft Store `OpenAI.Codex`](https://apps.microsoft.com/detail/9mz1741s0917)) | Uses `CODEX_CLI_PATH` override; auto-syncs across Store updates |
-| **OpenAI Codex CLI Engine** | **`codex-cli 0.158.0-alpha.2`** | Bundled Desktop engine & standalone CLI (`app-server` & `exec`) |
+| **OpenAI Codex Desktop App** | **`26.929.21022.0`** ([Microsoft Store `OpenAI.Codex` & `OpenAI.CodexPrimaryRuntime`](https://apps.microsoft.com/detail/9mz1741s0917)) | Uses `CODEX_CLI_PATH` override; auto-heals across Store & split-runtime updates |
+| **OpenAI Codex CLI Engine** | **`codex-cli 0.159.0-alpha.4`** (`0.158.0-alpha.2+`) | Bundled Desktop engine, standalone CLI (`Programs\OpenAI\Codex\bin`), & VS Code extension |
 | **Primary ChatGPT Session** | **`gpt-6-luna`** (ChatGPT Plus / Pro Account) | Direct pass-through to `https://chatgpt.com` |
 | **9Router** | **`0.5.91`** (`npm i -g 9router@latest`) | Default subagent endpoint (`http://localhost:20128/v1`) |
 | **PowerShell** | **PowerShell `7.6.6`** & **Windows PowerShell `5.1`** | Both `pwsh.exe` and built-in `powershell.exe` supported |
@@ -346,11 +346,11 @@ Diagnostics complete. All checks finished.
 
 ---
 
-## 🔄 Self-Healing Microsoft Store Updates
+## 🔄 Self-Healing Microsoft Store, CLI & VS Code Updates
 
-Because `OpenAI.Codex` (`26.924.1866.0` `app.asar`) checks the exact byte size and SHA-256 of `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe` and deletes `bin\<hash>` if modified—while checking `process.env.CODEX_CLI_PATH` (`source=override`) first:
-- `install.ps1` sets `CODEX_CLI_PATH = "%LOCALAPPDATA%\OpenAI\Codex\custom\codex-9router-subagents.exe"` in your Windows User environment (`HKCU\Environment`) and leaves `bin\<hash>\codex.exe` completely untouched as the stock Microsoft Store binary.
-- The installer registers a lightweight Windows Startup Hook (`Codex9RouterHookSync.cmd` $\rightarrow$ `%LOCALAPPDATA%\OpenAI\Codex\custom\hook-sync.ps1`) that runs at logon and automatically refreshes `custom\codex.orig.exe`, `custom\codex-9router-subagents.orig.exe`, and companion helpers (`codex-command-runner.exe`, `codex-windows-sandbox-setup.exe`, `codex-windows-sandbox-service.exe`, `codex-code-mode-host.exe`, `rg.exe`) whenever the Microsoft Store `OpenAI.Codex` package updates in `C:\Program Files\WindowsApps\OpenAI.Codex*\app\resources`.
+Because `OpenAI.Codex` (`26.929.21022.0` `app.asar`) checks the exact byte size and SHA-256 of `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe` and deletes `bin\<hash>` if modified—while checking `process.env.CODEX_CLI_PATH` (`source=override`) first:
+- `install.ps1` sets `CODEX_CLI_PATH = "%LOCALAPPDATA%\OpenAI\Codex\custom\codex-9router-subagents.exe"` in your Windows User environment (`HKCU\Environment`), prepends `%LOCALAPPDATA%\OpenAI\Codex\custom` to index `0` of your User `Path`, hooks standalone CLI (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`) and VS Code / Cursor / Windsurf (`openai.chatgpt-*`) extension binaries, and leaves `bin\<hash>\codex.exe` completely untouched as the stock Microsoft Store binary.
+- Both `codex-9router-proxy.exe` (in-process on every startup and `--doctor`) and the Windows Startup Hook (`Codex9RouterHookSync.cmd` $\rightarrow$ `%LOCALAPPDATA%\OpenAI\Codex\custom\hook-sync.ps1`) automatically discover `OpenAI.Codex*` and split-runtime `OpenAI.CodexPrimaryRuntime*` packages via `HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages` (`PackageRootFolder`) and refresh `custom\codex.orig.exe`, `custom\codex-9router-subagents.orig.exe`, companion helpers (`codex-command-runner.exe`, `codex-windows-sandbox-setup.exe`, `codex-windows-sandbox-service.exe`, `codex-code-mode-host.exe`, `rg.exe`), and hooked CLI/extension shims whenever Microsoft Store, CLI, or extension updates occur.
 
 ---
 
@@ -381,13 +381,14 @@ codex --version
 
 ---
 
-## 📦 What's New in `v0.2.5`
+## 📦 What's New in `v0.2.6`
 
-- **Subagent Remote-Compaction via 9Router + Deterministic Local Fallback (`"generate": false` & `x-codex-turn-metadata`)**: Intercepts subagent `/responses` remote-compaction requests (detected via HTTP header `x-codex-turn-metadata` `"request_kind": "compaction"` / `"compaction"` or JSON body `"generate": false`), strips `x-codex-turn-metadata` before forwarding, transforms them into 9Router summarization requests, extracts the assistant summary (or falls back to a deterministic local summary constructed from `"input"`), and returns a valid `text/event-stream` SSE sequence (`response.created`, `response.output_item.done` with `"type": "compaction"` and `"encrypted_content"`, and `response.completed`) strictly without routing subagent requests to ChatGPT.
-- **Compaction Checkpoint Rehydration (`"type": "compaction"`)**: Rehydrates `"type": "compaction"` items in `"input"` into standard `"type": "message"` (`"role": "user"`) items prefixed with `[Compacted Conversation Summary]` inside `sanitize_subagent_request_for_9router` so 9Router retains compacted context on subsequent turns.
-- **`gpt-6-luna` Metadata Alignment (`872k` Context Window) & `models_cache.json` In-Place Sync**: Aligns injected subagent model metadata (`context_window: 872000`, `max_context_window: 872000`, `effective_context_window_percent: 95`, `comp_hash: "3000"`) with `gpt-6-luna`, updates existing entries in place, and synchronizes `~/.codex/models_cache.json` on startup, `--doctor`, and installation so subagent forks never trigger false `model_downshift` or `comp_hash_changed` compactions.
-- **Hidden-Desktop (`exebox-*`) GUI Self-Healing**: Automatically detects and terminates `ChatGPT.exe` instances stranded on hidden sandbox desktops (`exebox-*`) while preserving visible `WinSta0\Default` windows.
-- **Upstream Connection Resilience & Full `Error::source()` Diagnostics**: Includes a 10-second connect timeout, automatic retry on transient socket errors, and full `Error::source()` diagnostic chains (`[connect]`, `[timeout]`, `[dns]`).
+- **In-Process & Multi-Surface Binary Self-Healing (`sync_custom_codex_binaries` & `discover_codex_appmodel_packages`)**: Automatically discovers Microsoft Store `OpenAI.Codex*` and split-runtime `OpenAI.CodexPrimaryRuntime*` packages via `HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages` (`PackageRootFolder`), `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>`, standalone CLI (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`), and VS Code / Cursor / Windsurf (`openai.chatgpt-*`) extension directories on startup and `--doctor`, keeping `custom\codex-9router-subagents.orig.exe`, `custom\codex.orig.exe`, companion helpers, and hooked CLI/extension shims synchronized across Store and CLI updates.
+- **User `Path` Precedence & Multi-Surface Hooking (`install.ps1`, `hook-sync.ps1`)**: Prepends `%LOCALAPPDATA%\OpenAI\Codex\custom` at index `0` of the User `Path` (ahead of `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`), hooks standalone CLI and VS Code extension binaries with `codex.orig.exe` backups, and prioritizes `> 10 MB` stock binaries sorted by newest modification time in `pick_best_orig_candidate` / `find_real_codex`.
+- **Active TLS Reverse-Proxy Health Probe (`verify_existing_tls_proxy_listener`)**: Performs a live TLS + HTTP health probe against `https://127.0.0.1:20129/backend-api/codex/models` using the local `bridge-cert.pem` CA when port `20129` is already bound (`AddrInUse`), distinguishing a healthy `codex-9router-proxy` listener from an unrelated process occupying the port.
+- **Atomic File Locking & Retry Backoff (`models_cache.json` & `state_5.sqlite`)**: Adds a cross-process lockfile guard (`models_cache.json.proxy.lock`) with stale-lock expiration and atomic `.tmp.<pid>` rename in `sync_models_cache_file`, plus multi-attempt retry backoff in `ensure_sqlite_trigger` so concurrent CLI/Desktop invocations never fail under `SQLITE_BUSY` or file contention.
+- **Dynamic Package Family Name (`PFN`) & Nickname Role Inference Hardening**: Dynamically resolves the `OpenAI.Codex_*` Package Family Name when launching the Desktop GUI via `shell:AppsFolder\<PFN>!App`, and restricts `extract_role_from_nickname` strictly to bare role names (`worker`, `explorer`, `reviewer`, `default`) and `/root/<role>` paths.
+- **Installer & Uninstaller Process/TOML Safety (`install.ps1`, `uninstall.ps1`)**: Replaces broad `*codex*` and `*.old*` wildcard process termination with an exact Codex binary allowlist and port-owner verification, escapes regex replacement values with `ConvertTo-TomlEscapedString` + `[regex]::Escape(...)` and scriptblock evaluators, and cleans up managed `config.toml` sections, `agents\*.toml`, injected `models_cache.json` entries, and `%LOCALAPPDATA%\OpenAI\Codex\custom` on uninstall.
 
 ---
 

@@ -89,15 +89,19 @@ fn parse_toml_key_value(line: &str) -> Option<(String, String)> {
 }
 
 /// Check if a model identifier is a stock OpenAI / ChatGPT parent model
-/// (`gpt-*`, `o1*`, `o3*`, `o4*`, `chatgpt*`, `codex-*`).
+/// (`gpt-*`, `o1*`..`o9*`, `chatgpt*`, `codex-*`, `computer-use*`).
 pub fn is_parent_chatgpt_model(model: &str) -> bool {
     let lower = model.trim().to_ascii_lowercase();
+    let is_o_series = lower.starts_with('o')
+        && lower
+            .as_bytes()
+            .get(1)
+            .is_some_and(|b| b.is_ascii_digit());
     lower.starts_with("gpt-")
-        || lower.starts_with("o1")
-        || lower.starts_with("o3")
-        || lower.starts_with("o4")
+        || is_o_series
         || lower.starts_with("chatgpt")
         || lower.starts_with("codex-")
+        || lower.starts_with("computer-use")
 }
 
 /// Parse top-level `model = "..."` from a role manifest file (`~/.codex/agents/<role>.toml`).
@@ -255,6 +259,30 @@ pub fn read_provider_for_role_from_config_in_dir(
         }
     }
 
+    let agents_dir = codex_home.join("agents");
+    if let Ok(entries) = fs::read_dir(&agents_dir) {
+        let mut custom_files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("toml")))
+            .collect();
+        custom_files.sort();
+        for role_file in custom_files {
+            if let Ok(content) = fs::read_to_string(&role_file) {
+                if let Some(p) = parse_provider_from_role_toml(&content) {
+                    if !p.is_empty() && !p.eq_ignore_ascii_case("openai") {
+                        if !p.eq_ignore_ascii_case("9router") {
+                            return Some(p);
+                        }
+                        if first_role_provider.is_none() {
+                            first_role_provider = Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let config_path = codex_home.join("config.toml");
     if let Ok(content) = fs::read_to_string(&config_path) {
         if let Some(cfg_prov) = parse_provider_from_config_toml(&content) {
@@ -295,6 +323,116 @@ pub fn read_primary_model_from_config_in_dir(codex_home: &Path) -> Option<String
 pub fn read_primary_model_from_config() -> Option<String> {
     let codex_home = get_codex_home_dir()?;
     read_primary_model_from_config_in_dir(&codex_home)
+}
+
+/// Parse all subagent model values from `[subagent_models]` and `[agents].default_subagent_model` in `config.toml`.
+pub fn parse_all_subagent_models_from_config_toml(content: &str) -> Vec<String> {
+    let mut in_subagent_models = false;
+    let mut in_agents = false;
+    let mut models = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section = trimmed.trim_matches(|c| c == '[' || c == ']').trim();
+            if section.eq_ignore_ascii_case("subagent_models") {
+                in_subagent_models = true;
+                in_agents = false;
+            } else if section.eq_ignore_ascii_case("agents") {
+                in_agents = true;
+                in_subagent_models = false;
+            } else {
+                in_subagent_models = false;
+                in_agents = false;
+            }
+            continue;
+        }
+        if in_subagent_models {
+            if let Some((_k, v)) = parse_toml_key_value(trimmed) {
+                let m = v.trim();
+                if !m.is_empty()
+                    && !is_parent_chatgpt_model(m)
+                    && !models.iter().any(|existing: &String| existing.eq_ignore_ascii_case(m))
+                {
+                    models.push(m.to_string());
+                }
+            }
+        } else if in_agents {
+            if let Some((k, v)) = parse_toml_key_value(trimmed) {
+                if k.eq_ignore_ascii_case("default_subagent_model") {
+                    let m = v.trim();
+                    if !m.is_empty()
+                        && !is_parent_chatgpt_model(m)
+                        && !models.iter().any(|existing: &String| existing.eq_ignore_ascii_case(m))
+                    {
+                        models.push(m.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    models
+}
+
+/// Collect all configured subagent models across standard roles, custom `<codex_home>/agents/*.toml` manifests,
+/// and `<codex_home>/config.toml` (`[subagent_models]` & `default_subagent_model`).
+pub fn collect_configured_subagent_models_in_dir(codex_home: Option<&Path>) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    let mut push_unique = |m: String| {
+        let trimmed = m.trim();
+        if !trimmed.is_empty()
+            && !is_parent_chatgpt_model(trimmed)
+            && !models
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+        {
+            models.push(trimmed.to_string());
+        }
+    };
+
+    for role in ["default", "worker", "explorer", "reviewer"] {
+        if let Some(dir) = codex_home {
+            if let Some(m) = read_model_from_config_in_dir(dir, role) {
+                push_unique(m);
+            }
+        }
+        push_unique(map_role_to_model(Some(role)));
+    }
+
+    if let Some(dir) = codex_home {
+        let agents_dir = dir.join("agents");
+        if let Ok(entries) = fs::read_dir(&agents_dir) {
+            let mut toml_files: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+                })
+                .collect();
+            toml_files.sort();
+            for path in toml_files {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Some(m) = parse_model_from_role_toml(&content) {
+                        push_unique(m);
+                    }
+                }
+            }
+        }
+        let config_path = dir.join("config.toml");
+        if let Ok(content) = fs::read_to_string(&config_path) {
+            for m in parse_all_subagent_models_from_config_toml(&content) {
+                push_unique(m);
+            }
+        }
+    }
+
+    models
 }
 
 /// Parse `[subagent_models]` or `[agents].default_subagent_model` from TOML text.
@@ -800,8 +938,11 @@ pub fn contains_subagent_source(v: &Value) -> bool {
     }
 }
 
-/// Retrieve the configured target model provider for an optional subagent role (defaults to "9router").
-pub fn get_target_model_provider_for_role(role: Option<&str>) -> String {
+/// Retrieve the configured target model provider for an optional subagent role inside an explicit `<codex_home>` (defaults to "9router").
+pub fn get_target_model_provider_for_role_in_dir(
+    codex_home: Option<&Path>,
+    role: Option<&str>,
+) -> String {
     let proc_val = env::var("CODEX_SUBAGENT_PROVIDER")
         .ok()
         .map(|s| s.trim().to_string())
@@ -817,8 +958,8 @@ pub fn get_target_model_provider_for_role(role: Option<&str>) -> String {
         }
     }
 
-    if let Some(codex_home) = get_codex_home_dir() {
-        if let Some(cfg_prov) = read_provider_for_role_from_config_in_dir(&codex_home, role) {
+    if let Some(dir) = codex_home {
+        if let Some(cfg_prov) = read_provider_for_role_from_config_in_dir(dir, role) {
             return cfg_prov;
         }
     }
@@ -834,6 +975,12 @@ pub fn get_target_model_provider_for_role(role: Option<&str>) -> String {
     }
 
     "9router".to_string()
+}
+
+/// Retrieve the configured target model provider for an optional subagent role (defaults to "9router").
+pub fn get_target_model_provider_for_role(role: Option<&str>) -> String {
+    let codex_home = get_codex_home_dir();
+    get_target_model_provider_for_role_in_dir(codex_home.as_deref(), role)
 }
 
 /// Retrieve the configured target model provider (defaults to "9router").
@@ -868,7 +1015,7 @@ pub fn parse_reg_query_value(output: &str, name: &str) -> Option<String> {
 }
 
 #[cfg(windows)]
-fn query_hkcu_environment_win32(name: &str) -> Option<String> {
+fn query_hkcu_string_value_win32(subkey_path: &str, value_name: &str) -> Option<String> {
     use std::ffi::{OsStr, OsString};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
@@ -897,11 +1044,11 @@ fn query_hkcu_environment_win32(name: &str) -> Option<String> {
     const REG_SZ: u32 = 1;
     const REG_EXPAND_SZ: u32 = 2;
 
-    let subkey: Vec<u16> = OsStr::new("Environment")
+    let subkey: Vec<u16> = OsStr::new(subkey_path)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    let val_name: Vec<u16> = OsStr::new(name)
+    let val_name: Vec<u16> = OsStr::new(value_name)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
@@ -957,6 +1104,11 @@ fn query_hkcu_environment_win32(name: &str) -> Option<String> {
     }
 }
 
+#[cfg(windows)]
+fn query_hkcu_environment_win32(name: &str) -> Option<String> {
+    query_hkcu_string_value_win32("Environment", name)
+}
+
 /// Query a Windows User Environment variable from `HKCU\Environment`.
 pub fn get_user_env_var(name: &str) -> Option<String> {
     #[cfg(windows)]
@@ -968,6 +1120,518 @@ pub fn get_user_env_var(name: &str) -> Option<String> {
         let _ = name;
         None
     }
+}
+
+/// Extract a Windows Package Family Name (`<Name>_<PublisherId>`) from a Package Full Name
+/// (e.g. `"OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0"` -> `"OpenAI.Codex_2p2nqsd0c76g0"`).
+pub fn extract_package_family_name_from_full_name(full_name: &str) -> Option<String> {
+    let trimmed = full_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed.split('_').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let pkg_name = parts.first()?.trim();
+    let publisher_id = parts.last()?.trim();
+    if pkg_name.is_empty() || publisher_id.is_empty() {
+        return None;
+    }
+    Some(format!("{}_{}", pkg_name, publisher_id))
+}
+
+/// Parse a `u64` version tuple `(major, minor, build, revision)` from a Package Full Name
+/// (e.g. `"OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0"` -> `(26, 924, 2738, 0)`).
+pub fn parse_package_version_tuple(full_name: &str) -> (u64, u64, u64, u64) {
+    let parts: Vec<&str> = full_name.trim().split('_').collect();
+    let ver_str = if parts.len() >= 2 { parts[1] } else { full_name.trim() };
+    let mut nums = ver_str.split('.').map(|s| s.parse::<u64>().unwrap_or(0));
+    (
+        nums.next().unwrap_or(0),
+        nums.next().unwrap_or(0),
+        nums.next().unwrap_or(0),
+        nums.next().unwrap_or(0),
+    )
+}
+
+#[cfg(windows)]
+fn query_hkcu_codex_appmodel_packages() -> Vec<(String, PathBuf)> {
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            h_key: isize,
+            lp_sub_key: *const u16,
+            ul_options: u32,
+            sam_desired: u32,
+            phk_result: *mut isize,
+        ) -> i32;
+        fn RegEnumKeyExW(
+            h_key: isize,
+            dw_index: u32,
+            lp_name: *mut u16,
+            lpcch_name: *mut u32,
+            lp_reserved: *const u32,
+            lp_class: *mut u16,
+            lpcch_class: *mut u32,
+            lpft_last_write_time: *mut u64,
+        ) -> i32;
+        fn RegCloseKey(h_key: isize) -> i32;
+    }
+
+    const HKEY_CURRENT_USER: isize = -2147483647i32 as isize;
+    const KEY_READ: u32 = 0x20019;
+    const BASE_SUBKEY: &str =
+        "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages";
+
+    let subkey_wide: Vec<u16> = OsStr::new(BASE_SUBKEY)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut matching_names = Vec::new();
+    unsafe {
+        let mut hkey: isize = 0;
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey_wide.as_ptr(),
+            0,
+            KEY_READ,
+            &mut hkey,
+        ) == 0
+            && hkey != 0
+        {
+            let mut idx: u32 = 0;
+            loop {
+                let mut name_buf = [0u16; 260];
+                let mut name_len = name_buf.len() as u32;
+                let mut last_write: u64 = 0;
+                let status = RegEnumKeyExW(
+                    hkey,
+                    idx,
+                    name_buf.as_mut_ptr(),
+                    &mut name_len,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut last_write,
+                );
+                if status != 0 {
+                    break;
+                }
+                let name = OsString::from_wide(&name_buf[..name_len as usize])
+                    .to_string_lossy()
+                    .into_owned();
+                if name.to_ascii_lowercase().starts_with("openai.codex") {
+                    matching_names.push(name);
+                }
+                idx += 1;
+            }
+            let _ = RegCloseKey(hkey);
+        }
+    }
+
+    // Sort by parsed version descending so newest package comes first
+    matching_names.sort_by_key(|a| std::cmp::Reverse(parse_package_version_tuple(a)));
+
+    let mut results = Vec::new();
+    for pkg_name in matching_names {
+        let full_subkey = format!("{}\\{}", BASE_SUBKEY, pkg_name);
+        if let Some(root_str) = query_hkcu_string_value_win32(&full_subkey, "PackageRootFolder") {
+            let root_path = PathBuf::from(root_str);
+            if root_path.is_dir() {
+                results.push((pkg_name, root_path));
+            }
+        }
+    }
+    results
+}
+
+/// Resolve the active `OpenAI.Codex` Package Family Name dynamically from `HKCU` AppModel registry
+/// or `%LOCALAPPDATA%\Packages`, falling back to `"OpenAI.Codex_2p2nqsd0c76g0"`.
+pub fn resolve_codex_package_family_name() -> String {
+    #[cfg(windows)]
+    {
+        for (pkg_full_name, _) in query_hkcu_codex_appmodel_packages() {
+            let lower = pkg_full_name.to_ascii_lowercase();
+            if lower.starts_with("openai.codex_") {
+                if let Some(pfn) = extract_package_family_name_from_full_name(&pkg_full_name) {
+                    return pfn;
+                }
+            }
+        }
+    }
+    if let Ok(local_appdata) = env::var("LOCALAPPDATA") {
+        let packages_dir = PathBuf::from(local_appdata).join("Packages");
+        if let Ok(entries) = fs::read_dir(packages_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    let lower = name.to_ascii_lowercase();
+                    if lower.starts_with("openai.codex_") {
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "OpenAI.Codex_2p2nqsd0c76g0".to_string()
+}
+
+/// Discover all candidate directories that may contain official stock `codex.exe` (`> 10 MB`)
+/// and companion helper binaries (`rg.exe`, `codex-command-runner.exe`, `codex-code-mode-host.exe`,
+/// `codex-windows-sandbox-setup.exe`, `codex-windows-sandbox-service.exe`).
+pub fn discover_codex_binary_candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut push_dir = |p: PathBuf| {
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+
+    #[cfg(windows)]
+    {
+        for (_pkg_name, pkg_root) in query_hkcu_codex_appmodel_packages() {
+            push_dir(pkg_root.join("app").join("resources"));
+            push_dir(pkg_root);
+        }
+        let win_apps = Path::new("C:\\Program Files\\WindowsApps");
+        if let Ok(entries) = fs::read_dir(win_apps) {
+            let mut wa_dirs: Vec<PathBuf> = entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.to_ascii_lowercase().starts_with("openai.codex"))
+                })
+                .map(|e| e.path())
+                .collect();
+            wa_dirs.sort_by(|a, b| {
+                let na = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                let nb = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                parse_package_version_tuple(nb).cmp(&parse_package_version_tuple(na))
+            });
+            for d in wa_dirs {
+                push_dir(d.join("app").join("resources"));
+                push_dir(d);
+            }
+        }
+    }
+
+    if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
+        let bin_dir = Path::new(&local_app_data)
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin");
+        if let Ok(entries) = fs::read_dir(&bin_dir) {
+            let mut hash_dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            hash_dirs.sort_by(|a, b| {
+                let ma = a.metadata().and_then(|m| m.modified()).ok();
+                let mb = b.metadata().and_then(|m| m.modified()).ok();
+                mb.cmp(&ma)
+            });
+            for d in hash_dirs {
+                push_dir(d);
+            }
+        }
+
+        push_dir(
+            Path::new(&local_app_data)
+                .join("Programs")
+                .join("OpenAI")
+                .join("Codex")
+                .join("bin"),
+        );
+    }
+
+    if let Ok(userprofile) = env::var("USERPROFILE") {
+        let releases_dir = Path::new(&userprofile)
+            .join(".codex")
+            .join("packages")
+            .join("app-server-daemon")
+            .join("releases");
+        if let Ok(entries) = fs::read_dir(&releases_dir) {
+            for entry in entries.flatten() {
+                push_dir(entry.path().join("bin"));
+            }
+        }
+        for ext_root in [
+            ".vscode\\extensions",
+            ".vscode-insiders\\extensions",
+            ".cursor\\extensions",
+            ".windsurf\\extensions",
+        ] {
+            let ext_dir = Path::new(&userprofile).join(ext_root);
+            if let Ok(entries) = fs::read_dir(&ext_dir) {
+                for entry in entries.flatten() {
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| n.to_ascii_lowercase().starts_with("openai.chatgpt-"))
+                    {
+                        push_dir(entry.path().join("bin").join("windows-x86_64"));
+                        push_dir(entry.path().join("bin").join("windows-arm64"));
+                    }
+                }
+            }
+        }
+    }
+
+    dirs
+}
+
+/// Copy `src` to `dst`, renaming `dst` to `<filename>.old.<pid>` first if `dst` is locked in use.
+pub fn safe_copy_or_rename_locked(src: &Path, dst: &Path) -> io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if fs::copy(src, dst).is_ok() {
+        return Ok(());
+    }
+    if dst.exists() {
+        let file_name = dst
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("binary.exe");
+        let pid = std::process::id();
+        let old_path = dst.with_file_name(format!("{}.old.{}", file_name, pid));
+        let _ = fs::remove_file(&old_path);
+        if fs::rename(dst, &old_path).is_err() {
+            let alt_old = dst.with_file_name(format!(
+                "{}.old.{}.{}",
+                file_name,
+                pid,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(1)
+            ));
+            let _ = fs::rename(dst, &alt_old);
+        }
+    }
+    fs::copy(src, dst).map(|_| ())
+}
+
+/// Synchronize `custom\codex-9router-subagents.orig.exe`, `custom\codex.orig.exe`, and companion helper binaries
+/// (`rg.exe`, `codex-command-runner.exe`, `codex-code-mode-host.exe`, `codex-windows-sandbox-setup.exe`,
+/// `codex-windows-sandbox-service.exe`) inside `custom_dir` from `candidate_dirs` whenever a newer stock `codex.exe`
+/// (`> 10 MB`) or helper is installed. Returns the number of files refreshed.
+pub fn sync_custom_codex_binaries_from_candidates(
+    custom_dir: &Path,
+    candidate_dirs: &[PathBuf],
+) -> usize {
+    sync_custom_codex_binaries_from_candidates_with_min_size(custom_dir, candidate_dirs, 10_000_000)
+}
+
+/// Synchronize `custom\codex-9router-subagents.orig.exe`, `custom\codex.orig.exe`, and companion helper binaries
+/// inside `custom_dir` from `candidate_dirs` using `min_stock_bytes` as the minimum stock `codex.exe` size threshold.
+pub fn sync_custom_codex_binaries_from_candidates_with_min_size(
+    custom_dir: &Path,
+    candidate_dirs: &[PathBuf],
+    min_stock_bytes: u64,
+) -> usize {
+    if !custom_dir.is_dir() {
+        return 0;
+    }
+
+    // Best-effort cleanup of unlocked .old.* files in custom_dir
+    if let Ok(entries) = fs::read_dir(custom_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.contains(".old."))
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    let cur_canon = env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    let custom_canon = custom_dir.canonicalize().ok();
+
+    // 1. Find newest stock codex binary (> min_stock_bytes) across candidate_dirs
+    let mut best_stock: Option<(PathBuf, u64, Option<std::time::SystemTime>)> = None;
+    for dir in candidate_dirs {
+        if let (Some(ref cc), Ok(dc)) = (&custom_canon, dir.canonicalize()) {
+            if cc == &dc {
+                continue;
+            }
+        }
+        for name in ["codex.orig.exe", "codex.exe"] {
+            let candidate = dir.join(name);
+            if !candidate.is_file() {
+                continue;
+            }
+            if let (Some(ref cur), Ok(cand_c)) = (&cur_canon, candidate.canonicalize()) {
+                if cur == &cand_c {
+                    continue;
+                }
+            }
+            let Ok(meta) = candidate.metadata() else {
+                continue;
+            };
+            let len = meta.len();
+            if len <= min_stock_bytes {
+                continue;
+            }
+            let modified = meta.modified().ok();
+            let is_newer = match &best_stock {
+                None => true,
+                Some((_, _, best_mod)) => modified > *best_mod,
+            };
+            if is_newer {
+                best_stock = Some((candidate, len, modified));
+            }
+        }
+    }
+
+    let mut refreshed_count = 0;
+
+    if let Some((ref src_codex, src_len, src_mod)) = best_stock {
+        for orig_name in ["codex-9router-subagents.orig.exe", "codex.orig.exe"] {
+            let dst = custom_dir.join(orig_name);
+            let needs_refresh = match dst.metadata() {
+                Err(_) => true,
+                Ok(dst_meta) => {
+                    let dst_len = dst_meta.len();
+                    let dst_mod = dst_meta.modified().ok();
+                    dst_len <= min_stock_bytes
+                        || dst_len != src_len
+                        || (src_mod.is_some() && dst_mod < src_mod)
+                }
+            };
+            if needs_refresh && safe_copy_or_rename_locked(src_codex, &dst).is_ok() {
+                refreshed_count += 1;
+            }
+        }
+    }
+
+    // 2. Refresh companion helper binaries from candidate_dirs
+    const HELPERS: [&str; 5] = [
+        "rg.exe",
+        "codex-command-runner.exe",
+        "codex-code-mode-host.exe",
+        "codex-windows-sandbox-setup.exe",
+        "codex-windows-sandbox-service.exe",
+    ];
+
+    for helper in HELPERS {
+        let mut best_helper: Option<(PathBuf, u64, Option<std::time::SystemTime>)> = None;
+        for dir in candidate_dirs {
+            if let (Some(ref cc), Ok(dc)) = (&custom_canon, dir.canonicalize()) {
+                if cc == &dc {
+                    continue;
+                }
+            }
+            let h_path = dir.join(helper);
+            let Ok(meta) = h_path.metadata() else {
+                continue;
+            };
+            if !meta.is_file() || meta.len() == 0 {
+                continue;
+            }
+            let modified = meta.modified().ok();
+            let is_newer = match &best_helper {
+                None => true,
+                Some((_, _, best_mod)) => modified > *best_mod,
+            };
+            if is_newer {
+                best_helper = Some((h_path, meta.len(), modified));
+            }
+        }
+
+        if let Some((ref src_h, src_len, src_mod)) = best_helper {
+            let dst_h = custom_dir.join(helper);
+            let needs_refresh = match dst_h.metadata() {
+                Err(_) => true,
+                Ok(dst_meta) => {
+                    let dst_len = dst_meta.len();
+                    let dst_mod = dst_meta.modified().ok();
+                    dst_len == 0
+                        || dst_len != src_len
+                        || (src_mod.is_some() && dst_mod < src_mod)
+                }
+            };
+            if needs_refresh && safe_copy_or_rename_locked(src_h, &dst_h).is_ok() {
+                refreshed_count += 1;
+            }
+        }
+    }
+
+    refreshed_count
+}
+
+/// Perform in-process self-healing of `%LOCALAPPDATA%\OpenAI\Codex\custom` binaries and helpers,
+/// and re-hook standalone CLI (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`) or IDE extensions
+/// (`openai.chatgpt-*`) if an external update overwrote `codex.exe` with a `> 10 MB` stock binary while
+/// `codex.orig.exe` already exists in that directory.
+pub fn sync_custom_codex_binaries() -> usize {
+    let Ok(local_app_data) = env::var("LOCALAPPDATA") else {
+        return 0;
+    };
+    let custom_dir = Path::new(&local_app_data)
+        .join("OpenAI")
+        .join("Codex")
+        .join("custom");
+    if !custom_dir.is_dir() {
+        return 0;
+    }
+    let candidate_dirs = discover_codex_binary_candidate_dirs();
+    let mut count = sync_custom_codex_binaries_from_candidates(&custom_dir, &candidate_dirs);
+
+    // If custom\codex-9router-subagents.exe exists (< 10 MB proxy binary), auto-heal any previously
+    // hooked standalone CLI or VS Code extension surface where an update replaced codex.exe (> 10 MB)
+    // alongside an existing codex.orig.exe.
+    let proxy_shim = custom_dir.join("codex-9router-subagents.exe");
+    if proxy_shim
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() < 10_000_000)
+    {
+        let mut hook_dirs = vec![Path::new(&local_app_data)
+            .join("Programs")
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin")];
+        if let Ok(userprofile) = env::var("USERPROFILE") {
+            for ext_root in [
+                ".vscode\\extensions",
+                ".vscode-insiders\\extensions",
+                ".cursor\\extensions",
+                ".windsurf\\extensions",
+            ] {
+                let ext_dir = Path::new(&userprofile).join(ext_root);
+                if let Ok(entries) = fs::read_dir(&ext_dir) {
+                    for entry in entries.flatten() {
+                        if entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|n| n.to_ascii_lowercase().starts_with("openai.chatgpt-"))
+                        {
+                            hook_dirs.push(entry.path().join("bin").join("windows-x86_64"));
+                        }
+                    }
+                }
+            }
+        }
+        for hdir in hook_dirs {
+            let codex_exe = hdir.join("codex.exe");
+            let codex_orig = hdir.join("codex.orig.exe");
+            if codex_orig.is_file()
+                && codex_exe
+                    .metadata()
+                    .is_ok_and(|m| m.is_file() && m.len() > 10_000_000)
+                && safe_copy_or_rename_locked(&codex_exe, &codex_orig).is_ok()
+                && safe_copy_or_rename_locked(&proxy_shim, &codex_exe).is_ok()
+            {
+                count += 1;
+            }
+        }
+    }
+
+    count
 }
 
 /// Select the best official `.orig.exe` candidate inside `dir`, preferring files > 10 MB
@@ -1027,7 +1691,7 @@ pub fn find_real_codex() -> PathBuf {
         }
     }
 
-    // 3. Check custom directory and bin/<hash> candidates in LOCALAPPDATA
+    // 3. Check custom directory and discovered Store / bin/<hash> / Programs / extension candidates
     if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
         let custom_dir = Path::new(&local_app_data)
             .join("OpenAI")
@@ -1036,69 +1700,31 @@ pub fn find_real_codex() -> PathBuf {
         if let Some(orig) = pick_best_orig_candidate(&custom_dir) {
             return orig;
         }
-
-        let bin_dir = Path::new(&local_app_data)
-            .join("OpenAI")
-            .join("Codex")
-            .join("bin");
-        if let Ok(entries) = fs::read_dir(&bin_dir) {
-            let mut candidates: Vec<PathBuf> = Vec::new();
-            for entry in entries.flatten() {
-                let orig = entry.path().join("codex.orig.exe");
-                if orig.is_file() {
-                    candidates.push(orig);
-                } else {
-                    let p = entry.path().join("codex.exe");
-                    if p.is_file() {
-                        if let Ok(cur) = env::current_exe() {
-                            if let (Ok(c1), Ok(c2)) = (p.canonicalize(), cur.canonicalize()) {
-                                if c1 == c2 {
-                                    continue;
-                                }
-                            }
-                        }
-                        if p.metadata().is_ok_and(|m| m.len() > 10_000_000) {
-                            candidates.push(p);
-                        }
-                    }
-                }
-            }
-            candidates.sort_by(|a, b| {
-                let ma = a.metadata().and_then(|m| m.modified()).ok();
-                let mb = b.metadata().and_then(|m| m.modified()).ok();
-                mb.cmp(&ma)
-            });
-            if let Some(first) = candidates.into_iter().next() {
-                return first;
-            }
-        }
-
-        let app_bin = Path::new(&local_app_data)
-            .join("Programs")
-            .join("OpenAI")
-            .join("Codex")
-            .join("bin")
-            .join("codex.exe");
-        if app_bin.is_file() && app_bin.metadata().is_ok_and(|m| m.len() > 10_000_000) {
-            return app_bin;
-        }
     }
 
-    // 4. Check user home .codex package daemon releases
-    if let Ok(userprofile) = env::var("USERPROFILE") {
-        let releases_dir = Path::new(&userprofile)
-            .join(".codex")
-            .join("packages")
-            .join("app-server-daemon")
-            .join("releases");
-        if let Ok(entries) = fs::read_dir(&releases_dir) {
-            for entry in entries.flatten() {
-                let orig = entry.path().join("bin").join("codex.orig.exe");
-                if orig.is_file() {
-                    return orig;
+    let cur_canon = env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    let mut stock_candidates: Vec<(PathBuf, Option<std::time::SystemTime>)> = Vec::new();
+    for dir in discover_codex_binary_candidate_dirs() {
+        for name in ["codex.orig.exe", "codex.exe"] {
+            let p = dir.join(name);
+            if !p.is_file() {
+                continue;
+            }
+            if let (Some(ref c1), Ok(c2)) = (&cur_canon, p.canonicalize()) {
+                if c1 == &c2 {
+                    continue;
+                }
+            }
+            if let Ok(meta) = p.metadata() {
+                if meta.len() > 10_000_000 {
+                    stock_candidates.push((p, meta.modified().ok()));
                 }
             }
         }
+    }
+    stock_candidates.sort_by_key(|a| std::cmp::Reverse(a.1));
+    if let Some((first, _)) = stock_candidates.into_iter().next() {
+        return first;
     }
 
     PathBuf::from("codex.orig.exe")
@@ -1437,8 +2063,8 @@ pub fn probe_endpoint(endpoint: &str) {
     }
 }
 
-/// Check if a given model string corresponds to a 9Router or subagent model.
-pub fn is_subagent_model_name(m: &str) -> bool {
+/// Check if a given model string corresponds to a 9Router or subagent model within a specific `<codex_home>` directory.
+pub fn is_subagent_model_name_in_dir(m: &str, codex_home: Option<&Path>) -> bool {
     let trimmed = m.trim();
     if trimmed.is_empty() || is_parent_chatgpt_model(trimmed) {
         return false;
@@ -1453,9 +2079,8 @@ pub fn is_subagent_model_name(m: &str) -> bool {
         return true;
     }
 
-    // Also match if user configured a custom model for any subagent role
-    for role in ["default", "worker", "explorer", "reviewer"] {
-        let configured = map_role_to_model(Some(role));
+    // Match if user configured a custom model for any standard or custom subagent role
+    for configured in collect_configured_subagent_models_in_dir(codex_home) {
         if !configured.is_empty()
             && !is_parent_chatgpt_model(&configured)
             && lower == configured.to_lowercase()
@@ -1465,6 +2090,12 @@ pub fn is_subagent_model_name(m: &str) -> bool {
     }
 
     false
+}
+
+/// Check if a given model string corresponds to a 9Router or subagent model.
+pub fn is_subagent_model_name(m: &str) -> bool {
+    let codex_home = get_codex_home_dir();
+    is_subagent_model_name_in_dir(m, codex_home.as_deref())
 }
 
 /// Check if a request path is an LLM responses endpoint.
@@ -1544,8 +2175,11 @@ pub fn read_subagent_endpoint_from_config(provider: &str) -> Option<String> {
     read_subagent_endpoint_from_config_in_dir(&codex_home, provider)
 }
 
-/// Retrieve the 9Router / subagent responses target endpoint.
-pub fn get_subagent_responses_url() -> String {
+/// Retrieve the subagent responses target endpoint for an optional role within `<codex_home>`.
+pub fn get_subagent_responses_url_for_role_in_dir(
+    role: Option<&str>,
+    codex_home: Option<&Path>,
+) -> String {
     let proc_val = env::var("CODEX_SUBAGENT_ENDPOINT")
         .ok()
         .and_then(|s| normalize_subagent_responses_endpoint(&s));
@@ -1559,9 +2193,11 @@ pub fn get_subagent_responses_url() -> String {
         }
     }
 
-    let provider = get_target_model_provider();
-    if let Some(cfg_ep) = read_subagent_endpoint_from_config(&provider) {
-        return cfg_ep;
+    let provider = get_target_model_provider_for_role_in_dir(codex_home, role);
+    if let Some(home) = codex_home {
+        if let Some(cfg_ep) = read_subagent_endpoint_from_config_in_dir(home, &provider) {
+            return cfg_ep;
+        }
     }
 
     if let Some(ep) = proc_val.or_else(|| {
@@ -1576,45 +2212,83 @@ pub fn get_subagent_responses_url() -> String {
     "http://127.0.0.1:20128/v1/responses".to_string()
 }
 
-/// Retrieve authorization header for 9Router subagents.
-pub fn get_subagent_auth_header() -> Option<String> {
-    if let Ok(key) = env::var("NINEROUTER_KEY") {
-        let trimmed = key.trim();
-        if !trimmed.is_empty() {
-            return Some(format!("Bearer {}", trimmed));
-        }
+/// Retrieve the subagent responses target endpoint for an optional role.
+pub fn get_subagent_responses_url_for_role(role: Option<&str>) -> String {
+    let codex_home = get_codex_home_dir();
+    get_subagent_responses_url_for_role_in_dir(role, codex_home.as_deref())
+}
+
+/// Retrieve the 9Router / subagent responses target endpoint.
+pub fn get_subagent_responses_url() -> String {
+    get_subagent_responses_url_for_role(None)
+}
+
+/// Format an API key or bearer token into a single `Bearer <token>` header value without duplicating `Bearer `.
+pub fn format_bearer_header_value(raw_key: &str) -> Option<String> {
+    let mut token = raw_key.trim();
+    while let Some(rest) = token
+        .strip_prefix("Bearer ")
+        .or_else(|| token.strip_prefix("bearer "))
+        .or_else(|| token.strip_prefix("BEARER "))
+    {
+        token = rest.trim();
     }
-    if let Some(key) = get_user_env_var("NINEROUTER_KEY") {
-        let trimmed = key.trim();
-        if !trimmed.is_empty() {
-            return Some(format!("Bearer {}", trimmed));
-        }
+    if token.is_empty() {
+        None
+    } else {
+        Some(format!("Bearer {}", token))
     }
-    if let Some(codex_home) = get_codex_home_dir() {
-        let provider = get_target_model_provider();
-        if let Ok(content) = fs::read_to_string(codex_home.join("config.toml")) {
+}
+
+/// Retrieve authorization header for a subagent role within `<codex_home>`, prioritizing the active
+/// provider's configured `env_key` in `config.toml` before falling back to `NINEROUTER_KEY`.
+pub fn get_subagent_auth_header_for_role_in_dir(
+    role: Option<&str>,
+    codex_home: Option<&Path>,
+) -> Option<String> {
+    if let Some(home) = codex_home {
+        let provider = get_target_model_provider_for_role_in_dir(Some(home), role);
+        if let Ok(content) = fs::read_to_string(home.join("config.toml")) {
             if let Some(env_key_name) = parse_provider_env_key_from_config_toml(&content, &provider)
             {
                 let trimmed_name = env_key_name.trim();
-                if !trimmed_name.is_empty() && !trimmed_name.eq_ignore_ascii_case("NINEROUTER_KEY")
-                {
+                if !trimmed_name.is_empty() {
                     if let Ok(k) = env::var(trimmed_name) {
-                        let t = k.trim();
-                        if !t.is_empty() {
-                            return Some(format!("Bearer {}", t));
+                        if let Some(formatted) = format_bearer_header_value(&k) {
+                            return Some(formatted);
                         }
                     }
                     if let Some(k) = get_user_env_var(trimmed_name) {
-                        let t = k.trim();
-                        if !t.is_empty() {
-                            return Some(format!("Bearer {}", t));
+                        if let Some(formatted) = format_bearer_header_value(&k) {
+                            return Some(formatted);
                         }
                     }
                 }
             }
         }
     }
+    if let Ok(key) = env::var("NINEROUTER_KEY") {
+        if let Some(formatted) = format_bearer_header_value(&key) {
+            return Some(formatted);
+        }
+    }
+    if let Some(key) = get_user_env_var("NINEROUTER_KEY") {
+        if let Some(formatted) = format_bearer_header_value(&key) {
+            return Some(formatted);
+        }
+    }
     None
+}
+
+/// Retrieve authorization header for a subagent role.
+pub fn get_subagent_auth_header_for_role(role: Option<&str>) -> Option<String> {
+    let codex_home = get_codex_home_dir();
+    get_subagent_auth_header_for_role_in_dir(role, codex_home.as_deref())
+}
+
+/// Retrieve authorization header for 9Router subagents.
+pub fn get_subagent_auth_header() -> Option<String> {
+    get_subagent_auth_header_for_role(None)
 }
 
 /// Decompress request body if compressed with `Content-Encoding: zstd`.
@@ -1904,21 +2578,34 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
 
     // 2. Sanitize top-level "tools" array:
     //    - Filter out "type": "namespace", "type": "web_search", "type": "web_search_preview",
-    //      and "type": "custom" (Freeform tools require custom_tool_call SSE responses which
-    //      9Router does not emit; when codex.orig.exe uses our injected model metadata with
-    //      apply_patch_tool_type = "function", it sends "type": "function", "name": "apply_patch"
-    //      which is preserved here and matches ToolPayload::Function).
+    //      "type": "tool_search" (or "name": "tool_search"), and "type": "custom" (Freeform tools
+    //      require custom_tool_call SSE responses which 9Router does not emit; when codex.orig.exe
+    //      uses our injected model metadata with apply_patch_tool_type = "function", it sends
+    //      "type": "function", "name": "apply_patch" which is preserved here and matches ToolPayload::Function).
+    let mut tools_became_empty = false;
     if let Some(tools_arr) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
         tools_arr.retain(|tool| {
             let tool_type = tool
                 .get("type")
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
+            let tool_name = tool
+                .get("name")
+                .or_else(|| tool.get("function").and_then(|f| f.get("name")))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
             !matches!(
                 tool_type,
-                "namespace" | "web_search" | "web_search_preview" | "custom"
-            )
+                "namespace" | "web_search" | "web_search_preview" | "custom" | "tool_search"
+            ) && !tool_name.eq_ignore_ascii_case("tool_search")
         });
+        if tools_arr.is_empty() {
+            tools_became_empty = true;
+        }
+    }
+    if tools_became_empty {
+        obj.remove("tools");
+        obj.remove("tool_choice");
     }
 
     // 3. Strip ChatGPT-internal top-level fields that 9Router / downstream providers do not accept.
@@ -2138,10 +2825,12 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
     inject_subagent_models_metadata_with_primary(body, primary.as_deref())
 }
 
-/// Inject subagent model metadata descriptors with an optional configured primary parent model preference.
-pub fn inject_subagent_models_metadata_with_primary(
+/// Inject subagent model metadata descriptors with an optional configured primary parent model preference
+/// and an optional `<codex_home>` directory for discovering custom role manifests.
+pub fn inject_subagent_models_metadata_in_dir(
     body: &[u8],
     primary_model: Option<&str>,
+    codex_home: Option<&Path>,
 ) -> Vec<u8> {
     let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
         return body.to_vec();
@@ -2167,7 +2856,7 @@ pub fn inject_subagent_models_metadata_with_primary(
     // then "gpt-6-luna", then the first non-subagent parent model. Never select a subagent model as template.
     let primary_clean = primary_model
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && !is_subagent_model_name(s));
+        .filter(|s| !s.is_empty() && !is_subagent_model_name_in_dir(s, codex_home));
     let template = primary_clean
         .and_then(|prim| {
             models_arr.iter().find(|item| {
@@ -2190,7 +2879,7 @@ pub fn inject_subagent_models_metadata_with_primary(
                 item.get("slug")
                     .or_else(|| item.get("id"))
                     .and_then(|s| s.as_str())
-                    .is_some_and(|s| !is_subagent_model_name(s))
+                    .is_some_and(|s| !is_subagent_model_name_in_dir(s, codex_home))
             })
         })
         .cloned();
@@ -2201,9 +2890,13 @@ pub fn inject_subagent_models_metadata_with_primary(
         "explore".to_string(),
         "review".to_string(),
     ];
-    for role in ["default", "worker", "explorer", "reviewer"] {
-        let m = map_role_to_model(Some(role));
-        if !m.is_empty() && !slugs_to_ensure.contains(&m) {
+    for m in collect_configured_subagent_models_in_dir(codex_home) {
+        if !m.is_empty()
+            && !is_parent_chatgpt_model(&m)
+            && !slugs_to_ensure
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&m))
+        {
             slugs_to_ensure.push(m);
         }
     }
@@ -2277,6 +2970,15 @@ pub fn inject_subagent_models_metadata_with_primary(
     }
 
     serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec())
+}
+
+/// Inject subagent model metadata descriptors with an optional configured primary parent model preference.
+pub fn inject_subagent_models_metadata_with_primary(
+    body: &[u8],
+    primary_model: Option<&str>,
+) -> Vec<u8> {
+    let codex_home = get_codex_home_dir();
+    inject_subagent_models_metadata_in_dir(body, primary_model, codex_home.as_deref())
 }
 
 /// Apply `inject_subagent_models_metadata` to a `models_cache.json` file on disk if present.
@@ -3028,6 +3730,7 @@ pub async fn handle_subagent_compaction(
     forward_headers.remove("x-codex-turn-metadata");
     forward_headers.remove("x-codex-request-kind");
     forward_headers.remove("x-openai-request-kind");
+    forward_headers.remove(header::ACCEPT_ENCODING);
 
     let model_name = serde_json::from_slice::<Value>(routed_body)
         .ok()
@@ -3075,10 +3778,14 @@ pub async fn handle_subagent_compaction(
     build_compaction_sse_response(&fallback_summary, &model_name)
 }
 
-/// Resolve the forward target URL for a given path and routing classification.
-pub fn resolve_forward_url(path: &str, is_subagent: bool) -> String {
+/// Resolve the forward target URL for a given path, routing classification, and optional subagent role.
+pub fn resolve_forward_url_for_role(
+    path: &str,
+    is_subagent: bool,
+    role: Option<&str>,
+) -> String {
     if is_subagent {
-        get_subagent_responses_url()
+        get_subagent_responses_url_for_role(role)
     } else {
         let base = get_chatgpt_upstream_base();
         let base_trimmed = base.trim_end_matches('/');
@@ -3090,19 +3797,34 @@ pub fn resolve_forward_url(path: &str, is_subagent: bool) -> String {
     }
 }
 
-/// Resolve the forward target URL preserving optional query parameters.
-pub fn resolve_forward_url_with_query(
+/// Resolve the forward target URL for a given path and routing classification.
+pub fn resolve_forward_url(path: &str, is_subagent: bool) -> String {
+    resolve_forward_url_for_role(path, is_subagent, None)
+}
+
+/// Resolve the forward target URL preserving optional query parameters and optional subagent role.
+pub fn resolve_forward_url_with_query_for_role(
     path: &str,
     query: Option<&str>,
     is_subagent: bool,
+    role: Option<&str>,
 ) -> String {
-    let base_url = resolve_forward_url(path, is_subagent);
+    let base_url = resolve_forward_url_for_role(path, is_subagent, role);
     if let Some(q) = query {
         if !q.is_empty() && !base_url.contains('?') {
             return format!("{}?{}", base_url, q);
         }
     }
     base_url
+}
+
+/// Resolve the forward target URL preserving optional query parameters.
+pub fn resolve_forward_url_with_query(
+    path: &str,
+    query: Option<&str>,
+    is_subagent: bool,
+) -> String {
+    resolve_forward_url_with_query_for_role(path, query, is_subagent, None)
 }
 
 /// Check if an HTTP header is a hop-by-hop header that should not be forwarded.
@@ -3148,9 +3870,8 @@ pub fn build_forward_headers_with_subagent_auth(
 
     if is_subagent {
         let auth_val = subagent_auth
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .and_then(|auth_str| HeaderValue::from_str(auth_str).ok())
+            .and_then(format_bearer_header_value)
+            .and_then(|auth_str| HeaderValue::from_str(&auth_str).ok())
             .unwrap_or_else(|| HeaderValue::from_static("Bearer dummy-9router-key"));
         out.insert(header::AUTHORIZATION, auth_val);
     }
@@ -3158,15 +3879,25 @@ pub fn build_forward_headers_with_subagent_auth(
     out
 }
 
-/// Build headers to forward upstream to either 9Router or ChatGPT.
+/// Build headers to forward upstream to either 9Router or ChatGPT for an optional subagent role.
 /// Never forwards the user's incoming ChatGPT OAuth `Authorization` header to subagent endpoints.
-pub fn build_forward_headers(incoming_headers: &HeaderMap, is_subagent: bool) -> HeaderMap {
+pub fn build_forward_headers_for_role(
+    incoming_headers: &HeaderMap,
+    is_subagent: bool,
+    role: Option<&str>,
+) -> HeaderMap {
     let subagent_auth = if is_subagent {
-        get_subagent_auth_header()
+        get_subagent_auth_header_for_role(role)
     } else {
         None
     };
     build_forward_headers_with_subagent_auth(incoming_headers, is_subagent, subagent_auth.as_deref())
+}
+
+/// Build headers to forward upstream to either 9Router or ChatGPT.
+/// Never forwards the user's incoming ChatGPT OAuth `Authorization` header to subagent endpoints.
+pub fn build_forward_headers(incoming_headers: &HeaderMap, is_subagent: bool) -> HeaderMap {
+    build_forward_headers_for_role(incoming_headers, is_subagent, None)
 }
 
 /// Filter upstream response headers before returning to the local Codex client.
@@ -3199,19 +3930,10 @@ pub fn default_cert_paths() -> (PathBuf, PathBuf) {
     (cert_path, key_path)
 }
 
-/// Load existing or generate a new self-signed TLS certificate for `127.0.0.1` / `localhost`.
-pub fn get_or_create_tls_files(
+fn generate_and_write_tls_files(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-    if cert_path.exists() && key_path.exists() {
-        let cert_pem = fs::read_to_string(cert_path)?;
-        let key_pem = fs::read_to_string(key_path)?;
-        if !cert_pem.trim().is_empty() && !key_pem.trim().is_empty() {
-            return Ok((cert_pem, key_pem));
-        }
-    }
-
     let subject_alt_names = vec![
         "127.0.0.1".to_string(),
         "localhost".to_string(),
@@ -3235,19 +3957,35 @@ pub fn get_or_create_tls_files(
     Ok((cert_pem, key_pem))
 }
 
-/// Build a `tokio_rustls::TlsAcceptor` supporting both HTTP/2 (`h2`) and `http/1.1`.
-pub fn create_tls_acceptor(
+/// Load existing or generate a new self-signed TLS certificate for `127.0.0.1` / `localhost`.
+pub fn get_or_create_tls_files(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    if cert_path.exists() && key_path.exists() {
+        let cert_pem = fs::read_to_string(cert_path)?;
+        let key_pem = fs::read_to_string(key_path)?;
+        if !cert_pem.trim().is_empty() && !key_pem.trim().is_empty() {
+            return Ok((cert_pem, key_pem));
+        }
+    }
+
+    generate_and_write_tls_files(cert_path, key_path)
+}
+
+fn try_build_tls_acceptor_from_disk(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<TlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
-    let _ = get_or_create_tls_files(cert_path, key_path)?;
-
     let cert_pem = fs::read(cert_path)?;
     let key_pem = fs::read(key_path)?;
 
     let mut certs = Vec::new();
     for cert_result in rustls_pemfile::certs(&mut &cert_pem[..]) {
         certs.push(cert_result?);
+    }
+    if certs.is_empty() {
+        return Err("No certificates found in cert file".into());
     }
 
     let key = rustls_pemfile::private_key(&mut &key_pem[..])?
@@ -3259,6 +3997,25 @@ pub fn create_tls_acceptor(
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
+}
+
+/// Build a `tokio_rustls::TlsAcceptor` supporting both HTTP/2 (`h2`) and `http/1.1`.
+/// Automatically regenerates `bridge-cert.pem` and `bridge-key.pem` once if existing files are corrupted or mismatched.
+pub fn create_tls_acceptor(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<TlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
+    let _ = get_or_create_tls_files(cert_path, key_path)?;
+
+    match try_build_tls_acceptor_from_disk(cert_path, key_path) {
+        Ok(acceptor) => Ok(acceptor),
+        Err(_) => {
+            let _ = fs::remove_file(cert_path);
+            let _ = fs::remove_file(key_path);
+            let _ = generate_and_write_tls_files(cert_path, key_path)?;
+            try_build_tls_acceptor_from_disk(cert_path, key_path)
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -3464,15 +4221,41 @@ pub async fn proxy_handler(
     let (decompressed_body, _was_compressed) = decompress_if_needed(&body, &headers);
     let (is_subagent, routed_body) =
         inspect_and_route_http_request_with_headers(path, &headers, &decompressed_body);
+    let effective_role = if is_subagent {
+        let body_role = serde_json::from_slice::<Value>(&decompressed_body)
+            .ok()
+            .and_then(|v| find_agent_role(&v));
+        let header_role = extract_role_from_http_headers(&headers);
+        match (body_role, header_role) {
+            (Some(r), Some(hr)) if r == "default" || r == "subagent" => Some(hr),
+            (Some(r), _) => Some(r),
+            (None, hr) => hr,
+        }
+    } else {
+        None
+    };
     #[cfg(test)]
     let target_url = headers
         .get("x-codex-test-upstream")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| resolve_forward_url_with_query(path, query, is_subagent));
+        .unwrap_or_else(|| {
+            resolve_forward_url_with_query_for_role(
+                path,
+                query,
+                is_subagent,
+                effective_role.as_deref(),
+            )
+        });
     #[cfg(not(test))]
-    let target_url = resolve_forward_url_with_query(path, query, is_subagent);
-    let mut forward_headers = build_forward_headers(&headers, is_subagent);
+    let target_url = resolve_forward_url_with_query_for_role(
+        path,
+        query,
+        is_subagent,
+        effective_role.as_deref(),
+    );
+    let mut forward_headers =
+        build_forward_headers_for_role(&headers, is_subagent, effective_role.as_deref());
     #[cfg(test)]
     forward_headers.remove("x-codex-test-upstream");
 
@@ -3632,21 +4415,96 @@ pub fn create_router(state: Arc<ProxyAppState>) -> Router {
         .with_state(state)
 }
 
-/// Bind and spawn the embedded dual-stack HTTP/HTTPS reverse proxy in a background thread.
-pub fn spawn_embedded_reverse_proxy(bind_addr: &str) -> io::Result<PathBuf> {
+/// Verify whether an existing listener on `bind_addr` is a healthy `codex-9router-proxy` TLS endpoint
+/// trusted by the certificate at `cert_path`.
+pub fn verify_existing_tls_proxy_listener(bind_addr: &str, cert_path: &Path) -> bool {
+    let Ok(cert_bytes) = fs::read(cert_path) else {
+        return false;
+    };
+    let Ok(cert) = reqwest::Certificate::from_pem(&cert_bytes) else {
+        return false;
+    };
+    let url = format!("https://{}/health", bind_addr);
+    thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return false;
+        };
+        rt.block_on(async move {
+            let Ok(client) = reqwest::Client::builder()
+                .add_root_certificate(cert)
+                .timeout(Duration::from_millis(800))
+                .build()
+            else {
+                return false;
+            };
+            let Ok(resp) = client.get(&url).send().await else {
+                return false;
+            };
+            if resp.status() != reqwest::StatusCode::OK {
+                return false;
+            }
+            let Ok(body) = resp.text().await else {
+                return false;
+            };
+            body.contains("codex-9router-proxy")
+        })
+    })
+    .join()
+    .unwrap_or(false)
+}
+
+/// Bind and spawn the embedded dual-stack HTTP/HTTPS reverse proxy in a background thread,
+/// returning `(cert_path, bound_port)`. If `bind_addr` is already in use, verifies that the
+/// listener completes a TLS `/health` check trusted by `cert_path`; otherwise binds a fallback port.
+pub fn spawn_embedded_reverse_proxy_with_port(bind_addr: &str) -> io::Result<(PathBuf, String)> {
     let (cert_path, key_path) = default_cert_paths();
     let tls_acceptor = create_tls_acceptor(&cert_path, &key_path)
         .map_err(|e| io::Error::other(e.to_string()))?;
 
-    let std_listener = match TcpListener::bind(bind_addr) {
-        Ok(l) => l,
-        Err(e) => {
-            // If another instance of codex-9router-proxy is already listening on 20129, return the cert path
-            if e.kind() == io::ErrorKind::AddrInUse {
-                return Ok(cert_path);
-            }
-            return Err(e);
+    let requested_port = bind_addr
+        .rsplit(':')
+        .next()
+        .unwrap_or("20129")
+        .to_string();
+
+    let (std_listener, actual_port) = match TcpListener::bind(bind_addr) {
+        Ok(l) => {
+            let bound_port = l
+                .local_addr()
+                .map(|a| a.port().to_string())
+                .unwrap_or_else(|_| requested_port.clone());
+            (l, bound_port)
         }
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            if verify_existing_tls_proxy_listener(bind_addr, &cert_path) {
+                return Ok((cert_path, requested_port));
+            }
+            let mut fallback_listener: Option<(TcpListener, String)> = None;
+            for candidate_port in 20130..=20139u16 {
+                let candidate_addr = format!("127.0.0.1:{}", candidate_port);
+                if let Ok(l) = TcpListener::bind(&candidate_addr) {
+                    fallback_listener = Some((l, candidate_port.to_string()));
+                    break;
+                } else if verify_existing_tls_proxy_listener(&candidate_addr, &cert_path) {
+                    return Ok((cert_path, candidate_port.to_string()));
+                }
+            }
+            if fallback_listener.is_none() {
+                if let Ok(l) = TcpListener::bind("127.0.0.1:0") {
+                    if let Ok(addr) = l.local_addr() {
+                        fallback_listener = Some((l, addr.port().to_string()));
+                    }
+                }
+            }
+            match fallback_listener {
+                Some(pair) => pair,
+                None => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
     };
     std_listener.set_nonblocking(true)?;
 
@@ -3721,7 +4579,12 @@ pub fn spawn_embedded_reverse_proxy(bind_addr: &str) -> io::Result<PathBuf> {
         });
     });
 
-    Ok(cert_path)
+    Ok((cert_path, actual_port))
+}
+
+/// Bind and spawn the embedded dual-stack HTTP/HTTPS reverse proxy in a background thread.
+pub fn spawn_embedded_reverse_proxy(bind_addr: &str) -> io::Result<PathBuf> {
+    spawn_embedded_reverse_proxy_with_port(bind_addr).map(|(cert_path, _)| cert_path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4094,11 +4957,12 @@ mod win_desktop {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let mut cmd_wide: Vec<u16> =
-            std::ffi::OsStr::new("explorer.exe shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App")
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
+        let family_name = resolve_codex_package_family_name();
+        let cmd_str = format!("explorer.exe shell:AppsFolder\\{}!App", family_name);
+        let mut cmd_wide: Vec<u16> = std::ffi::OsStr::new(&cmd_str)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
 
         unsafe {
             let mut si: StartupInfoW = std::mem::zeroed();
@@ -4220,6 +5084,8 @@ pub fn run_doctor() {
     println!("===================================================================");
     println!();
 
+    let _ = sync_custom_codex_binaries();
+
     #[cfg(windows)]
     {
         let (class, healed) = win_desktop::heal_hidden_desktop_codex(false);
@@ -4339,8 +5205,7 @@ pub fn run_doctor() {
 
     let provider = get_target_model_provider();
     println!("[OK] Subagent Provider  : {}", provider);
-    let key_set = env::var("NINEROUTER_KEY").is_ok_and(|k| !k.trim().is_empty())
-        || get_user_env_var("NINEROUTER_KEY").is_some_and(|k| !k.trim().is_empty());
+    let key_set = get_subagent_auth_header().is_some();
     if key_set {
         println!("[OK] Provider API Key   : [CONFIGURED / MASKED]");
     } else {
@@ -4348,7 +5213,7 @@ pub fn run_doctor() {
     }
 
     let (cert_path, key_path) = default_cert_paths();
-    let tls_status = match get_or_create_tls_files(&cert_path, &key_path) {
+    let tls_status = match create_tls_acceptor(&cert_path, &key_path) {
         Ok(_) => format!("Ready ({})", cert_path.display()),
         Err(e) => format!("Error ({})", e),
     };
@@ -4358,7 +5223,13 @@ pub fn run_doctor() {
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let proxy_status = match TcpListener::bind(&proxy_addr) {
         Ok(_) => "Port available / ready to bind",
-        Err(_) => "Port active / in use",
+        Err(_) => {
+            if verify_existing_tls_proxy_listener(&proxy_addr, &cert_path) {
+                "Port active / verified codex-9router-proxy TLS listener"
+            } else {
+                "Port occupied by another process (will auto-fallback to 20130..20139)"
+            }
+        }
     };
     println!("[OK] Reverse Proxy Port : {} ({})", proxy_addr, proxy_status);
     println!("     - Loopback URL     : https://{}/backend-api/", proxy_addr);
@@ -4412,9 +5283,10 @@ pub fn run_doctor() {
     println!("===================================================================");
 }
 
-/// Strip any existing `chatgpt_base_url` override from CLI arguments and append the HTTPS loopback URL.
+/// Strip any existing `chatgpt_base_url` override from CLI arguments and insert the HTTPS loopback URL
+/// before any `--` argument separator so positional arguments after `--` are never polluted.
 pub fn inject_loopback_base_url(args: &[String], port: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut cleaned = Vec::new();
     let mut skip_next = false;
     for (i, a) in args.iter().enumerate() {
         if skip_next {
@@ -4428,61 +5300,143 @@ pub fn inject_loopback_base_url(args: &[String], port: &str) -> Vec<String> {
         if a.starts_with("-c=") && a.contains("chatgpt_base_url") {
             continue;
         }
-        out.push(a.clone());
+        cleaned.push(a.clone());
     }
-    out.push("-c".to_string());
-    out.push(format!(
+
+    let base_url_arg = format!(
         "chatgpt_base_url=\"https://127.0.0.1:{}/backend-api/\"",
         port
-    ));
-    out
+    );
+
+    if let Some(sep_idx) = cleaned.iter().position(|a| a == "--") {
+        let mut out = Vec::with_capacity(cleaned.len() + 2);
+        out.extend_from_slice(&cleaned[..sep_idx]);
+        out.push("-c".to_string());
+        out.push(base_url_arg);
+        out.extend_from_slice(&cleaned[sep_idx..]);
+        out
+    } else {
+        cleaned.push("-c".to_string());
+        cleaned.push(base_url_arg);
+        cleaned
+    }
 }
 
-/// Determine whether CLI arguments represent a non-API / lightweight command (e.g. `--version`, `--help`, `login`, `logout`)
+/// Determine whether CLI arguments represent a non-API / lightweight command (e.g. `--version`, `--help`,
+/// `login`, `logout`, `sandbox`, `stdio-to-uds`, `mcp`, `plugin`, `update`, etc.)
 /// that should not spawn the embedded reverse proxy or inject `-c chatgpt_base_url=...`.
 /// Interactive `codex` invocations (`args.is_empty()`) are NOT lightweight and MUST receive proxy injection.
 pub fn is_lightweight_cli_invocation(args: &[String]) -> bool {
-    if args.iter().any(|a| {
+    let pre_sep: Vec<&str> = args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .map(|s| s.as_str())
+        .collect();
+
+    if pre_sep.iter().any(|&a| {
         a == "--version" || a == "-V" || a == "--help" || a == "-h" || a == "help"
     }) {
         return true;
     }
-    if let Some(first) = args.first().map(|s| s.as_str()) {
+
+    let mut first_subcommand: Option<&str> = None;
+    let mut skip_next = false;
+    for (i, &a) in pre_sep.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
         if matches!(
-            first,
-            "version" | "login" | "logout" | "completion" | "features"
+            a,
+            "-c" | "--config"
+                | "-m"
+                | "--model"
+                | "-p"
+                | "--profile"
+                | "-C"
+                | "--cd"
+                | "-s"
+                | "--sandbox"
+                | "-a"
+                | "--ask-for-approval"
+                | "--enable"
+                | "--disable"
+        ) {
+            if i + 1 < pre_sep.len() {
+                skip_next = true;
+            }
+            continue;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        first_subcommand = Some(a);
+        break;
+    }
+
+    if let Some(sub) = first_subcommand {
+        if matches!(
+            sub,
+            "version"
+                | "login"
+                | "logout"
+                | "completion"
+                | "features"
+                | "sandbox"
+                | "stdio-to-uds"
+                | "mcp"
+                | "plugin"
+                | "update"
+                | "debug"
+                | "apply"
+                | "archive"
+                | "unarchive"
+                | "delete"
+                | "migrate-rollouts"
+                | "app"
+                | "generate-ts"
+                | "generate-json-schema"
         ) {
             return true;
         }
     }
-    if args.iter().any(|a| a == "daemon")
-        && args
+    if pre_sep.contains(&"daemon")
+        && pre_sep
             .iter()
-            .any(|a| matches!(a.as_str(), "stop" | "status" | "version"))
+            .any(|&a| matches!(a, "stop" | "status" | "version"))
     {
         return true;
     }
     false
 }
 
+/// Check whether CLI arguments invoke the built-in diagnostics doctor (`--doctor`, `doctor`, `-doctor`, `--proxy-status`).
+/// Only matches when it is the first argument so `codex exec "doctor"` is never hijacked.
+pub fn is_doctor_cli_invocation(args: &[String]) -> bool {
+    let Some(first) = args.first().map(|s| s.as_str()) else {
+        return false;
+    };
+    first.eq_ignore_ascii_case("--doctor")
+        || first.eq_ignore_ascii_case("doctor")
+        || first.eq_ignore_ascii_case("-doctor")
+        || first.eq_ignore_ascii_case("--proxy-status")
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
 
-    if args.iter().any(|a| {
-        a.eq_ignore_ascii_case("--doctor")
-            || a.eq_ignore_ascii_case("doctor")
-            || a.eq_ignore_ascii_case("-doctor")
-    }) {
+    if is_doctor_cli_invocation(&args) {
         run_doctor();
         return Ok(());
     }
 
+    let _ = sync_custom_codex_binaries();
     let _ = sync_codex_models_cache();
 
     if args.iter().any(|a| a.eq_ignore_ascii_case("--proxy-daemon")) {
         let port = get_proxy_port();
         let bind_addr = format!("127.0.0.1:{}", port);
-        let _ = spawn_embedded_reverse_proxy(&bind_addr)?;
+        let _ = spawn_embedded_reverse_proxy_with_port(&bind_addr)?;
         loop {
             thread::park();
         }
@@ -4508,9 +5462,10 @@ fn main() -> io::Result<()> {
         if !is_lightweight_command {
             let port = get_proxy_port();
             let bind_addr = format!("127.0.0.1:{}", port);
-            if let Ok(cert_path) = spawn_embedded_reverse_proxy(&bind_addr) {
+            if let Ok((cert_path, actual_port)) = spawn_embedded_reverse_proxy_with_port(&bind_addr)
+            {
                 cmd.env("CODEX_CA_CERTIFICATE", &cert_path);
-                forward_args = inject_loopback_base_url(&forward_args, &port);
+                forward_args = inject_loopback_base_url(&forward_args, &actual_port);
             }
         }
 
@@ -4526,18 +5481,18 @@ fn main() -> io::Result<()> {
     let port = get_proxy_port();
     let bind_addr = format!("127.0.0.1:{}", port);
     let (default_cert, _) = default_cert_paths();
-    let cert_path = match spawn_embedded_reverse_proxy(&bind_addr) {
-        Ok(p) => p,
+    let (cert_path, actual_port) = match spawn_embedded_reverse_proxy_with_port(&bind_addr) {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!(
                 "[codex-9router-proxy] Reverse proxy note on {}: {}",
                 bind_addr, e
             );
-            default_cert
+            (default_cert, port)
         }
     };
 
-    let child_args = inject_loopback_base_url(&args, &port);
+    let child_args = inject_loopback_base_url(&args, &actual_port);
 
     let mut child = Command::new(&real_codex)
         .args(&child_args)
@@ -7181,5 +8136,371 @@ default_subagent_model = "9router-subagent"
         );
 
         let _ = fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
+    fn test_sync_custom_codex_binaries_from_candidates_auto_heals_and_guards_against_self_copy() {
+        let tmp_root = env::temp_dir().join(format!(
+            "codex_sync_binaries_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_root);
+        let candidate_dir = tmp_root.join("store_app_resources");
+        let custom_dir = tmp_root.join("custom");
+        fs::create_dir_all(&candidate_dir).unwrap();
+        fs::create_dir_all(&custom_dir).unwrap();
+
+        let fake_proxy_exe = custom_dir.join("codex.exe");
+        // Small proxy binary (e.g. 200 bytes)
+        fs::write(&fake_proxy_exe, vec![b'P'; 200]).unwrap();
+
+        // Candidate dir has real codex.exe (5000 bytes, larger than proxy) + companion binaries
+        let real_codex_bytes = vec![b'R'; 5000];
+        fs::write(candidate_dir.join("codex.exe"), &real_codex_bytes).unwrap();
+        fs::write(
+            candidate_dir.join("codex-command-runner.exe"),
+            b"runner-v2",
+        )
+        .unwrap();
+        fs::write(
+            candidate_dir.join("codex-windows-sandbox-setup.exe"),
+            b"sandbox-v2",
+        )
+        .unwrap();
+        fs::write(
+            candidate_dir.join("codex-code-mode-host.exe"),
+            b"codemode-v2",
+        )
+        .unwrap();
+
+        // Pre-populate stale custom orig binaries
+        fs::write(custom_dir.join("codex.orig.exe"), b"old-codex").unwrap();
+        fs::write(
+            custom_dir.join("codex-9router-subagents.orig.exe"),
+            b"old-codex",
+        )
+        .unwrap();
+
+        let updated = sync_custom_codex_binaries_from_candidates_with_min_size(
+            &custom_dir,
+            std::slice::from_ref(&candidate_dir),
+            1_000,
+        );
+        assert!(updated >= 5, "expected at least 5 binaries synced, got {}", updated);
+        assert_eq!(
+            fs::read(custom_dir.join("codex.orig.exe")).unwrap(),
+            real_codex_bytes
+        );
+        assert_eq!(
+            fs::read(custom_dir.join("codex-9router-subagents.orig.exe")).unwrap(),
+            real_codex_bytes
+        );
+        assert_eq!(
+            fs::read(custom_dir.join("codex-command-runner.exe")).unwrap(),
+            b"runner-v2"
+        );
+        assert_eq!(
+            fs::read(custom_dir.join("codex-windows-sandbox-setup.exe")).unwrap(),
+            b"sandbox-v2"
+        );
+        assert_eq!(
+            fs::read(custom_dir.join("codex-code-mode-host.exe")).unwrap(),
+            b"codemode-v2"
+        );
+
+        // Now simulate a candidate dir where codex.exe was already replaced with the small proxy binary (200 bytes):
+        // sync_custom_codex_binaries_from_candidates MUST NOT overwrite codex.orig.exe with the proxy binary!
+        let shimmed_candidate_dir = tmp_root.join("shimmed_bin");
+        fs::create_dir_all(&shimmed_candidate_dir).unwrap();
+        fs::write(shimmed_candidate_dir.join("codex.exe"), vec![b'P'; 200]).unwrap();
+        let updated_shimmed = sync_custom_codex_binaries_from_candidates_with_min_size(
+            &custom_dir,
+            std::slice::from_ref(&shimmed_candidate_dir),
+            1_000,
+        );
+        assert_eq!(updated_shimmed, 0);
+        assert_eq!(
+            fs::read(custom_dir.join("codex.orig.exe")).unwrap().len(),
+            5000,
+            "must never overwrite codex.orig.exe with the proxy shim binary"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn test_extract_package_family_name_and_version_tuple() {
+        assert_eq!(
+            extract_package_family_name_from_full_name(
+                "OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0"
+            )
+            .as_deref(),
+            Some("OpenAI.Codex_2p2nqsd0c76g0")
+        );
+        assert_eq!(
+            parse_package_version_tuple("OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0"),
+            (26, 924, 2738, 0)
+        );
+        assert!(
+            parse_package_version_tuple("OpenAI.Codex_26.1000.0.0_x64__2p2nqsd0c76g0")
+                > parse_package_version_tuple("OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0")
+        );
+    }
+
+    #[test]
+    fn test_custom_role_manifests_model_metadata_and_per_role_auth_endpoint_resolution() {
+        let tmp_home = env::temp_dir().join(format!(
+            "codex_custom_role_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_home);
+        let agents_dir = tmp_home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        fs::write(
+            agents_dir.join("researcher.toml"),
+            "name = \"researcher\"\nmodel = \"deepseek-r1-custom\"\nmodel_provider = \"openrouter\"\n",
+        )
+        .unwrap();
+        fs::write(
+            agents_dir.join("worker.toml"),
+            "name = \"worker\"\nmodel = \"qwen3-coder-plus\"\nmodel_provider = \"9router\"\n",
+        )
+        .unwrap();
+
+        let config_toml = r#"
+model = "gpt-5.4"
+
+[model_providers.9router]
+name = "9router"
+base_url = "http://127.0.0.1:20128/v1"
+env_key = "NINEROUTER_KEY"
+
+[model_providers.openrouter]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "CODEX_TEST_OPENROUTER_KEY"
+
+[subagent_models]
+auditor = "claude-3-7-sonnet-audit"
+"#;
+        fs::write(tmp_home.join("config.toml"), config_toml).unwrap();
+
+        // 1. Custom role model discovery & is_subagent_model_name_in_dir
+        let models = collect_configured_subagent_models_in_dir(Some(&tmp_home));
+        assert!(models.contains(&"deepseek-r1-custom".to_string()));
+        assert!(models.contains(&"qwen3-coder-plus".to_string()));
+        assert!(models.contains(&"claude-3-7-sonnet-audit".to_string()));
+        assert!(is_subagent_model_name_in_dir(
+            "deepseek-r1-custom",
+            Some(&tmp_home)
+        ));
+        assert!(is_subagent_model_name_in_dir(
+            "claude-3-7-sonnet-audit",
+            Some(&tmp_home)
+        ));
+        assert!(!is_subagent_model_name_in_dir("o5-mini", Some(&tmp_home)));
+        assert!(!is_subagent_model_name_in_dir(
+            "computer-use-preview",
+            Some(&tmp_home)
+        ));
+
+        // 2. Models catalog injection includes custom role models
+        let base_catalog = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.4",
+                    "display_name": "GPT-5.4",
+                    "context_window": 272000,
+                    "max_context_window": 400000,
+                    "comp_hash": "1000"
+                }
+            ]
+        });
+        let enriched_bytes = inject_subagent_models_metadata_in_dir(
+            &serde_json::to_vec(&base_catalog).unwrap(),
+            Some("gpt-5.4"),
+            Some(&tmp_home),
+        );
+        let enriched: Value = serde_json::from_slice(&enriched_bytes).unwrap();
+        let arr = enriched["models"].as_array().unwrap();
+        assert!(arr.iter().any(|m| m["slug"] == "deepseek-r1-custom"));
+        assert!(arr.iter().any(|m| m["slug"] == "claude-3-7-sonnet-audit"));
+
+        // 3. Per-role provider & endpoint resolution
+        assert_eq!(
+            get_target_model_provider_for_role_in_dir(Some(&tmp_home), Some("researcher")),
+            "openrouter"
+        );
+        assert_eq!(
+            get_subagent_responses_url_for_role_in_dir(Some("researcher"), Some(&tmp_home)),
+            "https://openrouter.ai/api/v1/responses"
+        );
+        assert_eq!(
+            get_subagent_responses_url_for_role_in_dir(Some("worker"), Some(&tmp_home)),
+            "http://127.0.0.1:20128/v1/responses"
+        );
+
+        // 4. Active provider env_key takes precedence over NINEROUTER_KEY & strips duplicate Bearer prefix
+        env::set_var("CODEX_TEST_OPENROUTER_KEY", "Bearer sk-or-test-key-123");
+        let auth = get_subagent_auth_header_for_role_in_dir(Some("researcher"), Some(&tmp_home));
+        env::remove_var("CODEX_TEST_OPENROUTER_KEY");
+        assert_eq!(auth.as_deref(), Some("Bearer sk-or-test-key-123"));
+        assert_eq!(
+            format_bearer_header_value("Bearer Bearer my-token").as_deref(),
+            Some("Bearer my-token")
+        );
+
+        let _ = fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
+    fn test_sanitize_subagent_request_filters_tool_search_and_drops_empty_tools_array() {
+        let mut req = serde_json::json!({
+            "model": "9router-subagent",
+            "tool_choice": "auto",
+            "tools": [
+                { "type": "tool_search" },
+                { "type": "function", "name": "tool_search", "parameters": {} },
+                { "type": "web_search_preview" }
+            ],
+            "input": [
+                { "type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}] }
+            ]
+        });
+        sanitize_subagent_request_for_9router(&mut req);
+        assert!(
+            req.get("tools").is_none(),
+            "empty tools array must be removed after filtering incompatible tools"
+        );
+        assert!(
+            req.get("tool_choice").is_none(),
+            "tool_choice must be removed when tools array becomes empty"
+        );
+
+        let mut req_with_valid_tool = serde_json::json!({
+            "model": "9router-subagent",
+            "tool_choice": "auto",
+            "tools": [
+                { "type": "tool_search" },
+                { "type": "function", "name": "apply_patch", "parameters": {} }
+            ]
+        });
+        sanitize_subagent_request_for_9router(&mut req_with_valid_tool);
+        let remaining_tools = req_with_valid_tool["tools"].as_array().unwrap();
+        assert_eq!(remaining_tools.len(), 1);
+        assert_eq!(remaining_tools[0]["name"], "apply_patch");
+        assert_eq!(req_with_valid_tool["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn test_create_tls_acceptor_self_heals_corrupted_pem_and_fallback_port_binding() {
+        let tmp_tls = env::temp_dir().join(format!("codex_tls_heal_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_tls);
+        fs::create_dir_all(&tmp_tls).unwrap();
+
+        let cert_path = tmp_tls.join("bridge-cert.pem");
+        let key_path = tmp_tls.join("bridge-key.pem");
+        fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\ncorrupted\n-----END CERTIFICATE-----\n").unwrap();
+        fs::write(&key_path, "-----BEGIN PRIVATE KEY-----\ncorrupted\n-----END PRIVATE KEY-----\n").unwrap();
+
+        let acceptor = create_tls_acceptor(&cert_path, &key_path);
+        assert!(
+            acceptor.is_ok(),
+            "create_tls_acceptor must self-heal corrupted PEM files on disk"
+        );
+
+        // Occupy a random local TCP port with a raw non-TLS listener and verify
+        // spawn_embedded_reverse_proxy_with_port detects it is not our TLS proxy and binds a fallback port.
+        let dummy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = dummy_listener.local_addr().unwrap().to_string();
+        let occupied_port = dummy_listener.local_addr().unwrap().port().to_string();
+
+        let (returned_cert, bound_port) =
+            spawn_embedded_reverse_proxy_with_port(&occupied_addr).unwrap();
+        assert!(returned_cert.is_file());
+        assert_ne!(
+            bound_port, occupied_port,
+            "must bind a fallback port when requested port is occupied by a non-proxy listener"
+        );
+        let verified = verify_existing_tls_proxy_listener(
+            &format!("127.0.0.1:{}", bound_port),
+            &returned_cert,
+        );
+        assert!(
+            verified,
+            "spawned fallback proxy listener must pass TLS /health verification"
+        );
+
+        drop(dummy_listener);
+        let _ = fs::remove_dir_all(&tmp_tls);
+    }
+
+    #[test]
+    fn test_cli_arg_injection_before_double_dash_lightweight_subcommands_and_doctor_guard() {
+        let args = vec![
+            "exec".to_string(),
+            "--full-auto".to_string(),
+            "--".to_string(),
+            "-leading-dash-prompt".to_string(),
+        ];
+        let injected = inject_loopback_base_url(&args, "20129");
+        assert_eq!(
+            injected,
+            vec![
+                "exec".to_string(),
+                "--full-auto".to_string(),
+                "-c".to_string(),
+                "chatgpt_base_url=\"https://127.0.0.1:20129/backend-api/\"".to_string(),
+                "--".to_string(),
+                "-leading-dash-prompt".to_string(),
+            ]
+        );
+
+        for sub in [
+            "sandbox",
+            "stdio-to-uds",
+            "mcp",
+            "plugin",
+            "update",
+            "debug",
+            "apply",
+            "archive",
+            "unarchive",
+            "delete",
+            "migrate-rollouts",
+            "app",
+            "generate-ts",
+            "generate-json-schema",
+        ] {
+            assert!(
+                is_lightweight_cli_invocation(&[sub.to_string()]),
+                "{} must be classified as lightweight CLI invocation",
+                sub
+            );
+            assert!(
+                is_lightweight_cli_invocation(&[
+                    "-c".to_string(),
+                    "foo=bar".to_string(),
+                    sub.to_string()
+                ]),
+                "{} after -c flag must be classified as lightweight CLI invocation",
+                sub
+            );
+        }
+        assert!(!is_lightweight_cli_invocation(&[]));
+        assert!(!is_lightweight_cli_invocation(&[
+            "exec".to_string(),
+            "hello".to_string()
+        ]));
+        assert!(!is_lightweight_cli_invocation(&["app-server".to_string()]));
+
+        assert!(is_doctor_cli_invocation(&["--doctor".to_string()]));
+        assert!(is_doctor_cli_invocation(&["doctor".to_string()]));
+        assert!(is_doctor_cli_invocation(&["--proxy-status".to_string()]));
+        assert!(
+            !is_doctor_cli_invocation(&["exec".to_string(), "doctor".to_string()]),
+            "codex exec doctor must never be hijacked by run_doctor()"
+        );
     }
 }
