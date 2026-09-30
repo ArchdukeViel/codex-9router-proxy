@@ -88,6 +88,18 @@ fn parse_toml_key_value(line: &str) -> Option<(String, String)> {
     }
 }
 
+/// Check if a model identifier is a stock OpenAI / ChatGPT parent model
+/// (`gpt-*`, `o1*`, `o3*`, `o4*`, `chatgpt*`, `codex-*`).
+pub fn is_parent_chatgpt_model(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.starts_with("gpt-")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+        || lower.starts_with("chatgpt")
+        || lower.starts_with("codex-")
+}
+
 /// Parse top-level `model = "..."` from a role manifest file (`~/.codex/agents/<role>.toml`).
 pub fn parse_model_from_role_toml(content: &str) -> Option<String> {
     for line in content.lines() {
@@ -105,6 +117,104 @@ pub fn parse_model_from_role_toml(content: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Parse top-level `model_provider = "..."` from a role manifest file (`~/.codex/agents/<role>.toml`).
+pub fn parse_provider_from_role_toml(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if let Some((k, v)) = parse_toml_key_value(trimmed) {
+            if k.eq_ignore_ascii_case("model_provider") {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Parse provider name from `[model_providers.<provider>]` in `~/.codex/config.toml`.
+pub fn parse_provider_from_config_toml(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section = trimmed.trim_matches(|c| c == '[' || c == ']').trim();
+            if let Some(rest) = section.strip_prefix("model_providers.") {
+                let prov = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+                if !prov.is_empty() && !prov.eq_ignore_ascii_case("openai") {
+                    return Some(prov.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse `base_url = "..."` from `[model_providers.<provider>]` in `~/.codex/config.toml`.
+pub fn parse_provider_base_url_from_config_toml(content: &str, provider: &str) -> Option<String> {
+    let target_section = format!("model_providers.{}", provider.trim());
+    let mut in_target_provider = false;
+    let mut in_any_provider = false;
+    let mut fallback_base_url: Option<String> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section = trimmed.trim_matches(|c| c == '[' || c == ']').trim();
+            let normalized_section = section.replace(['"', '\''], "");
+            in_target_provider = normalized_section.eq_ignore_ascii_case(&target_section);
+            in_any_provider = normalized_section
+                .to_ascii_lowercase()
+                .starts_with("model_providers.");
+            continue;
+        }
+        if in_target_provider || in_any_provider {
+            if let Some((k, v)) = parse_toml_key_value(trimmed) {
+                if k.eq_ignore_ascii_case("base_url") {
+                    if in_target_provider {
+                        return Some(v);
+                    }
+                    if fallback_base_url.is_none() {
+                        fallback_base_url = Some(v);
+                    }
+                }
+            }
+        }
+    }
+    fallback_base_url
+}
+
+/// Read target subagent model provider from `<codex_home>/agents/*.toml` or `<codex_home>/config.toml`.
+pub fn read_provider_from_config_in_dir(codex_home: &Path) -> Option<String> {
+    for role in ["default", "worker", "explorer", "reviewer"] {
+        let role_file = codex_home.join("agents").join(format!("{}.toml", role));
+        if role_file.is_file() {
+            if let Ok(content) = fs::read_to_string(&role_file) {
+                if let Some(p) = parse_provider_from_role_toml(&content) {
+                    if !p.is_empty() && !p.eq_ignore_ascii_case("openai") {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    let config_path = codex_home.join("config.toml");
+    let content = fs::read_to_string(&config_path).ok()?;
+    parse_provider_from_config_toml(&content)
+}
+
+/// Read target subagent model provider from `~/.codex/agents/*.toml` or `~/.codex/config.toml`.
+pub fn read_provider_from_config() -> Option<String> {
+    let codex_home = get_codex_home_dir()?;
+    read_provider_from_config_in_dir(&codex_home)
 }
 
 /// Parse `[subagent_models]` or `[agents].default_subagent_model` from TOML text.
@@ -155,23 +265,27 @@ pub fn parse_model_from_toml(content: &str, role: &str) -> Option<String> {
     default_subagent_model
 }
 
-/// Read model configuration for a specific role from `~/.codex/agents/<role>.toml` or `~/.codex/config.toml`.
-pub fn read_model_from_config(role: &str) -> Option<String> {
-    if let Some(codex_home) = get_codex_home_dir() {
-        let role_file = codex_home
-            .join("agents")
-            .join(format!("{}.toml", role.to_lowercase()));
-        if role_file.is_file() {
-            if let Ok(content) = fs::read_to_string(&role_file) {
-                if let Some(m) = parse_model_from_role_toml(&content) {
-                    return Some(m);
-                }
+/// Read model configuration for a specific role from `<codex_home>/agents/<role>.toml` or `<codex_home>/config.toml`.
+pub fn read_model_from_config_in_dir(codex_home: &Path, role: &str) -> Option<String> {
+    let role_file = codex_home
+        .join("agents")
+        .join(format!("{}.toml", role.to_lowercase()));
+    if role_file.is_file() {
+        if let Ok(content) = fs::read_to_string(&role_file) {
+            if let Some(m) = parse_model_from_role_toml(&content) {
+                return Some(m);
             }
         }
     }
-    let config_path = get_config_path()?;
+    let config_path = codex_home.join("config.toml");
     let content = fs::read_to_string(&config_path).ok()?;
     parse_model_from_toml(&content, role)
+}
+
+/// Read model configuration for a specific role from `~/.codex/agents/<role>.toml` or `~/.codex/config.toml`.
+pub fn read_model_from_config(role: &str) -> Option<String> {
+    let codex_home = get_codex_home_dir()?;
+    read_model_from_config_in_dir(&codex_home, role)
 }
 
 /// Built-in default model name for a given role without consulting env/disk.
@@ -181,29 +295,43 @@ pub fn builtin_role_model(_role: &str) -> &'static str {
 }
 
 /// Map an agent role to a specialized model name with multi-tier resolution:
-/// 1. Environment variable override: `CODEX_<ROLE>_MODEL`
-/// 2. Generic environment variable override: `CODEX_SUBAGENT_MODEL`
-/// 3. Active `~/.codex/agents/<role>.toml` or `~/.codex/config.toml`
+/// 1. Explicit process environment variable override: `CODEX_<ROLE>_MODEL` or `CODEX_SUBAGENT_MODEL`
+///    (when set in process env and not merely inherited unchanged from `HKCU\Environment`)
+/// 2. Active `~/.codex/agents/<role>.toml` or `~/.codex/config.toml` (`read_model_from_config`)
+/// 3. Persisted Windows User Registry / environment variable (`CODEX_<ROLE>_MODEL`, `CODEX_DEFAULT_MODEL`)
 /// 4. Built-in default: `9router-subagent`
 pub fn map_role_to_model(role: Option<&str>) -> String {
     let role_str = role.unwrap_or("default");
     let role_lower =
         normalize_subagent_role_token(role_str).unwrap_or_else(|| role_str.trim().to_lowercase());
 
-    // 1. Specific role env var: CODEX_WORKER_MODEL, CODEX_EXPLORER_MODEL, etc.
     let env_role = format!("CODEX_{}_MODEL", role_lower.to_uppercase());
-    if let Ok(m) = env::var(&env_role) {
-        let trimmed = m.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+    let proc_role_val = env::var(&env_role)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let reg_role_val = get_user_env_var(&env_role)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // 1. Explicit process-level role override (when not merely inherited unchanged from HKCU\Environment)
+    if let Some(ref m) = proc_role_val {
+        if reg_role_val.as_deref() != Some(m.as_str()) {
+            return m.clone();
         }
     }
 
-    // 2. Generic subagent model env var: CODEX_SUBAGENT_MODEL
-    if let Ok(m) = env::var("CODEX_SUBAGENT_MODEL") {
-        let trimmed = m.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+    // 2. Generic subagent model process env var: CODEX_SUBAGENT_MODEL
+    let proc_generic_val = env::var("CODEX_SUBAGENT_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let reg_generic_val = get_user_env_var("CODEX_SUBAGENT_MODEL")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(ref m) = proc_generic_val {
+        if reg_generic_val.as_deref() != Some(m.as_str()) {
+            return m.clone();
         }
     }
 
@@ -212,7 +340,27 @@ pub fn map_role_to_model(role: Option<&str>) -> String {
         return m;
     }
 
-    // 4. Built-in default
+    // 4. Persisted environment / Windows User Registry fallback
+    if let Some(m) = proc_role_val.or(reg_role_val) {
+        return m;
+    }
+    if let Some(m) = proc_generic_val.or(reg_generic_val) {
+        return m;
+    }
+    if let Some(m) = env::var("CODEX_DEFAULT_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            get_user_env_var("CODEX_DEFAULT_MODEL")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    {
+        return m;
+    }
+
+    // 5. Built-in default
     builtin_role_model(&role_lower).to_string()
 }
 
@@ -546,7 +694,29 @@ pub fn contains_subagent_source(v: &Value) -> bool {
 
 /// Retrieve the configured target model provider (defaults to "9router").
 pub fn get_target_model_provider() -> String {
-    env::var("CODEX_SUBAGENT_PROVIDER").unwrap_or_else(|_| "9router".to_string())
+    let proc_val = env::var("CODEX_SUBAGENT_PROVIDER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let reg_val = get_user_env_var("CODEX_SUBAGENT_PROVIDER")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(ref p) = proc_val {
+        if reg_val.as_deref() != Some(p.as_str()) {
+            return p.clone();
+        }
+    }
+
+    if let Some(cfg_prov) = read_provider_from_config() {
+        return cfg_prov;
+    }
+
+    if let Some(p) = proc_val.or(reg_val) {
+        return p;
+    }
+
+    "9router".to_string()
 }
 
 /// Parse the value of a registry key from `reg query HKCU\Environment /v <name>` output.
@@ -984,14 +1154,7 @@ pub fn route_thread_params(params: &mut serde_json::Map<String, Value>) -> bool 
         let needs_model = match params.get("model") {
             None => true,
             Some(Value::Null) => true,
-            Some(Value::String(s)) => {
-                s.is_empty()
-                    || (is_subagent
-                        && (s.starts_with("gpt-")
-                            || s.starts_with("o1")
-                            || s.starts_with("o3")
-                            || s.starts_with("chatgpt")))
-            }
+            Some(Value::String(s)) => s.is_empty() || (is_subagent && is_parent_chatgpt_model(s)),
             _ => false,
         };
 
@@ -1087,10 +1250,7 @@ pub fn is_subagent_model_name(m: &str) -> bool {
     for role in ["default", "worker", "explorer", "reviewer"] {
         let configured = map_role_to_model(Some(role));
         if !configured.is_empty()
-            && !configured.starts_with("gpt-")
-            && !configured.starts_with("o1")
-            && !configured.starts_with("o3")
-            && !configured.starts_with("chatgpt")
+            && !is_parent_chatgpt_model(&configured)
             && lower == configured.to_lowercase()
         {
             return true;
@@ -1125,7 +1285,19 @@ pub fn is_models_path(path: &str) -> bool {
 
 /// Retrieve the configured loopback proxy port (default: 20129).
 pub fn get_proxy_port() -> String {
-    env::var("CODEX_PROXY_PORT").unwrap_or_else(|_| "20129".to_string())
+    if let Ok(p) = env::var("CODEX_PROXY_PORT") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Some(p) = get_user_env_var("CODEX_PROXY_PORT") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "20129".to_string()
 }
 
 /// Retrieve the official ChatGPT upstream base URL (default: <https://chatgpt.com>).
@@ -1133,26 +1305,74 @@ pub fn get_chatgpt_upstream_base() -> String {
     env::var("CODEX_CHATGPT_UPSTREAM_URL").unwrap_or_else(|_| "https://chatgpt.com".to_string())
 }
 
+/// Normalize a raw base URL or endpoint into a `/v1/responses` (or `/responses`) endpoint URL.
+pub fn normalize_subagent_responses_endpoint(ep: &str) -> Option<String> {
+    let trimmed = ep.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.ends_with("/responses") {
+        return Some(trimmed.to_string());
+    }
+    if trimmed.ends_with("/v1") {
+        return Some(format!("{}/responses", trimmed));
+    }
+    Some(format!("{}/v1/responses", trimmed))
+}
+
+/// Read subagent provider `base_url` from `<codex_home>/config.toml`.
+pub fn read_subagent_endpoint_from_config_in_dir(
+    codex_home: &Path,
+    provider: &str,
+) -> Option<String> {
+    let config_path = codex_home.join("config.toml");
+    let content = fs::read_to_string(&config_path).ok()?;
+    let base_url = parse_provider_base_url_from_config_toml(&content, provider)?;
+    normalize_subagent_responses_endpoint(&base_url)
+}
+
+/// Read subagent provider `base_url` from `~/.codex/config.toml`.
+pub fn read_subagent_endpoint_from_config(provider: &str) -> Option<String> {
+    let codex_home = get_codex_home_dir()?;
+    read_subagent_endpoint_from_config_in_dir(&codex_home, provider)
+}
+
 /// Retrieve the 9Router / subagent responses target endpoint.
 pub fn get_subagent_responses_url() -> String {
-    if let Ok(ep) = env::var("CODEX_SUBAGENT_ENDPOINT") {
-        let trimmed = ep.trim().trim_end_matches('/');
-        if !trimmed.is_empty() {
-            if trimmed.ends_with("/responses") {
-                return trimmed.to_string();
-            }
-            if trimmed.ends_with("/v1") {
-                return format!("{}/responses", trimmed);
-            }
-            return format!("{}/v1/responses", trimmed);
+    let proc_val = env::var("CODEX_SUBAGENT_ENDPOINT")
+        .ok()
+        .and_then(|s| normalize_subagent_responses_endpoint(&s));
+    let reg_val = get_user_env_var("CODEX_SUBAGENT_ENDPOINT")
+        .and_then(|s| normalize_subagent_responses_endpoint(&s));
+
+    if let Some(ref ep) = proc_val {
+        if reg_val.as_deref() != Some(ep.as_str()) {
+            return ep.clone();
         }
     }
+
+    let provider = get_target_model_provider();
+    if let Some(cfg_ep) = read_subagent_endpoint_from_config(&provider) {
+        return cfg_ep;
+    }
+
+    if let Some(ep) = proc_val.or(reg_val) {
+        return ep;
+    }
+
     "http://127.0.0.1:20128/v1/responses".to_string()
 }
 
 /// Retrieve authorization header for 9Router subagents.
 pub fn get_subagent_auth_header() -> Option<String> {
     if let Ok(key) = env::var("NINEROUTER_KEY") {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            return Some(format!("Bearer {}", trimmed));
+        }
+        return None;
+    }
+    if let Some(key) = get_user_env_var("NINEROUTER_KEY") {
         let trimmed = key.trim();
         if !trimmed.is_empty() {
             return Some(format!("Bearer {}", trimmed));
@@ -1517,13 +1737,7 @@ pub fn inspect_and_route_http_request_with_headers(
 
     let needs_model_rewrite = match current_model.as_deref() {
         None => true,
-        Some(m) => {
-            m.is_empty()
-                || m.starts_with("gpt-")
-                || m.starts_with("o1")
-                || m.starts_with("o3")
-                || m.starts_with("chatgpt")
-        }
+        Some(m) => m.is_empty() || is_parent_chatgpt_model(m),
     };
 
     if needs_model_rewrite {
@@ -1550,10 +1764,60 @@ pub fn inspect_and_route_http_request(path: &str, body: &[u8]) -> (bool, Vec<u8>
     inspect_and_route_http_request_with_headers(path, &HeaderMap::new(), body)
 }
 
+/// Resolve the subagent context window given an optional string override or the parent template
+/// (defaulting to `872000`).
+pub fn resolve_subagent_context_window_with_override(
+    template: Option<&Value>,
+    env_override: Option<&str>,
+) -> u64 {
+    if let Some(raw) = env_override {
+        if let Ok(parsed) = raw.trim().parse::<u64>() {
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
+    let tmpl_max = template
+        .and_then(|t| {
+            t.get("max_context_window")
+                .or_else(|| t.get("context_window"))
+        })
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    tmpl_max.max(872_000)
+}
+
+/// Resolve the subagent context window from `CODEX_SUBAGENT_CONTEXT_WINDOW` or the parent template
+/// (defaulting to `872000`).
+pub fn resolve_subagent_context_window(template: Option<&Value>) -> u64 {
+    let env_override = env::var("CODEX_SUBAGENT_CONTEXT_WINDOW")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            get_user_env_var("CODEX_SUBAGENT_CONTEXT_WINDOW").filter(|s| !s.trim().is_empty())
+        });
+    resolve_subagent_context_window_with_override(template, env_override.as_deref())
+}
+
+/// Resolve the subagent `comp_hash` from the matched parent template (defaulting to `"3000"`).
+pub fn resolve_subagent_comp_hash(template: Option<&Value>) -> String {
+    template
+        .and_then(|t| t.get("comp_hash"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("3000")
+        .to_string()
+}
+
 fn apply_subagent_model_metadata_fields(
     entry_obj: &mut serde_json::Map<String, Value>,
     slug: &str,
+    template: Option<&Value>,
 ) {
+    let context_window = resolve_subagent_context_window(template);
+    let comp_hash = resolve_subagent_comp_hash(template);
+
     entry_obj.insert("slug".to_string(), Value::String(slug.to_string()));
     if entry_obj.contains_key("id") {
         entry_obj.insert("id".to_string(), Value::String(slug.to_string()));
@@ -1567,17 +1831,20 @@ fn apply_subagent_model_metadata_fields(
         Value::String("Subagent model routed via Codex 9Router Proxy".to_string()),
     );
     entry_obj.insert("prefer_websockets".to_string(), Value::Bool(false));
-    entry_obj.insert("context_window".to_string(), serde_json::json!(872000));
-    entry_obj.insert("max_context_window".to_string(), serde_json::json!(872000));
+    entry_obj.insert(
+        "context_window".to_string(),
+        serde_json::json!(context_window),
+    );
+    entry_obj.insert(
+        "max_context_window".to_string(),
+        serde_json::json!(context_window),
+    );
     entry_obj.insert("auto_compact_token_limit".to_string(), Value::Null);
     entry_obj.insert(
         "effective_context_window_percent".to_string(),
         serde_json::json!(95),
     );
-    entry_obj.insert(
-        "comp_hash".to_string(),
-        Value::String("3000".to_string()),
-    );
+    entry_obj.insert("comp_hash".to_string(), Value::String(comp_hash));
     entry_obj.insert(
         "apply_patch_tool_type".to_string(),
         Value::String("function".to_string()),
@@ -1627,8 +1894,9 @@ fn apply_subagent_model_metadata_fields(
 /// Inject subagent model metadata descriptors (`9router-subagent`, `implement`, `explore`, `review`,
 /// and any configured role models) into the `/backend-api/models` or `models_cache.json` JSON payload
 /// so `codex.orig.exe` never logs `Model metadata for ... not found`, aligns subagent context metadata
-/// with `gpt-6-luna` (`context_window: 872000`, `max_context_window: 872000`,
-/// `effective_context_window_percent: 95`, `comp_hash: "3000"`), and configures function `apply_patch`.
+/// with the active parent model template (preserving its `comp_hash` or defaulting to `"3000"`, with
+/// `context_window: 872000`, `max_context_window: 872000`, `effective_context_window_percent: 95`),
+/// and configures function `apply_patch`.
 pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
     let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
         return body.to_vec();
@@ -1650,7 +1918,7 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
         return body.to_vec();
     };
 
-    // Prefer "gpt-6-luna" in models_arr as the base template, falling back to models_arr.first()
+    // Prefer "gpt-6-luna" in models_arr as the base template, falling back to the first non-subagent parent model
     let template = models_arr
         .iter()
         .find(|item| {
@@ -1658,6 +1926,14 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
                 .or_else(|| item.get("id"))
                 .and_then(|s| s.as_str())
                 .is_some_and(|s| s.eq_ignore_ascii_case("gpt-6-luna"))
+        })
+        .or_else(|| {
+            models_arr.iter().find(|item| {
+                item.get("slug")
+                    .or_else(|| item.get("id"))
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| !is_subagent_model_name(s))
+            })
         })
         .or_else(|| models_arr.first())
         .cloned();
@@ -1690,7 +1966,7 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
                         }
                     }
                 }
-                apply_subagent_model_metadata_fields(entry_obj, &slug);
+                apply_subagent_model_metadata_fields(entry_obj, &slug, template.as_ref());
             }
             continue;
         }
@@ -1737,7 +2013,7 @@ pub fn inject_subagent_models_metadata(body: &[u8]) -> Vec<u8> {
         };
 
         if let Some(entry_obj) = entry.as_object_mut() {
-            apply_subagent_model_metadata_fields(entry_obj, &slug);
+            apply_subagent_model_metadata_fields(entry_obj, &slug, template.as_ref());
         }
 
         models_arr.push(entry);
@@ -1935,13 +2211,7 @@ pub fn build_9router_compaction_request_body(body: &[u8]) -> Option<Vec<u8>> {
     let obj = json.as_object_mut()?;
     let needs_model_rewrite = match obj.get("model").and_then(|v| v.as_str()) {
         None => true,
-        Some(m) => {
-            m.is_empty()
-                || m.starts_with("gpt-")
-                || m.starts_with("o1")
-                || m.starts_with("o3")
-                || m.starts_with("chatgpt")
-        }
+        Some(m) => m.is_empty() || is_parent_chatgpt_model(m),
     };
     if needs_model_rewrite {
         let detected_role = find_agent_role(&Value::Object(obj.clone()));
@@ -2595,21 +2865,22 @@ pub fn is_hop_by_hop_header(name: &str) -> bool {
     )
 }
 
-/// Build headers to forward upstream to either 9Router or ChatGPT.
-pub fn build_forward_headers(incoming_headers: &HeaderMap, is_subagent: bool) -> HeaderMap {
+/// Build headers to forward upstream with an explicit optional subagent authorization header.
+/// Never forwards the user's incoming ChatGPT OAuth `Authorization` header to subagent endpoints.
+pub fn build_forward_headers_with_subagent_auth(
+    incoming_headers: &HeaderMap,
+    is_subagent: bool,
+    subagent_auth: Option<&str>,
+) -> HeaderMap {
     let mut out = HeaderMap::new();
-    let mut client_auth: Option<HeaderValue> = None;
 
     for (key, value) in incoming_headers.iter() {
         let key_str = key.as_str();
         if is_hop_by_hop_header(key_str) || key_str.eq_ignore_ascii_case("content-length") {
             continue;
         }
-        if key_str.eq_ignore_ascii_case("authorization") {
-            client_auth = Some(value.clone());
-            if is_subagent {
-                continue;
-            }
+        if is_subagent && key_str.eq_ignore_ascii_case("authorization") {
+            continue;
         }
         if is_subagent && key_str.eq_ignore_ascii_case("content-encoding") {
             // Subagent requests are forwarded as decompressed JSON
@@ -2619,21 +2890,26 @@ pub fn build_forward_headers(incoming_headers: &HeaderMap, is_subagent: bool) ->
     }
 
     if is_subagent {
-        if let Some(auth_str) = get_subagent_auth_header() {
-            if let Ok(val) = HeaderValue::from_str(&auth_str) {
-                out.insert(header::AUTHORIZATION, val);
-            }
-        } else if let Some(orig) = client_auth {
-            out.insert(header::AUTHORIZATION, orig);
-        } else {
-            out.insert(
-                header::AUTHORIZATION,
-                HeaderValue::from_static("Bearer dummy-9router-key"),
-            );
-        }
+        let auth_val = subagent_auth
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .and_then(|auth_str| HeaderValue::from_str(auth_str).ok())
+            .unwrap_or_else(|| HeaderValue::from_static("Bearer dummy-9router-key"));
+        out.insert(header::AUTHORIZATION, auth_val);
     }
 
     out
+}
+
+/// Build headers to forward upstream to either 9Router or ChatGPT.
+/// Never forwards the user's incoming ChatGPT OAuth `Authorization` header to subagent endpoints.
+pub fn build_forward_headers(incoming_headers: &HeaderMap, is_subagent: bool) -> HeaderMap {
+    let subagent_auth = if is_subagent {
+        get_subagent_auth_header()
+    } else {
+        None
+    };
+    build_forward_headers_with_subagent_auth(incoming_headers, is_subagent, subagent_auth.as_deref())
 }
 
 /// Filter upstream response headers before returning to the local Codex client.
@@ -6374,5 +6650,172 @@ default_subagent_model = "9router-subagent"
             "\"encrypted_content\":\"Previous-model fallback compacted via 9Router.\""
         ));
         let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_subagent_never_leaks_chatgpt_oauth_token_when_ninerouter_key_unset() {
+        let mut incoming = HeaderMap::new();
+        incoming.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.chatgpt_oauth_secret"),
+        );
+        incoming.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        let subagent_headers_no_key = build_forward_headers_with_subagent_auth(&incoming, true, None);
+        assert_eq!(
+            subagent_headers_no_key
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer dummy-9router-key"),
+            "subagent requests must replace incoming ChatGPT OAuth token with dummy-9router-key when NINEROUTER_KEY is unset"
+        );
+
+        let subagent_headers_empty_key =
+            build_forward_headers_with_subagent_auth(&incoming, true, Some("   "));
+        assert_eq!(
+            subagent_headers_empty_key
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer dummy-9router-key")
+        );
+
+        let subagent_headers_custom_key =
+            build_forward_headers_with_subagent_auth(&incoming, true, Some("Bearer custom-9router-token"));
+        assert_eq!(
+            subagent_headers_custom_key
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer custom-9router-token")
+        );
+
+        let parent_headers = build_forward_headers_with_subagent_auth(&incoming, false, None);
+        assert_eq!(
+            parent_headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.chatgpt_oauth_secret"),
+            "parent requests must preserve incoming ChatGPT OAuth token"
+        );
+    }
+
+    #[test]
+    fn test_inject_subagent_models_metadata_inherits_non_luna_parent_comp_hash_and_context_override() {
+        // 1. Catalog where primary parent model is gpt-5.4 with comp_hash = "1000" (no gpt-6-luna)
+        let catalog_gpt54 = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.4",
+                    "display_name": "GPT-5.4",
+                    "context_window": 272000,
+                    "max_context_window": 400000,
+                    "comp_hash": "1000"
+                }
+            ]
+        });
+        let enriched_bytes =
+            inject_subagent_models_metadata(&serde_json::to_vec(&catalog_gpt54).unwrap());
+        let enriched: Value = serde_json::from_slice(&enriched_bytes).unwrap();
+        let models = enriched["models"].as_array().unwrap();
+        let subagent = models
+            .iter()
+            .find(|m| m["slug"] == "9router-subagent")
+            .unwrap();
+        assert_eq!(
+            subagent["comp_hash"], "1000",
+            "must inherit comp_hash from parent gpt-5.4 template to prevent comp_hash_changed compaction"
+        );
+        assert_eq!(subagent["context_window"], 872000);
+        assert_eq!(subagent["max_context_window"], 872000);
+
+        // 2. Explicit CODEX_SUBAGENT_CONTEXT_WINDOW override and larger parent template fallback
+        let tmpl = &catalog_gpt54["models"][0];
+        assert_eq!(
+            resolve_subagent_context_window_with_override(Some(tmpl), Some("256000")),
+            256000
+        );
+        assert_eq!(
+            resolve_subagent_context_window_with_override(Some(tmpl), None),
+            872000
+        );
+        let large_tmpl = serde_json::json!({"max_context_window": 1000000, "comp_hash": "5000"});
+        assert_eq!(
+            resolve_subagent_context_window_with_override(Some(&large_tmpl), None),
+            1000000
+        );
+        assert_eq!(resolve_subagent_comp_hash(Some(&large_tmpl)), "5000");
+        assert_eq!(resolve_subagent_comp_hash(None), "3000");
+    }
+
+    #[test]
+    fn test_is_parent_chatgpt_model_includes_o4_and_codex_prefixes() {
+        assert!(is_parent_chatgpt_model("gpt-6-luna"));
+        assert!(is_parent_chatgpt_model("gpt-5.4"));
+        assert!(is_parent_chatgpt_model("o1-pro"));
+        assert!(is_parent_chatgpt_model("o3-mini"));
+        assert!(is_parent_chatgpt_model("o4-mini"));
+        assert!(is_parent_chatgpt_model("codex-mini-latest"));
+        assert!(is_parent_chatgpt_model("chatgpt-4o-latest"));
+        assert!(!is_parent_chatgpt_model("9router-subagent"));
+        assert!(!is_parent_chatgpt_model("qwen2.5-coder:32b"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-openai-subagent", HeaderValue::from_static("worker"));
+        for parent_model in ["o4-mini", "codex-mini-latest"] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": parent_model,
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "test"}]}]
+            }))
+            .unwrap();
+            let (is_sub, routed) = inspect_and_route_http_request_with_headers(
+                "/backend-api/codex/responses",
+                &headers,
+                &body,
+            );
+            assert!(is_sub);
+            let parsed: Value = serde_json::from_slice(&routed).unwrap();
+            assert_eq!(parsed["model"], map_role_to_model(Some("worker")));
+        }
+    }
+
+    #[test]
+    fn test_config_and_role_toml_resolution_for_models_provider_and_endpoint() {
+        let tmp_home =
+            env::temp_dir().join(format!("codex_home_portability_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_home);
+        let agents_dir = tmp_home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        fs::write(
+            agents_dir.join("worker.toml"),
+            "name = \"worker\"\nmodel = \"hot-reloaded-worker\"\nmodel_provider = \"ollama\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_home.join("config.toml"),
+            "[model_providers.ollama]\nname = \"ollama\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n\n[agents]\ndefault_subagent_model = \"hot-reloaded-default\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_model_from_config_in_dir(&tmp_home, "worker").as_deref(),
+            Some("hot-reloaded-worker")
+        );
+        assert_eq!(
+            read_model_from_config_in_dir(&tmp_home, "explorer").as_deref(),
+            Some("hot-reloaded-default")
+        );
+        assert_eq!(
+            read_provider_from_config_in_dir(&tmp_home).as_deref(),
+            Some("ollama")
+        );
+        assert_eq!(
+            read_subagent_endpoint_from_config_in_dir(&tmp_home, "ollama").as_deref(),
+            Some("http://127.0.0.1:11434/v1/responses")
+        );
+
+        let _ = fs::remove_dir_all(&tmp_home);
     }
 }

@@ -339,6 +339,40 @@ $customShim = Join-Path $customDir "codex-9router-subagents.exe"
 $env:CODEX_CLI_PATH = $customShim
 Write-Host "[OK] Saved CODEX_CLI_PATH -> $customShim (User Environment)." -ForegroundColor Green
 
+# Ensure %LOCALAPPDATA%\OpenAI\Codex\custom is in User PATH so `codex --doctor` and `codex exec` work in all terminals
+$normalizedCustomDir = $customDir.TrimEnd('\')
+$userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+$userPathEntries = if ([string]::IsNullOrWhiteSpace($userPath)) {
+    @()
+} else {
+    @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+$alreadyInUserPath = $false
+foreach ($entry in $userPathEntries) {
+    if ($entry.Trim().TrimEnd('\') -ieq $normalizedCustomDir) {
+        $alreadyInUserPath = $true
+        break
+    }
+}
+if (-not $alreadyInUserPath) {
+    $newUserPath = (@($customDir) + $userPathEntries) -join ';'
+    [System.Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+    Write-Host "[OK] Added $customDir to Windows User PATH." -ForegroundColor Green
+} else {
+    Write-Host "[OK] $customDir is already in Windows User PATH." -ForegroundColor Green
+}
+if (-not (($env:Path -split ';') | Where-Object { $_.Trim().TrimEnd('\') -ieq $normalizedCustomDir })) {
+    $env:Path = "$customDir;$env:Path"
+}
+
+$proxyPort = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_PROXY_PORT)) {
+    [int]$env:CODEX_PROXY_PORT
+} elseif (-not [string]::IsNullOrWhiteSpace([System.Environment]::GetEnvironmentVariable("CODEX_PROXY_PORT", "User"))) {
+    [int][System.Environment]::GetEnvironmentVariable("CODEX_PROXY_PORT", "User")
+} else {
+    20129
+}
+
 # 3. Configure ~/.codex/config.toml (BOM-Free UTF-8)
 $codexDir = Join-Path $env:USERPROFILE ".codex"
 if (-not (Test-Path $codexDir)) {
@@ -446,7 +480,8 @@ Write-Host "[OK] Configured $configFile and role manifests in $agentsDir (BOM-Fr
 # 4. Inject SQLite Automatic Provider Trigger into Databases
 $dbCandidates = @(
     (Join-Path $codexDir "state_5.sqlite"),
-    (Join-Path $codexDir "sqlite\state_5.sqlite")
+    (Join-Path $codexDir "sqlite\state_5.sqlite"),
+    (Join-Path $codexDir "sqlite\codex-dev.db")
 )
 
 $hasPython = [bool](Get-Command python -ErrorAction SilentlyContinue)
@@ -457,16 +492,27 @@ if ($hasPython) {
 import sqlite3, sys
 db_path = r'$db'
 provider = r'$Provider'
+models = [r'$DefaultModel', r'$WorkerModel', r'$ExplorerModel', r'$ReviewerModel', 'implement', 'explore', 'review']
+def q(s):
+    return "'" + s.replace("'", "''") + "'"
+unique_models = []
+for m in models:
+    m_clean = m.strip()
+    if m_clean and m_clean not in unique_models:
+        unique_models.append(m_clean)
+models_in_clause = ", ".join(q(m) for m in unique_models)
+provider_lit = q(provider.strip() or '9router')
 try:
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute('''
-    CREATE TRIGGER IF NOT EXISTS fix_subagent_provider_trigger
+    cur.execute("DROP TRIGGER IF EXISTS fix_subagent_provider_trigger;")
+    cur.execute(f'''
+    CREATE TRIGGER fix_subagent_provider_trigger
     AFTER INSERT ON threads
     FOR EACH ROW
-    WHEN (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.model LIKE '%9router%' OR NEW.model IN ('implement', 'explore', 'review'))
+    WHEN (NEW.agent_role IS NOT NULL OR NEW.thread_source = 'subagent' OR NEW.model LIKE '%9router%' OR NEW.model IN ({models_in_clause}))
     BEGIN
-        UPDATE threads SET model_provider = provider WHERE id = NEW.id;
+        UPDATE threads SET model_provider = {provider_lit} WHERE id = NEW.id;
     END;
     ''')
     conn.commit()
@@ -518,10 +564,10 @@ if (-not (Test-Path $releaseBinary)) {
 }
 Write-Host "[OK] Release binary ready ($((Get-Item $releaseBinary).Length) bytes)." -ForegroundColor Green
 
-# 6. Stop running codex processes, hidden-desktop ChatGPT.exe instances, and port 20129 listeners before hooking
+# 6. Stop running codex processes, hidden-desktop ChatGPT.exe instances, and port listeners before hooking
 Write-Host "[*] Checking for running codex processes..." -ForegroundColor Gray
 Clear-HiddenDesktopCodexGui
-Get-NetTCPConnection -LocalPort 20129 -ErrorAction SilentlyContinue | ForEach-Object {
+Get-NetTCPConnection -LocalPort $proxyPort -ErrorAction SilentlyContinue | ForEach-Object {
     $procId = $_.OwningProcess
     if ($procId -gt 0 -and $procId -ne $PID) {
         Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
@@ -771,13 +817,48 @@ if ($storeResDir) {
             }
         }
     }
+} else {
+    # Non-Microsoft-Store fallback: locate stock codex.exe (> 10 MB) from desktop bin, daemon releases, or Programs
+    $fallbackStockItem = $null
+    $fallbackCandidates = @()
+    if (Test-Path $desktopBinRoot) {
+        $fallbackCandidates += Get-ChildItem -Path "$desktopBinRoot\*\codex.orig.exe", "$desktopBinRoot\*\codex.exe" -File -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $daemonReleases) {
+        $fallbackCandidates += Get-ChildItem -Path "$daemonReleases\*\bin\codex.orig.exe", "$daemonReleases\*\bin\codex.exe" -File -ErrorAction SilentlyContinue
+    }
+    $progCodex = Join-Path $localAppData "Programs\OpenAI\Codex\bin\codex.exe"
+    if (Test-Path $progCodex) {
+        $fallbackCandidates += Get-Item $progCodex -ErrorAction SilentlyContinue
+    }
+    $fallbackStockItem = $fallbackCandidates | Where-Object { $_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    if ($fallbackStockItem) {
+        $stockDir = $fallbackStockItem.DirectoryName
+        foreach ($origName in @("codex-9router-subagents.orig.exe", "codex.orig.exe")) {
+            $origDst = Join-Path $customDir $origName
+            if ((-not (Test-Path $origDst)) -or ((Get-Item $origDst).Length -lt 10000000)) {
+                if (Safe-CopyExecutable -Source $fallbackStockItem.FullName -Destination $origDst) {
+                    Write-Host "[OK] Synchronized $origName from local stock binary ($($fallbackStockItem.Length) bytes)." -ForegroundColor Green
+                }
+            }
+        }
+        foreach ($helper in $customHelpers) {
+            $hSrc = Join-Path $stockDir $helper
+            $hDst = Join-Path $customDir $helper
+            if ((Test-Path $hSrc) -and -not (Test-Path $hDst)) {
+                if (Safe-CopyExecutable -Source $hSrc -Destination $hDst) {
+                    Write-Host "[OK] Synchronized helper $helper to $customDir." -ForegroundColor Green
+                }
+            }
+        }
+    }
 }
 
-# Synchronize ~/.codex/models_cache.json in place with gpt-6-luna aligned subagent metadata (872k/872k, comp_hash=3000)
+# Synchronize ~/.codex/models_cache.json in place with active parent model subagent metadata
 $modelsCache = Join-Path $codexDir "models_cache.json"
 if (Test-Path $modelsCache) {
     & $releaseBinary --doctor 2>&1 | Out-Null
-    Write-Host "[OK] Synchronized subagent model metadata in $modelsCache (aligned with gpt-6-luna)." -ForegroundColor Green
+    Write-Host "[OK] Synchronized subagent model metadata in $modelsCache." -ForegroundColor Green
 }
 
 # 10. Register Self-Healing Startup Hook
@@ -788,6 +869,7 @@ $syncScript = @"
 `$proxyPath = Join-Path `$customDir 'codex-9router-subagents.exe'
 `$customCodex = Join-Path `$customDir 'codex.exe'
 `$binRoot = Join-Path `$env:LOCALAPPDATA 'OpenAI\Codex\bin'
+`$proxyPort = if (`$env:CODEX_PROXY_PORT -and `$env:CODEX_PROXY_PORT.Trim()) { [int]`$env:CODEX_PROXY_PORT.Trim() } else { $proxyPort }
 
 function Sync-Executable {
     param(
@@ -842,7 +924,7 @@ if (-not `$resDir -or -not (Test-Path `$resDir)) {
 `$binHelpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe')
 `$customHelpers = @('codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-service.exe', 'codex-windows-sandbox-setup.exe', 'rg.exe')
 
-# 3. Refresh custom\codex.orig.exe, custom\codex-9router-subagents.orig.exe, and custom\ helpers when MS Store package updates
+# 3. Refresh custom\codex.orig.exe, custom\codex-9router-subagents.orig.exe, and custom\ helpers when MS Store package updates (or fallback to binRoot stock binary)
 if (`$resDir -and (Test-Path `$resDir)) {
     `$storeCodex = Join-Path `$resDir 'codex.exe'
     if (Test-Path `$storeCodex) {
@@ -861,6 +943,16 @@ if (`$resDir -and (Test-Path `$resDir)) {
             `$hItem = Get-Item `$hs
             if ((-not (Test-Path `$hd)) -or ((Get-Item `$hd).Length -ne `$hItem.Length) -or ((Get-Item `$hd).LastWriteTimeUtc -ne `$hItem.LastWriteTimeUtc)) {
                 Sync-Executable -Source `$hs -Destination `$hd | Out-Null
+            }
+        }
+    }
+} elseif (Test-Path `$binRoot) {
+    `$fbStock = Get-ChildItem -Path "`$binRoot\*\codex.orig.exe", "`$binRoot\*\codex.exe" -File | Where-Object { `$_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    if (`$fbStock) {
+        foreach (`$origName in @('codex-9router-subagents.orig.exe', 'codex.orig.exe')) {
+            `$origDst = Join-Path `$customDir `$origName
+            if ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -lt 10000000)) {
+                Sync-Executable -Source `$fbStock.FullName -Destination `$origDst | Out-Null
             }
         }
     }
@@ -930,15 +1022,15 @@ if (`$chatGptPids.Count -gt 0) {
     }
 }
 if (-not (Get-Process -Name 'ChatGPT*')) {
-    @(
-        "`$env:APPDATA\Codex\web\Codex\lockfile",
-        "`$env:LOCALAPPDATA\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Roaming\Codex\web\Codex\lockfile"
-    ) | Where-Object { Test-Path `$_ } | Remove-Item -Force
+    `$lockCandidates = @("`$env:APPDATA\Codex\web\Codex\lockfile")
+    `$pkgLocks = Get-ChildItem "`$env:LOCALAPPDATA\Packages\OpenAI.Codex*\LocalCache\Roaming\Codex\web\Codex\lockfile" -File -ErrorAction SilentlyContinue
+    if (`$pkgLocks) { `$lockCandidates += `$pkgLocks.FullName }
+    `$lockCandidates | Where-Object { Test-Path `$_ } | Remove-Item -Force
 }
 
 if (Test-Path `$proxyPath) {
     & `$proxyPath --doctor 2>&1 | Out-Null
-    if (-not (Get-NetTCPConnection -LocalPort 20129 -State Listen -ErrorAction SilentlyContinue)) {
+    if (-not (Get-NetTCPConnection -LocalPort `$proxyPort -State Listen -ErrorAction SilentlyContinue)) {
         Start-Process -FilePath `$proxyPath -ArgumentList "--proxy-daemon" -WindowStyle Hidden
     }
 }
@@ -952,7 +1044,7 @@ $cmdContent = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -W
 Write-Host "[OK] Registered self-healing startup hook in $startupCmd." -ForegroundColor Green
 
 # 11. Terminate any stale .old.* processes that respawned during copy and clean up .old.* files
-Get-NetTCPConnection -LocalPort 20129 -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
+Get-NetTCPConnection -LocalPort $proxyPort -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
     $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
     if ($p -and ($p.Name -like "*.old*" -or $p.Path -like "*.old.*")) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
@@ -962,10 +1054,10 @@ Get-Process -Name "*.old*" -ErrorAction SilentlyContinue | Stop-Process -Force -
 Start-Sleep -Milliseconds 600
 Get-ChildItem "$desktopBinRoot\*\*.old.*", "$customDir\*.old.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-# 12. Ensure background reverse-proxy listener (:20129) and app-server daemon are running
-Write-Host "[*] Ensuring reverse proxy listener on 127.0.0.1:20129..." -ForegroundColor Gray
+# 12. Ensure background reverse-proxy listener (:$proxyPort) and app-server daemon are running
+Write-Host "[*] Ensuring reverse proxy listener on 127.0.0.1:$proxyPort..." -ForegroundColor Gray
 try {
-    if (-not (Get-NetTCPConnection -LocalPort 20129 -State Listen -ErrorAction SilentlyContinue)) {
+    if (-not (Get-NetTCPConnection -LocalPort $proxyPort -State Listen -ErrorAction SilentlyContinue)) {
         Start-Process -FilePath $customShim -ArgumentList "--proxy-daemon" -WindowStyle Hidden
         Start-Sleep -Milliseconds 500
     }

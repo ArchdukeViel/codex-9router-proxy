@@ -13,9 +13,10 @@ Write-Host "==================================================================="
 Write-Host "            Codex 9Router Proxy - Uninstaller                      " -ForegroundColor Yellow
 Write-Host "===================================================================" -ForegroundColor Yellow
 
-# 1. Stop running codex processes and port 20129 listeners
-Write-Host "[*] Stopping running codex processes..." -ForegroundColor Gray
-Get-NetTCPConnection -LocalPort 20129 -ErrorAction SilentlyContinue | ForEach-Object {
+# 1. Stop running codex processes and proxy port listeners
+$proxyPort = if ($env:CODEX_PROXY_PORT -and $env:CODEX_PROXY_PORT.Trim()) { [int]$env:CODEX_PROXY_PORT.Trim() } else { 20129 }
+Write-Host "[*] Stopping running codex processes and port $proxyPort listeners..." -ForegroundColor Gray
+Get-NetTCPConnection -LocalPort $proxyPort -ErrorAction SilentlyContinue | ForEach-Object {
     $procId = $_.OwningProcess
     if ($procId -gt 0 -and $procId -ne $PID) {
         Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
@@ -29,7 +30,7 @@ Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*.old*
 }
 Start-Sleep -Milliseconds 500
 
-# 2. Clean up CODEX_CLI_PATH if it points to our custom wrapper
+# 2. Clean up CODEX_CLI_PATH, subagent routing environment variables, and User PATH
 $userCliPath = [System.Environment]::GetEnvironmentVariable("CODEX_CLI_PATH", "User")
 if ($userCliPath -and ($userCliPath -like "*codex-9router-subagents*" -or $userCliPath -like "*OpenAI\Codex\custom\*")) {
     [System.Environment]::SetEnvironmentVariable("CODEX_CLI_PATH", $null, "User")
@@ -40,7 +41,67 @@ if ($env:CODEX_CLI_PATH -and ($env:CODEX_CLI_PATH -like "*codex-9router-subagent
     Write-Host "[OK] Cleared CODEX_CLI_PATH from current session." -ForegroundColor Green
 }
 
-# 3. Restore Desktop App Binaries
+$envVarsToClean = @(
+    "CODEX_SUBAGENT_PROVIDER",
+    "CODEX_SUBAGENT_ENDPOINT",
+    "CODEX_DEFAULT_MODEL",
+    "CODEX_WORKER_MODEL",
+    "CODEX_EXPLORER_MODEL",
+    "CODEX_REVIEWER_MODEL",
+    "NINEROUTER_KEY"
+)
+foreach ($varName in $envVarsToClean) {
+    if ($null -ne [System.Environment]::GetEnvironmentVariable($varName, "User")) {
+        [System.Environment]::SetEnvironmentVariable($varName, $null, "User")
+        Write-Host "[OK] Removed $varName from User Environment." -ForegroundColor Green
+    }
+    if (Test-Path "Env:$varName") {
+        Remove-Item "Env:$varName" -ErrorAction SilentlyContinue
+    }
+}
+
+$customDir = Join-Path $env:LOCALAPPDATA "OpenAI\Codex\custom"
+$userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath) {
+    $filteredUserPath = ($userPath -split ';' | Where-Object { $_.Trim() -and ($_.Trim().TrimEnd('\') -ne $customDir.TrimEnd('\')) }) -join ';'
+    if ($filteredUserPath -ne $userPath) {
+        [System.Environment]::SetEnvironmentVariable("Path", $filteredUserPath, "User")
+        Write-Host "[OK] Removed $customDir from User PATH." -ForegroundColor Green
+    }
+}
+if ($env:Path) {
+    $env:Path = ($env:Path -split ';' | Where-Object { $_.Trim() -and ($_.Trim().TrimEnd('\') -ne $customDir.TrimEnd('\')) }) -join ';'
+}
+
+# 3. Drop SQLite subagent provider trigger if present
+$codexDir = if ($env:CODEX_HOME -and $env:CODEX_HOME.Trim()) { $env:CODEX_HOME.Trim() } else { Join-Path $env:USERPROFILE ".codex" }
+$dbCandidates = @(
+    (Join-Path $codexDir "state_5.sqlite"),
+    (Join-Path $codexDir "sqlite\state_5.sqlite"),
+    (Join-Path $codexDir "sqlite\codex-dev.db")
+) | Where-Object { Test-Path $_ }
+
+if ($dbCandidates.Count -gt 0) {
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCmd) {
+        foreach ($dbFile in $dbCandidates) {
+            try {
+                $pyDropScript = @"
+import sqlite3
+conn = sqlite3.connect(r'$dbFile')
+cur = conn.cursor()
+cur.execute('DROP TRIGGER IF EXISTS fix_subagent_provider_trigger;')
+conn.commit()
+conn.close()
+"@
+                $pyDropScript | & python - 2>&1 | Out-Null
+                Write-Host "[OK] Removed SQLite subagent provider trigger from $dbFile" -ForegroundColor Green
+            } catch {}
+        }
+    }
+}
+
+# 4. Restore Desktop App Binaries
 $storeResDir = $null
 $storePkg = Get-AppxPackage -Name "*OpenAI.Codex*" -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
 if ($storePkg -and $storePkg.InstallLocation) {
@@ -55,7 +116,6 @@ if (-not $storeResDir) {
     }
 }
 $desktopBinRoot = Join-Path $env:LOCALAPPDATA "OpenAI\Codex\bin"
-$customDir = Join-Path $env:LOCALAPPDATA "OpenAI\Codex\custom"
 if (Test-Path $desktopBinRoot) {
     Get-ChildItem -Path $desktopBinRoot -Directory | ForEach-Object {
         $c = Join-Path $_.FullName "codex.exe"
@@ -72,7 +132,7 @@ if (Test-Path $desktopBinRoot) {
 }
 Get-ChildItem "$desktopBinRoot\*\*.old.*", "$customDir\*.old.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-# 4. Restore Daemon Binaries
+# 5. Restore Daemon Binaries
 $daemonReleases = Join-Path $env:USERPROFILE ".codex\packages\app-server-daemon\releases"
 if (Test-Path $daemonReleases) {
     Get-ChildItem -Path $daemonReleases -Directory | ForEach-Object {
@@ -86,7 +146,7 @@ if (Test-Path $daemonReleases) {
     }
 }
 
-# 5. Remove Self-Healing Hook
+# 6. Remove Self-Healing Hook
 $startupFolder = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Startup)
 $startupCmd = Join-Path $startupFolder "Codex9RouterHookSync.cmd"
 if (Test-Path $startupCmd) {
