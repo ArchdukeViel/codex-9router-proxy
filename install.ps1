@@ -1017,91 +1017,62 @@ if (Safe-CopyExecutable -Source $releaseBinary -Destination $customCodex) {
     Write-Host "[OK] Deployed standalone proxy copy to $customCodex" -ForegroundColor Green
 }
 
+# Locate newest stock codex.exe / codex.orig.exe (> 10 MB) across Microsoft Store, desktop bin, custom/*.orig.exe, daemon releases, Programs, and IDE extensions
+$stockCandidates = @()
 if ($storeResDir -and (Test-Path (Join-Path $storeResDir "codex.exe"))) {
-    $storeCodex = Join-Path $storeResDir "codex.exe"
-    $storeItem = Get-Item $storeCodex
+    $stockCandidates += Get-Item (Join-Path $storeResDir "codex.exe") -ErrorAction SilentlyContinue
+}
+if (Test-Path $desktopBinRoot) {
+    $stockCandidates += Get-ChildItem -Path "$desktopBinRoot\*\codex.orig.exe", "$desktopBinRoot\*\codex.exe" -File -ErrorAction SilentlyContinue
+}
+foreach ($ehDir in $extraHookDirs) {
+    $stockCandidates += Get-ChildItem -Path "$ehDir\codex.orig.exe", "$ehDir\codex.exe" -File -ErrorAction SilentlyContinue
+}
+if (Test-Path $customDir) {
+    $stockCandidates += Get-ChildItem -Path "$customDir\codex.orig.exe", "$customDir\codex-9router-subagents.orig.exe" -File -ErrorAction SilentlyContinue
+}
+if (Test-Path $daemonReleases) {
+    $stockCandidates += Get-ChildItem -Path "$daemonReleases\*\bin\codex.orig.exe", "$daemonReleases\*\bin\codex.exe" -File -ErrorAction SilentlyContinue
+}
+$bestStockItem = $stockCandidates | Where-Object { $_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc, Length -Descending | Select-Object -First 1
+if ($bestStockItem) {
+    $stockDir = $bestStockItem.DirectoryName
     foreach ($origName in @("codex-9router-subagents.orig.exe", "codex.orig.exe")) {
         $origDst = Join-Path $customDir $origName
         $needsSync = (-not (Test-Path $origDst))
         if (-not $needsSync) {
             $dstItem = Get-Item $origDst
-            if (($dstItem.Length -ne $storeItem.Length) -or ($dstItem.LastWriteTimeUtc -ne $storeItem.LastWriteTimeUtc)) {
+            if (($dstItem.Length -lt 10000000) -or ($dstItem.LastWriteTimeUtc -lt $bestStockItem.LastWriteTimeUtc) -or (($dstItem.LastWriteTimeUtc -eq $bestStockItem.LastWriteTimeUtc) -and ($dstItem.Length -ne $bestStockItem.Length))) {
                 $needsSync = $true
             }
         }
-        if ($needsSync) {
-            if (Safe-CopyExecutable -Source $storeCodex -Destination $origDst) {
-                Write-Host "[OK] Synchronized $origName with Microsoft Store binary ($($storeItem.Length) bytes)." -ForegroundColor Green
+        if (($bestStockItem.FullName -ne $origDst) -and $needsSync) {
+            if (Safe-CopyExecutable -Source $bestStockItem.FullName -Destination $origDst) {
+                Write-Host "[OK] Synchronized $origName from newest stock binary ($($bestStockItem.Length) bytes)." -ForegroundColor Green
             }
         }
     }
+    $helperSearchDirs = New-Object System.Collections.Generic.List[string]
+    if ($stockDir -and (Test-Path $stockDir)) { $helperSearchDirs.Add($stockDir) }
+    foreach ($scDir in $storeCandidateDirs) {
+        if ($scDir -and (Test-Path $scDir) -and -not $helperSearchDirs.Contains($scDir)) { $helperSearchDirs.Add($scDir) }
+    }
+    foreach ($ehDir in $extraHookDirs) {
+        if ($ehDir -and (Test-Path $ehDir) -and -not $helperSearchDirs.Contains($ehDir)) { $helperSearchDirs.Add($ehDir) }
+    }
     foreach ($helper in $customHelpers) {
-        $hSrc = $storeCandidateDirs | ForEach-Object { Join-Path $_ $helper } | Where-Object { Test-Path $_ } | Select-Object -First 1
+        $bestHelper = $helperSearchDirs | ForEach-Object { Join-Path $_ $helper } | Where-Object { Test-Path $_ } | ForEach-Object { Get-Item $_ -ErrorAction SilentlyContinue } | Where-Object { $_.Length -gt 0 } | Sort-Object LastWriteTimeUtc, Length -Descending | Select-Object -First 1
         $hDst = Join-Path $customDir $helper
-        if ($hSrc -and (Test-Path $hSrc)) {
-            $srcItem = Get-Item $hSrc
+        if ($bestHelper -and ($bestHelper.FullName -ne $hDst)) {
             $needsHelperSync = (-not (Test-Path $hDst))
             if (-not $needsHelperSync) {
                 $dstItem = Get-Item $hDst
-                if (($dstItem.Length -ne $srcItem.Length) -or ($dstItem.LastWriteTimeUtc -ne $srcItem.LastWriteTimeUtc)) {
+                if (($dstItem.Length -eq 0) -or ($dstItem.LastWriteTimeUtc -lt $bestHelper.LastWriteTimeUtc) -or (($dstItem.LastWriteTimeUtc -eq $bestHelper.LastWriteTimeUtc) -and ($dstItem.Length -ne $bestHelper.Length))) {
                     $needsHelperSync = $true
                 }
             }
-            if ($needsHelperSync) {
-                if (Safe-CopyExecutable -Source $hSrc -Destination $hDst) {
-                    Write-Host "[OK] Synchronized helper $helper to $customDir ($($srcItem.Length) bytes)." -ForegroundColor Green
-                }
-            }
-        }
-    }
-} else {
-    # Non-Microsoft-Store fallback: locate stock codex.exe (> 10 MB) from desktop bin, custom/*.orig.exe, daemon releases, Programs, or IDE extensions
-    $fallbackCandidates = @()
-    if (Test-Path $desktopBinRoot) {
-        $fallbackCandidates += Get-ChildItem -Path "$desktopBinRoot\*\codex.orig.exe", "$desktopBinRoot\*\codex.exe" -File -ErrorAction SilentlyContinue
-    }
-    foreach ($ehDir in $extraHookDirs) {
-        $fallbackCandidates += Get-ChildItem -Path "$ehDir\codex.orig.exe", "$ehDir\codex.exe" -File -ErrorAction SilentlyContinue
-    }
-    if (Test-Path $customDir) {
-        $fallbackCandidates += Get-ChildItem -Path "$customDir\codex.orig.exe", "$customDir\codex-9router-subagents.orig.exe" -File -ErrorAction SilentlyContinue
-    }
-    if (Test-Path $daemonReleases) {
-        $fallbackCandidates += Get-ChildItem -Path "$daemonReleases\*\bin\codex.orig.exe", "$daemonReleases\*\bin\codex.exe" -File -ErrorAction SilentlyContinue
-    }
-    $fallbackStockItem = $fallbackCandidates | Where-Object { $_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-    if ($fallbackStockItem) {
-        $stockDir = $fallbackStockItem.DirectoryName
-        foreach ($origName in @("codex-9router-subagents.orig.exe", "codex.orig.exe")) {
-            $origDst = Join-Path $customDir $origName
-            $needsSync = (-not (Test-Path $origDst))
-            if (-not $needsSync) {
-                $dstItem = Get-Item $origDst
-                if (($dstItem.Length -lt 10000000) -or ($dstItem.Length -ne $fallbackStockItem.Length) -or ($dstItem.LastWriteTimeUtc -lt $fallbackStockItem.LastWriteTimeUtc)) {
-                    $needsSync = $true
-                }
-            }
-            if (($fallbackStockItem.FullName -ne $origDst) -and $needsSync) {
-                if (Safe-CopyExecutable -Source $fallbackStockItem.FullName -Destination $origDst) {
-                    Write-Host "[OK] Synchronized $origName from local stock binary ($($fallbackStockItem.Length) bytes)." -ForegroundColor Green
-                }
-            }
-        }
-        foreach ($helper in $customHelpers) {
-            $hSrc = Join-Path $stockDir $helper
-            $hDst = Join-Path $customDir $helper
-            if ((Test-Path $hSrc) -and ($hSrc -ne $hDst)) {
-                $srcItem = Get-Item $hSrc
-                $needsHelperSync = (-not (Test-Path $hDst))
-                if (-not $needsHelperSync) {
-                    $dstItem = Get-Item $hDst
-                    if (($dstItem.Length -ne $srcItem.Length) -or ($dstItem.LastWriteTimeUtc -lt $srcItem.LastWriteTimeUtc)) {
-                        $needsHelperSync = $true
-                    }
-                }
-                if ($needsHelperSync -and (Safe-CopyExecutable -Source $hSrc -Destination $hDst)) {
-                    Write-Host "[OK] Synchronized helper $helper to $customDir." -ForegroundColor Green
-                }
+            if ($needsHelperSync -and (Safe-CopyExecutable -Source $bestHelper.FullName -Destination $hDst)) {
+                Write-Host "[OK] Synchronized helper $helper to $customDir ($($bestHelper.Length) bytes)." -ForegroundColor Green
             }
         }
     }
@@ -1128,7 +1099,7 @@ if ((Test-Path $customOrigStock) -and ((Get-Item $customOrigStock).Length -gt 10
             $needsOrigSync = (-not (Test-Path $cOrig))
             if (-not $needsOrigSync) {
                 $oItem = Get-Item $cOrig
-                if (($oItem.Length -lt 10000000) -or ($oItem.LastWriteTimeUtc -lt $customOrigItem.LastWriteTimeUtc)) {
+                if (($oItem.Length -lt 10000000) -or ($oItem.LastWriteTimeUtc -lt $customOrigItem.LastWriteTimeUtc) -or (($oItem.LastWriteTimeUtc -eq $customOrigItem.LastWriteTimeUtc) -and ($oItem.Length -ne $customOrigItem.Length))) {
                     $needsOrigSync = $true
                 }
             }
@@ -1145,7 +1116,7 @@ if ((Test-Path $customOrigStock) -and ((Get-Item $customOrigStock).Length -gt 10
                     $needsHelperSync = (-not (Test-Path $hDst))
                     if (-not $needsHelperSync) {
                         $dstItem = Get-Item $hDst
-                        if (($dstItem.Length -ne $srcItem.Length) -or ($dstItem.LastWriteTimeUtc -lt $srcItem.LastWriteTimeUtc)) {
+                        if (($dstItem.Length -eq 0) -or ($dstItem.LastWriteTimeUtc -lt $srcItem.LastWriteTimeUtc) -or (($dstItem.LastWriteTimeUtc -eq $srcItem.LastWriteTimeUtc) -and ($dstItem.Length -ne $srcItem.Length))) {
                             $needsHelperSync = $true
                         }
                     }
@@ -1319,52 +1290,60 @@ if (Test-Path `$proxyPath) {
 }
 
 # 4. Refresh custom\codex.orig.exe, custom\codex-9router-subagents.orig.exe, and custom\ helpers when MS Store or CLI updates
+`$allStockCandidates = @()
 if (`$resDir -and (Test-Path (Join-Path `$resDir 'codex.exe'))) {
-    `$storeCodex = Join-Path `$resDir 'codex.exe'
-    `$storeItem = Get-Item `$storeCodex
+    `$allStockCandidates += Get-Item (Join-Path `$resDir 'codex.exe')
+}
+if (Test-Path `$binRoot) {
+    `$allStockCandidates += Get-ChildItem -Path "`$binRoot\*\codex.orig.exe", "`$binRoot\*\codex.exe" -File
+}
+foreach (`$ed in `$extraDirs) {
+    `$allStockCandidates += Get-ChildItem -Path "`$ed\codex.orig.exe", "`$ed\codex.exe" -File
+}
+if (Test-Path `$customDir) {
+    `$allStockCandidates += Get-ChildItem -Path "`$customDir\codex.orig.exe", "`$customDir\codex-9router-subagents.orig.exe" -File
+}
+if (Test-Path `$daemonReleases) {
+    `$allStockCandidates += Get-ChildItem -Path "`$daemonReleases\*\bin\codex.orig.exe", "`$daemonReleases\*\bin\codex.exe" -File
+}
+`$bestStock = `$allStockCandidates | Where-Object { `$_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc, Length -Descending | Select-Object -First 1
+if (`$bestStock) {
     foreach (`$origName in @('codex-9router-subagents.orig.exe', 'codex.orig.exe')) {
         `$origDst = Join-Path `$customDir `$origName
-        if ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -ne `$storeItem.Length) -or ((Get-Item `$origDst).LastWriteTimeUtc -ne `$storeItem.LastWriteTimeUtc)) {
-            Sync-Executable -Source `$storeCodex -Destination `$origDst | Out-Null
-        }
-    }
-    foreach (`$h in `$customHelpers) {
-        `$hs = `$candDirs | ForEach-Object { Join-Path `$_ `$h } | Where-Object { Test-Path `$_ } | Select-Object -First 1
-        `$hd = Join-Path `$customDir `$h
-        if (`$hs -and (Test-Path `$hs)) {
-            `$hItem = Get-Item `$hs
-            if ((-not (Test-Path `$hd)) -or ((Get-Item `$hd).Length -ne `$hItem.Length) -or ((Get-Item `$hd).LastWriteTimeUtc -ne `$hItem.LastWriteTimeUtc)) {
-                Sync-Executable -Source `$hs -Destination `$hd | Out-Null
+        if (`$bestStock.FullName -ne `$origDst) {
+            `$needsOrig = (-not (Test-Path `$origDst))
+            if (-not `$needsOrig) {
+                `$di = Get-Item `$origDst
+                if ((`$di.Length -lt 10000000) -or (`$di.LastWriteTimeUtc -lt `$bestStock.LastWriteTimeUtc) -or ((`$di.LastWriteTimeUtc -eq `$bestStock.LastWriteTimeUtc) -and (`$di.Length -ne `$bestStock.Length))) {
+                    `$needsOrig = `$true
+                }
+            }
+            if (`$needsOrig) {
+                Sync-Executable -Source `$bestStock.FullName -Destination `$origDst | Out-Null
             }
         }
     }
-} else {
-    `$fbCandidates = @()
-    if (Test-Path `$binRoot) {
-        `$fbCandidates += Get-ChildItem -Path "`$binRoot\*\codex.orig.exe", "`$binRoot\*\codex.exe" -File
+    `$hSearchDirs = New-Object System.Collections.Generic.List[string]
+    if (`$bestStock.DirectoryName -and (Test-Path `$bestStock.DirectoryName)) { `$hSearchDirs.Add(`$bestStock.DirectoryName) }
+    foreach (`$cd in `$candDirs) {
+        if (`$cd -and (Test-Path `$cd) -and -not `$hSearchDirs.Contains(`$cd)) { `$hSearchDirs.Add(`$cd) }
     }
     foreach (`$ed in `$extraDirs) {
-        `$fbCandidates += Get-ChildItem -Path "`$ed\codex.orig.exe", "`$ed\codex.exe" -File
+        if (`$ed -and (Test-Path `$ed) -and -not `$hSearchDirs.Contains(`$ed)) { `$hSearchDirs.Add(`$ed) }
     }
-    if (Test-Path `$customDir) {
-        `$fbCandidates += Get-ChildItem -Path "`$customDir\codex.orig.exe", "`$customDir\codex-9router-subagents.orig.exe" -File
-    }
-    if (Test-Path `$daemonReleases) {
-        `$fbCandidates += Get-ChildItem -Path "`$daemonReleases\*\bin\codex.orig.exe", "`$daemonReleases\*\bin\codex.exe" -File
-    }
-    `$fbStock = `$fbCandidates | Where-Object { `$_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-    if (`$fbStock) {
-        foreach (`$origName in @('codex-9router-subagents.orig.exe', 'codex.orig.exe')) {
-            `$origDst = Join-Path `$customDir `$origName
-            if ((`$fbStock.FullName -ne `$origDst) -and ((-not (Test-Path `$origDst)) -or ((Get-Item `$origDst).Length -lt 10000000) -or ((Get-Item `$origDst).Length -ne `$fbStock.Length) -or ((Get-Item `$origDst).LastWriteTimeUtc -lt `$fbStock.LastWriteTimeUtc))) {
-                Sync-Executable -Source `$fbStock.FullName -Destination `$origDst | Out-Null
+    foreach (`$h in `$customHelpers) {
+        `$bestH = `$hSearchDirs | ForEach-Object { Join-Path `$_ `$h } | Where-Object { Test-Path `$_ } | ForEach-Object { Get-Item `$_ } | Where-Object { `$_.Length -gt 0 } | Sort-Object LastWriteTimeUtc, Length -Descending | Select-Object -First 1
+        `$hd = Join-Path `$customDir `$h
+        if (`$bestH -and (`$bestH.FullName -ne `$hd)) {
+            `$needsH = (-not (Test-Path `$hd))
+            if (-not `$needsH) {
+                `$hdi = Get-Item `$hd
+                if ((`$hdi.Length -eq 0) -or (`$hdi.LastWriteTimeUtc -lt `$bestH.LastWriteTimeUtc) -or ((`$hdi.LastWriteTimeUtc -eq `$bestH.LastWriteTimeUtc) -and (`$hdi.Length -ne `$bestH.Length))) {
+                    `$needsH = `$true
+                }
             }
-        }
-        foreach (`$h in `$customHelpers) {
-            `$hs = Join-Path `$fbStock.DirectoryName `$h
-            `$hd = Join-Path `$customDir `$h
-            if ((Test-Path `$hs) -and (`$hs -ne `$hd) -and ((-not (Test-Path `$hd)) -or ((Get-Item `$hd).Length -ne (Get-Item `$hs).Length) -or ((Get-Item `$hd).LastWriteTimeUtc -lt (Get-Item `$hs).LastWriteTimeUtc))) {
-                Sync-Executable -Source `$hs -Destination `$hd | Out-Null
+            if (`$needsH) {
+                Sync-Executable -Source `$bestH.FullName -Destination `$hd | Out-Null
             }
         }
     }
@@ -1388,14 +1367,33 @@ if ((Test-Path `$customOrigStock) -and ((Get-Item `$customOrigStock).Length -gt 
         `$cExe = Join-Path `$hDir 'codex.exe'
         `$cOrig = Join-Path `$hDir 'codex.orig.exe'
         if ((Test-Path `$cExe) -or (Test-Path `$cOrig)) {
-            if (((-not (Test-Path `$cOrig)) -or ((Get-Item `$cOrig).Length -lt 10000000) -or ((Get-Item `$cOrig).LastWriteTimeUtc -lt `$customOrigItem.LastWriteTimeUtc)) -and (`$customOrigItem.FullName -ne `$cOrig)) {
-                Sync-Executable -Source `$customOrigStock -Destination `$cOrig | Out-Null
+            if (`$customOrigItem.FullName -ne `$cOrig) {
+                `$needsCO = (-not (Test-Path `$cOrig))
+                if (-not `$needsCO) {
+                    `$coi = Get-Item `$cOrig
+                    if ((`$coi.Length -lt 10000000) -or (`$coi.LastWriteTimeUtc -lt `$customOrigItem.LastWriteTimeUtc) -or ((`$coi.LastWriteTimeUtc -eq `$customOrigItem.LastWriteTimeUtc) -and (`$coi.Length -ne `$customOrigItem.Length))) {
+                        `$needsCO = `$true
+                    }
+                }
+                if (`$needsCO) {
+                    Sync-Executable -Source `$customOrigStock -Destination `$cOrig | Out-Null
+                }
             }
             foreach (`$h in `$binHelpers) {
                 `$hs = Join-Path `$customDir `$h
                 `$hd = Join-Path `$hDir `$h
-                if ((Test-Path `$hs) -and (`$hs -ne `$hd) -and ((-not (Test-Path `$hd)) -or ((Get-Item `$hd).Length -ne (Get-Item `$hs).Length) -or ((Get-Item `$hd).LastWriteTimeUtc -lt (Get-Item `$hs).LastWriteTimeUtc))) {
-                    Sync-Executable -Source `$hs -Destination `$hd | Out-Null
+                if ((Test-Path `$hs) -and (`$hs -ne `$hd)) {
+                    `$hsItem = Get-Item `$hs
+                    `$needsBH = (-not (Test-Path `$hd))
+                    if (-not `$needsBH) {
+                        `$hdi = Get-Item `$hd
+                        if ((`$hdi.Length -eq 0) -or (`$hdi.LastWriteTimeUtc -lt `$hsItem.LastWriteTimeUtc) -or ((`$hdi.LastWriteTimeUtc -eq `$hsItem.LastWriteTimeUtc) -and (`$hdi.Length -ne `$hsItem.Length))) {
+                            `$needsBH = `$true
+                        }
+                    }
+                    if (`$needsBH) {
+                        Sync-Executable -Source `$hs -Destination `$hd | Out-Null
+                    }
                 }
             }
         }
