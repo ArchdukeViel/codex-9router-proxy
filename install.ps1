@@ -154,6 +154,28 @@ public class CodexDesktopCheck {
     }
 }
 
+function Check-McpServerStatuses {
+    $codexCmd = Get-Command codex -ErrorAction SilentlyContinue
+    if ($codexCmd) {
+        try {
+            $mcpList = & codex mcp list 2>&1
+            $hasAuthIssue = $false
+            foreach ($line in $mcpList) {
+                if ($line -match "(\S+)\s+.*?\s+(OAuth|Not logged in)\s*$") {
+                    $serverName = $Matches[1]
+                    $authStatus = $Matches[2]
+                    Write-Host "  [!] MCP Server '$serverName' auth status: $authStatus" -ForegroundColor Yellow
+                    Write-Host "      -> Run: codex mcp login $serverName" -ForegroundColor Yellow
+                    $hasAuthIssue = $true
+                }
+            }
+            if (-not $hasAuthIssue) {
+                Write-Host "[OK] All registered MCP servers report supported/ready auth." -ForegroundColor Green
+            }
+        } catch {}
+    }
+}
+
 # If -Doctor requested, run diagnostic check immediately
 if ($Doctor) {
     Clear-HiddenDesktopCodexGui
@@ -167,6 +189,7 @@ if ($Doctor) {
             Write-Error "No compiled codex-9router-proxy binary found. Run .\install.ps1 first to install."
         }
     }
+    Check-McpServerStatuses
     return
 }
 
@@ -261,6 +284,30 @@ if (-not $NonInteractive) {
         }
     }
 
+    # Query upstream endpoint for available models to assist user selection
+    $discoveredModels = @()
+    try {
+        $modelsEndpoint = "$($Endpoint.TrimEnd('/'))/models"
+        $mHeaders = @{}
+        if (-not [string]::IsNullOrWhiteSpace($ApiKey)) {
+            $mHeaders["Authorization"] = "Bearer $ApiKey"
+        }
+        $mResp = Invoke-RestMethod -Uri $modelsEndpoint -Headers $mHeaders -TimeoutSec 3 -ErrorAction SilentlyContinue
+        $mArr = if ($mResp.data) { $mResp.data } elseif ($mResp.models) { $mResp.models } else { @() }
+        foreach ($item in $mArr) {
+            $mid = if ($item.id) { $item.id } elseif ($item.slug) { $item.slug } else { $null }
+            if ($mid) { $discoveredModels += $mid }
+        }
+    } catch {}
+
+    if ($discoveredModels.Count -gt 0) {
+        Write-Host ""
+        Write-Host "[INFO] Discovered $($discoveredModels.Count) upstream models from $Endpoint/models." -ForegroundColor Cyan
+        $sampleModels = ($discoveredModels | Select-Object -First 6) -join ", "
+        Write-Host "       Available samples: $sampleModels" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
     # Model Configuration Prompts per Role
     if (-not $DefaultModel) {
         $dmInput = Read-Host "[?] Enter Default Subagent Model [default: 9router-subagent]"
@@ -310,38 +357,47 @@ Write-Host "    Reviewer Model : $ReviewerModel"
 Write-Host ""
 
 # 2. Persist Environment Variables & Registry
+function Set-FastUserEnv {
+    param([string]$Name, [string]$Value)
+    Set-ItemProperty -Path "HKCU:\Environment" -Name $Name -Value $Value -Force
+    Set-Item -Path "env:$Name" -Value $Value
+}
+
+# 2. Persist Environment Variables & Registry
 if (-not [string]::IsNullOrWhiteSpace($ApiKey)) {
-    [System.Environment]::SetEnvironmentVariable("NINEROUTER_KEY", $ApiKey, "User")
-    $env:NINEROUTER_KEY = $ApiKey
+    Set-FastUserEnv "NINEROUTER_KEY" $ApiKey
     Write-Host "[OK] Saved NINEROUTER_KEY to Windows User Environment (Registry HKCU\Environment)." -ForegroundColor Green
 }
-[System.Environment]::SetEnvironmentVariable("CODEX_SUBAGENT_PROVIDER", $Provider, "User")
-$env:CODEX_SUBAGENT_PROVIDER = $Provider
-
-[System.Environment]::SetEnvironmentVariable("CODEX_SUBAGENT_ENDPOINT", $Endpoint, "User")
-$env:CODEX_SUBAGENT_ENDPOINT = $Endpoint
-
-[System.Environment]::SetEnvironmentVariable("CODEX_DEFAULT_MODEL", $DefaultModel, "User")
-$env:CODEX_DEFAULT_MODEL = $DefaultModel
-
-[System.Environment]::SetEnvironmentVariable("CODEX_WORKER_MODEL", $WorkerModel, "User")
-$env:CODEX_WORKER_MODEL = $WorkerModel
-
-[System.Environment]::SetEnvironmentVariable("CODEX_EXPLORER_MODEL", $ExplorerModel, "User")
-$env:CODEX_EXPLORER_MODEL = $ExplorerModel
-
-[System.Environment]::SetEnvironmentVariable("CODEX_REVIEWER_MODEL", $ReviewerModel, "User")
-$env:CODEX_REVIEWER_MODEL = $ReviewerModel
+Set-FastUserEnv "CODEX_SUBAGENT_PROVIDER" $Provider
+Set-FastUserEnv "CODEX_SUBAGENT_ENDPOINT" $Endpoint
+Set-FastUserEnv "CODEX_DEFAULT_MODEL" $DefaultModel
+Set-FastUserEnv "CODEX_WORKER_MODEL" $WorkerModel
+Set-FastUserEnv "CODEX_EXPLORER_MODEL" $ExplorerModel
+Set-FastUserEnv "CODEX_REVIEWER_MODEL" $ReviewerModel
 
 $customDir = Join-Path $env:LOCALAPPDATA "OpenAI\Codex\custom"
 $customShim = Join-Path $customDir "codex-9router-subagents.exe"
-[System.Environment]::SetEnvironmentVariable("CODEX_CLI_PATH", $customShim, "User")
-$env:CODEX_CLI_PATH = $customShim
+Set-FastUserEnv "CODEX_CLI_PATH" $customShim
 Write-Host "[OK] Saved CODEX_CLI_PATH -> $customShim (User Environment)." -ForegroundColor Green
+
+# Detect system browser (Chrome or Edge across standard 64-bit, 32-bit, and per-user local appdata paths)
+$browserCandidate = @(
+    $env:AGENT_BROWSER_EXECUTABLE_PATH,
+    (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
+    (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"),
+    (Join-Path $env:LOCALAPPDATA "Google\Chrome\Application\chrome.exe"),
+    (Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"),
+    (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe")
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+
+if ($browserCandidate) {
+    Set-FastUserEnv "AGENT_BROWSER_EXECUTABLE_PATH" $browserCandidate
+    Write-Host "[OK] Detected system browser: $browserCandidate (User Environment)." -ForegroundColor Green
+}
 
 # Ensure %LOCALAPPDATA%\OpenAI\Codex\custom is at index 0 of User PATH (ahead of Programs\OpenAI\Codex\bin and .cargo\bin)
 $normalizedCustomDir = $customDir.TrimEnd('\')
-$userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+$userPath = (Get-ItemProperty -Path "HKCU:\Environment" -Name "Path" -ErrorAction SilentlyContinue).Path
 $userPathEntries = if ([string]::IsNullOrWhiteSpace($userPath)) {
     @()
 } else {
@@ -352,7 +408,7 @@ $remainingUserPathEntries = @(
 )
 $newUserPath = (@($customDir) + $remainingUserPathEntries) -join ';'
 if ($newUserPath -ne $userPath) {
-    [System.Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+    Set-FastUserEnv "Path" $newUserPath
     Write-Host "[OK] Placed $customDir at index 0 of Windows User PATH." -ForegroundColor Green
 } else {
     Write-Host "[OK] $customDir is already at index 0 of Windows User PATH." -ForegroundColor Green
@@ -465,6 +521,18 @@ description = "$escapedRoleDesc"
 model = "$escapedRoleModel"
 model_provider = "$escapedProvider"
 model_reasoning_effort = "high"
+sandbox_mode = "danger-full-access"
+developer_instructions = """You are a dedicated worker subagent executing tasks on behalf of /root.
+You have full shell execution capabilities via exec_command in PowerShell.
+IMPORTANT: For browser automation, use the configured AGENT_BROWSER_EXECUTABLE_PATH:
+  if (-not `$env:AGENT_BROWSER_EXECUTABLE_PATH) { `$env:AGENT_BROWSER_EXECUTABLE_PATH = @((Join-Path `$env:ProgramFiles 'Google\Chrome\Application\chrome.exe'), (Join-Path `${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'), (Join-Path `$env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe'), (Join-Path `${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'), (Join-Path `$env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')) | Where-Object { Test-Path `$_ } | Select-Object -First 1 }
+- To perform browser checks, use agent-browser CLI via exec_command:
+  agent-browser open https://example.com && agent-browser get title
+- Alternatively, use Node.js Playwright with channel chrome:
+  node -e \"const { chromium } = require('playwright'); (async () => { const b = await chromium.launch({channel:'chrome'}); const p = await b.newPage(); await p.goto('https://example.com'); console.log(await p.title()); await b.close(); })();\"
+- To perform Git checks, execute git commands via exec_command, preserving exact requested chaining (e.g. &&).
+- To perform health or network queries, query endpoints via exec_command (e.g. Invoke-RestMethod or curl.exe).
+Directly execute assigned tasks and report your complete findings in your final answer."""
 "@
     $targetToml = Join-Path $agentsDir "$roleName.toml"
     [System.IO.File]::WriteAllText($targetToml, $roleTomlContent, $utf8NoBom)
@@ -482,6 +550,76 @@ config_file = "$escapedRoleTomlPath"
         $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $roleBlock.Trim() + "`r`n"
     }
 }
+
+# 3b. Configure Always-Allow Policies, Browser CDP Access & MCP Approvals
+if ($configContent -match "(?m)^approvals_reviewer\s*=") {
+    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, "(?m)^approvals_reviewer\s*=.*", 'approvals_reviewer = "auto_review"')
+} else {
+    $configContent = "approvals_reviewer = `"auto_review`"`r`n" + $configContent
+}
+
+$appsDefaultSection = @"
+[apps._default]
+default_tools_approval_mode = "approve"
+"@
+$patternApps = "(?ms)\[apps\._default\].*?(?=\r?\n\[|\z)"
+if ($configContent -match $patternApps) {
+    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternApps, { $appsDefaultSection.Trim() })
+} else {
+    $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $appsDefaultSection.Trim() + "`r`n"
+}
+
+$granularSection = @"
+[approval_policy.granular]
+mcp_elicitations = false
+rules = false
+sandbox_approval = false
+skill_approval = false
+request_permissions = false
+"@
+$patternGranular = "(?ms)\[approval_policy\.granular\].*?(?=\r?\n\[|\z)"
+if ($configContent -match $patternGranular) {
+    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternGranular, { $granularSection.Trim() })
+} else {
+    $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $granularSection.Trim() + "`r`n"
+}
+
+$browserUseSection = @"
+[browser_use]
+allow_history_access = true
+
+[browser_use.default_origin_policy]
+access = "allow"
+full_cdp_access = "allow"
+downloads = "allow"
+uploads = "allow"
+"@
+$patternBrowser = "(?ms)\[browser_use(?:\.[^\]]+)?\].*?(?=\r?\n\[(?!browser_use)|\z)"
+if ($configContent -match $patternBrowser) {
+    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternBrowser, { $browserUseSection.Trim() })
+} else {
+    $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $browserUseSection.Trim() + "`r`n"
+}
+
+# Ensure all [mcp_servers.*] blocks have default_tools_approval_mode = "approve"
+$configContent = [System.Text.RegularExpressions.Regex]::Replace(
+    $configContent,
+    "(?ms)(\[mcp_servers\.[^\]]+\])(.*?)(?=\r?\n\[|\z)",
+    {
+        param($m)
+        $header = $m.Groups[1].Value
+        $body = $m.Groups[2].Value
+        if ($body -match "(?m)^default_tools_approval_mode\s*=") {
+            $body = [System.Text.RegularExpressions.Regex]::Replace($body, "(?m)^default_tools_approval_mode\s*=.*", 'default_tools_approval_mode = "approve"')
+        } else {
+            $body = $body.TrimEnd() + "`r`ndefault_tools_approval_mode = `"approve`"`r`n"
+        }
+        if ($header -match "playwright") {
+            $body = [System.Text.RegularExpressions.Regex]::Replace($body, ',?\s*"--(?:test-type|silent-debugger-extension-api)"', '')
+        }
+        return "$header$body"
+    }
+)
 
 # Ensure chatgpt_base_url is clean / direct
 if ($configContent -match "(?m)^chatgpt_base_url\s*=") {
@@ -1670,3 +1808,21 @@ Write-Host ""
 
 # Run doctor check to verify everything
 & $releaseBinary --doctor
+Check-McpServerStatuses
+
+# Broadcast WM_SETTINGCHANGE so running Explorer and terminal sessions refresh environment variables
+try {
+    if (-not ("Win32EnvNotify" -as [type])) {
+        Add-Type -Namespace Win32Env -Name NativeMethods -MemberDefinition @"
+            [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+            public static extern IntPtr SendMessageTimeout(
+                IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam,
+                uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+"@ -ErrorAction SilentlyContinue
+    }
+    $HWND_BROADCAST = [IntPtr]0xffff
+    $WM_SETTINGCHANGE = 0x001A
+    $SMTO_ABORTIFHUNG = 0x0002
+    $result = [UIntPtr]::Zero
+    [Win32Env.NativeMethods]::SendMessageTimeout($HWND_BROADCAST, $WM_SETTINGCHANGE, [UIntPtr]::Zero, "Environment", $SMTO_ABORTIFHUNG, 3000, [ref]$result) | Out-Null
+} catch {}

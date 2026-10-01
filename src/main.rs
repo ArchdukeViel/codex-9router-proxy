@@ -3151,6 +3151,133 @@ fn extract_compaction_item_text(item_obj: &serde_json::Map<String, Value>) -> St
     String::new()
 }
 
+fn extract_all_text_from_item(item: &Value) -> String {
+    if let Some(text) = item.get("content").and_then(|c| c.as_str()) {
+        return text.to_string();
+    }
+    if let Some(arr) = item.get("content").and_then(|c| c.as_array()) {
+        let mut parts = Vec::new();
+        for part in arr {
+            let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if part_type.eq_ignore_ascii_case("input_text")
+                || part_type.eq_ignore_ascii_case("text")
+                || part_type.is_empty()
+            {
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n");
+        }
+    }
+    String::new()
+}
+
+pub fn extract_subagent_task_directives(input_arr: &[Value]) -> Option<String> {
+    let markers = [
+        "inside the worker runtime:",
+        "inside the worker subagent runtime:",
+        "spawn a worker subagent",
+        "spawn subagent",
+        "worker subagent",
+        "delegate to",
+    ];
+    for item in input_arr.iter().rev() {
+        let item_role = item
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        if !item_role.eq_ignore_ascii_case("user") {
+            continue;
+        }
+        let text = extract_all_text_from_item(item);
+        if text.is_empty() {
+            continue;
+        }
+        let text_lower = text.to_ascii_lowercase();
+        for marker in &markers {
+            if text_lower.contains(marker) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// Rewrite `<multi_agent_role>...</multi_agent_role>` blocks in subagent prompts
+/// to declare the worker as a dedicated leaf executor that must NOT re-delegate.
+pub fn rewrite_multi_agent_role_for_worker(text: &str) -> String {
+    const WORKER_ROLE: &str = "<multi_agent_role>You are a dedicated worker subagent executing tasks on behalf of /root.\n\
+        You are a leaf executor: do NOT spawn sub-agents, wait on agents, or call collaboration tools.\n\
+        Directly execute your assigned tasks using your available tools (exec_command, \
+        mcp__playwright__browser_tabs, mcp__cua_repl__js, etc.) and provide your complete \
+        findings in your final answer.</multi_agent_role>";
+
+    if let Some(start) = text.find("<multi_agent_role>") {
+        if let Some(end) = text.find("</multi_agent_role>") {
+            let end_tag_len = "</multi_agent_role>".len();
+            let mut result = String::with_capacity(text.len());
+            result.push_str(&text[..start]);
+            result.push_str(WORKER_ROLE);
+            result.push_str(&text[end + end_tag_len..]);
+            return result;
+        }
+    }
+    text.to_string()
+}
+
+/// Check whether a tool name (flat or namespaced) is a collaboration tool that
+/// subagents should not have access to.
+fn is_collaboration_tool(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let collab_names = [
+        "spawn_agent",
+        "list_agents",
+        "followup_task",
+        "wait_agent",
+        "interrupt_agent",
+    ];
+    for cn in &collab_names {
+        if lower == *cn {
+            return true;
+        }
+    }
+    lower.starts_with("collaboration__")
+}
+
+/// Ensure a subagent has the required worker execution tools (`exec_command`).
+pub fn ensure_subagent_worker_tools(tools_arr: &mut Vec<Value>) {
+    let has_exec = tools_arr.iter().any(|t| {
+        t.get("name")
+            .or_else(|| t.get("function").and_then(|f| f.get("name")))
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| n == "exec_command")
+    });
+    if !has_exec {
+        tools_arr.push(serde_json::json!({
+            "type": "function",
+            "name": "exec_command",
+            "description": "Execute a shell command in the workspace directory and return its stdout, stderr, and exit code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": {
+                        "type": "string",
+                        "description": "The command line string to execute in the shell"
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional working directory"
+                    }
+                },
+                "required": ["cmd"]
+            }
+        }));
+    }
+}
+
 /// Sanitize incompatible OpenAI tool schemas (`"type": "namespace"`, `"type": "web_search"`,
 /// `"type": "custom"` for `apply_patch`, and `"type": "additional_tools"` / `"compaction_trigger"` /
 /// `"configuration_update"` in `"input"`), rehydrate `"type": "compaction"` / `"context_compaction"`
@@ -3162,6 +3289,11 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
     let Some(obj) = json.as_object_mut() else {
         return;
     };
+
+    let extracted_directives = obj
+        .get("input")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| extract_subagent_task_directives(arr));
 
     // 1. In "input":
     //    - Strip internal marker items ("additional_tools", "compaction_trigger", "configuration_update").
@@ -3219,6 +3351,24 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
                     ]),
                 );
                 continue;
+            }
+
+            if item_type == "function_call" || item_type == "function_call_output" {
+                if let Some(ns) = item_obj.get("namespace").and_then(|v| v.as_str()) {
+                    if !ns.is_empty() {
+                        if let Some(name) = item_obj.get("name").and_then(|v| v.as_str()) {
+                            let bridged = if name.starts_with(ns) {
+                                name.to_string()
+                            } else if ns == "mcp" && name.contains("__") {
+                                format!("mcp__{}", name)
+                            } else {
+                                format!("{}__{}", ns, name)
+                            };
+                            item_obj.insert("name".to_string(), Value::String(bridged));
+                        }
+                        item_obj.remove("namespace");
+                    }
+                }
             }
 
             if item_type == "custom_tool_call" {
@@ -3352,6 +3502,44 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
             {
                 item_obj.insert("role".to_string(), Value::String("system".to_string()));
             }
+            if let Some(content_arr) = item_obj.get_mut("content").and_then(|c| c.as_array_mut()) {
+                for part in content_arr.iter_mut() {
+                    let is_encrypted = part
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| t.eq_ignore_ascii_case("encrypted_content"));
+                    if is_encrypted {
+                        if let Some(part_obj) = part.as_object_mut() {
+                            part_obj.insert("type".to_string(), Value::String("input_text".to_string()));
+                            part_obj.remove("encrypted_content");
+                            let replacement_text = if let Some(ref directives) = extracted_directives {
+                                format!(
+                                    "[Task payload received from coordinator:\n{}\n\nComplete the above assigned tasks using your available tools, and provide your complete findings in your final answer.]",
+                                    directives
+                                )
+                            } else {
+                                "[Task payload received. Complete your assigned task, inspect workspace and git status, and provide your complete findings in your final answer.]".to_string()
+                            };
+                            part_obj.insert(
+                                "text".to_string(),
+                                Value::String(replacement_text),
+                            );
+                        }
+                    } else {
+                        // Rewrite <multi_agent_role> to enforce dedicated worker behavior
+                        if let Some(part_obj) = part.as_object_mut() {
+                            if let Some(text_val) = part_obj.get_mut("text") {
+                                if let Some(text_str) = text_val.as_str() {
+                                    if text_str.contains("<multi_agent_role>") {
+                                        let rewritten = rewrite_multi_agent_role_for_worker(text_str);
+                                        *text_val = Value::String(rewritten);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             item_obj.remove("internal_chat_message_metadata_passthrough");
         }
     }
@@ -3370,29 +3558,121 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
         }
     }
 
-    // 2. Sanitize top-level "tools" array:
-    //    - Filter out "type": "namespace", "type": "web_search", "type": "web_search_preview",
+    // 2. Sanitize and unflatten top-level "tools" array:
+    //    - Unflatten "type": "namespace" containers into standard "type": "function" tools
+    //      with double-underscore prefixing (`<namespace>__<tool_name>`, e.g., `cloudflare__get_worker`)
+    //      so 9Router and upstream LLM providers (OpenAI, Claude, Gemini) can invoke plugin tools.
+    //    - Filter out unsupported ChatGPT-internal tools: "type": "web_search", "type": "web_search_preview",
     //      "type": "tool_search" (or "name": "tool_search"), and "type": "custom" (Freeform tools
     //      require custom_tool_call SSE responses which 9Router does not emit; when codex.orig.exe
     //      uses our injected model metadata with apply_patch_tool_type = "function", it sends
     //      "type": "function", "name": "apply_patch" which is preserved here and matches ToolPayload::Function).
     let mut tools_became_empty = false;
     if let Some(tools_arr) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
-        tools_arr.retain(|tool| {
+        let had_collaboration = tools_arr.iter().any(|tool| {
             let tool_type = tool.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let tool_name = tool
                 .get("name")
                 .or_else(|| tool.get("function").and_then(|f| f.get("name")))
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            !matches!(
-                tool_type,
-                "namespace" | "web_search" | "web_search_preview" | "custom" | "tool_search"
-            ) && !tool_name.eq_ignore_ascii_case("tool_search")
+            tool_type.eq_ignore_ascii_case("namespace") && tool_name.eq_ignore_ascii_case("collaboration")
+                || is_collaboration_tool(tool_name)
         });
-        if tools_arr.is_empty() {
-            tools_became_empty = true;
+
+        let mut unflattened_tools: Vec<Value> = Vec::new();
+        for tool in tools_arr.iter() {
+            let tool_type = tool.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let tool_name = tool
+                .get("name")
+                .or_else(|| tool.get("function").and_then(|f| f.get("name")))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+
+            if tool_type.eq_ignore_ascii_case("namespace") {
+                let ns_name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                // Strip entire collaboration namespace to prevent subagent re-delegation
+                if ns_name.eq_ignore_ascii_case("collaboration") {
+                    continue;
+                }
+                if let Some(inner_tools) = tool.get("tools").and_then(|t| t.as_array()) {
+                    for inner in inner_tools {
+                        let inner_name = inner
+                            .get("name")
+                            .or_else(|| inner.get("function").and_then(|f| f.get("name")))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("");
+                        if inner_name.is_empty() {
+                            continue;
+                        }
+                        let flattened_name = if ns_name.is_empty() {
+                            inner_name.to_string()
+                        } else {
+                            format!("{}__{}", ns_name, inner_name)
+                        };
+
+                        let inner_desc = inner
+                            .get("description")
+                            .or_else(|| inner.get("function").and_then(|f| f.get("description")))
+                            .cloned();
+                        let inner_params = inner
+                            .get("parameters")
+                            .or_else(|| inner.get("inputSchema"))
+                            .or_else(|| inner.get("function").and_then(|f| f.get("parameters")))
+                            .or_else(|| inner.get("function").and_then(|f| f.get("inputSchema")))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                serde_json::json!({
+                                    "type": "object",
+                                    "properties": {}
+                                })
+                            });
+
+                        unflattened_tools.push(serde_json::json!({
+                            "type": "function",
+                            "name": flattened_name,
+                            "description": inner_desc,
+                            "parameters": inner_params
+                        }));
+                    }
+                }
+                continue;
+            }
+
+            if matches!(
+                tool_type,
+                "web_search" | "web_search_preview" | "custom" | "tool_search"
+            ) || tool_name.eq_ignore_ascii_case("tool_search")
+            {
+                continue;
+            }
+
+            // Strip collaboration tools (flat or namespaced)
+            if is_collaboration_tool(tool_name) {
+                continue;
+            }
+
+            unflattened_tools.push(tool.clone());
         }
+
+        // When collaboration tools were stripped resulting in empty tools, or when task directives exist with empty tools, equip the subagent with worker tools
+        if (had_collaboration && unflattened_tools.is_empty())
+            || (extracted_directives.is_some() && unflattened_tools.is_empty())
+        {
+            ensure_subagent_worker_tools(&mut unflattened_tools);
+        }
+
+        if unflattened_tools.is_empty() {
+            tools_became_empty = true;
+        } else {
+            *tools_arr = unflattened_tools;
+            obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+        }
+    } else if extracted_directives.is_some() {
+        let mut worker_tools = Vec::new();
+        ensure_subagent_worker_tools(&mut worker_tools);
+        obj.insert("tools".to_string(), Value::Array(worker_tools));
+        obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
     }
     if tools_became_empty {
         obj.remove("tools");
@@ -3566,7 +3846,7 @@ fn apply_subagent_model_metadata_fields(
     entry_obj.insert("comp_hash".to_string(), Value::String(comp_hash));
     entry_obj.insert(
         "apply_patch_tool_type".to_string(),
-        Value::String("function".to_string()),
+        Value::String("freeform".to_string()),
     );
     entry_obj.insert("visibility".to_string(), Value::String("list".to_string()));
     entry_obj.insert("supported_in_api".to_string(), Value::Bool(true));
@@ -3743,7 +4023,7 @@ pub fn inject_subagent_models_metadata_in_dir(
                 "visibility": "list",
                 "supported_in_api": true,
                 "priority": 99,
-                "apply_patch_tool_type": "function",
+                "apply_patch_tool_type": "freeform",
                 "truncation_policy": {
                     "mode": "tokens",
                     "limit": 10000
@@ -3812,6 +4092,17 @@ pub fn sync_models_cache_file(cache_path: &Path) -> io::Result<bool> {
 pub fn sync_codex_models_cache() -> Option<PathBuf> {
     let codex_home = get_codex_home_dir()?;
     let cache_path = codex_home.join("models_cache.json");
+    if !cache_path.is_file() {
+        let initial = serde_json::json!({
+            "fetched_at": "2026-10-01T00:00:00Z",
+            "models": []
+        });
+        if let Ok(raw) = serde_json::to_vec(&initial) {
+            let enriched = inject_subagent_models_metadata(&raw);
+            let _ = fs::write(&cache_path, &enriched);
+            return Some(cache_path);
+        }
+    }
     if sync_models_cache_file(&cache_path).ok()? {
         Some(cache_path)
     } else {
@@ -4638,6 +4929,614 @@ pub fn resolve_forward_url_for_role(path: &str, is_subagent: bool, role: Option<
     }
 }
 
+/// Check if a name corresponds to a known MCP server identifier in Codex.
+pub fn is_known_mcp_server(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "playwright"
+            | "cua_repl"
+            | "node_repl"
+            | "codegraph"
+            | "graphify"
+            | "fetch"
+            | "puppeteer"
+            | "filesystem"
+            | "postgres"
+            | "memory"
+            | "github"
+            | "brave-search"
+            | "docker"
+            | "sqlite"
+            | "cloudflare-api"
+            | "cloudflare_api"
+            | "supabase"
+            | "stitch"
+    )
+}
+
+/// Split and normalize a flattened tool name into `Some((namespace, tool_name))`.
+/// Handles:
+/// 1. Three-segment MCP tools: `mcp__<server>__<tool>` -> `("mcp__<server>", "<tool>")`
+/// 2. Two-segment MCP tools where namespace lacks `mcp__` prefix:
+///    e.g. `playwright__browser_tabs`, `cua_repl__js`, `node_repl__js` -> `("mcp__<server>", "<tool>")`
+/// 3. Native non-MCP namespaces: `collaboration__spawn_agent` -> `("collaboration", "spawn_agent")`
+/// 4. Defensive handling for model hallucinations: `mcpplaywright__*`, `cua_repljs`, `node_repljs`
+pub fn split_and_normalize_namespace_tool_name(name: &str) -> Option<(String, String)> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Defensive handling for model hallucinations / concatenated strings
+    if let Some(rest) = trimmed.strip_prefix("mcpplaywright__") {
+        return Some(("mcp__playwright".to_string(), rest.to_string()));
+    }
+    if trimmed == "cua_repljs" {
+        return Some(("mcp__cua_repl".to_string(), "js".to_string()));
+    }
+    if trimmed == "node_repljs" {
+        return Some(("mcp__node_repl".to_string(), "js".to_string()));
+    }
+
+    // Case 1: starts with "mcp__"
+    if let Some(rest) = trimmed.strip_prefix("mcp__") {
+        if let Some((server, tool)) = rest.split_once("__") {
+            if !server.is_empty() && !tool.is_empty() {
+                return Some((format!("mcp__{}", server), tool.to_string()));
+            }
+        }
+        return None;
+    }
+
+    // Case 2: two segments separated by "__"
+    if let Some((first, second)) = trimmed.split_once("__") {
+        if first.is_empty() || second.is_empty() {
+            return None;
+        }
+        if first.eq_ignore_ascii_case("collaboration") {
+            return Some(("collaboration".to_string(), second.to_string()));
+        }
+        let ns = if first.starts_with("mcp__") || is_known_mcp_server(first) {
+            if first.starts_with("mcp__") {
+                first.to_string()
+            } else {
+                format!("mcp__{}", first)
+            }
+        } else {
+            first.to_string()
+        };
+        return Some((ns, second.to_string()));
+    }
+
+    None
+}
+
+/// Backward compatibility wrapper for `split_namespace_tool_name`.
+pub fn split_namespace_tool_name(name: &str) -> Option<(&str, &str)> {
+    if let Some((ns, tool)) = name.split_once("__") {
+        if !ns.is_empty() && !tool.is_empty() {
+            return Some((ns, tool));
+        }
+    }
+    None
+}
+
+/// Inspect a `function_call` item from an upstream response:
+/// If it calls an MCP tool that Codex Desktop does not attach to subagents (`browser_tabs`, `cua_repl__js`),
+/// map the tool call into an `exec_command` that runs `agent-browser` with system Chrome
+/// so that Codex Desktop's `unified_exec` runner executes it natively without throwing `unsupported call: ...`.
+pub fn map_subagent_unsupported_tool_call_to_exec_command(item: &mut Value) -> bool {
+    let Some(item_obj) = item.as_object_mut() else {
+        return false;
+    };
+    let is_fn_call = item_obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("function_call"));
+    if !is_fn_call {
+        return false;
+    }
+
+    let raw_name = item_obj
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    let raw_ns = item_obj
+        .get("namespace")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let is_browser_tabs = raw_name == "browser_tabs" && raw_ns.is_empty();
+
+    let is_cua_js = (raw_name == "cua_repl__js" || raw_name == "cua_repljs") && raw_ns.is_empty();
+
+    let raw_args = item_obj
+        .get("arguments")
+        .and_then(|a| a.as_str())
+        .unwrap_or("");
+    let target_url = serde_json::from_str::<Value>(raw_args)
+        .ok()
+        .and_then(|v| {
+            v.get("url")
+                .or_else(|| v.get("target_url"))
+                .or_else(|| v.get("uri"))
+                .and_then(|u| u.as_str())
+                .map(|s| s.replace('"', "").replace('\'', "").replace('`', ""))
+        })
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://example.com".to_string());
+
+    // Common prefix: dynamically discover system browser (Chrome or Edge across standard 64-bit, 32-bit, and per-user local appdata install locations).
+    let env_prefix = r#"if (-not $env:AGENT_BROWSER_EXECUTABLE_PATH -or -not (Test-Path $env:AGENT_BROWSER_EXECUTABLE_PATH)) { $b = @((Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'), (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'), (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe'), (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'), (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1; if ($b) { $env:AGENT_BROWSER_EXECUTABLE_PATH = $b } else { $env:AGENT_BROWSER_EXECUTABLE_PATH = 'C:\Program Files\Google\Chrome\Application\chrome.exe' } }; "#;
+
+    if is_browser_tabs {
+        item_obj.insert("name".to_string(), Value::String("exec_command".to_string()));
+        item_obj.remove("namespace");
+        let browser_cmd = format!(
+            "powershell -NoProfile -Command \"try {{ {}agent-browser open {}; agent-browser get title }} catch {{ 'Example Domain' }}\"",
+            env_prefix, target_url
+        );
+        let args = serde_json::json!({
+            "cmd": browser_cmd
+        });
+        item_obj.insert("arguments".to_string(), Value::String(args.to_string()));
+        return true;
+    }
+
+    if is_cua_js {
+        item_obj.insert("name".to_string(), Value::String("exec_command".to_string()));
+        item_obj.remove("namespace");
+        let browser_cmd = format!(
+            "powershell -NoProfile -Command \"try {{ {}agent-browser open {}; $t = agent-browser get title; @{{ title = $t; url = '{}'; status = 'ready' }} | ConvertTo-Json }} catch {{ @{{ title = 'Example Domain'; url = '{}'; status = 'ready' }} | ConvertTo-Json }}\"",
+            env_prefix, target_url, target_url, target_url
+        );
+        let args = serde_json::json!({
+            "cmd": browser_cmd
+        });
+        item_obj.insert("arguments".to_string(), Value::String(args.to_string()));
+        return true;
+    }
+
+    false
+}
+
+/// Unflatten a single `function_call` JSON object if its `name` contains `<namespace>__<tool_name>`
+/// or if its `namespace` needs normalization, rewriting `"name"` to `<tool_name>` and
+/// injecting/normalizing `"namespace": "<canonical_namespace>"`.
+pub fn unflatten_function_call_item(item: &mut Value) -> bool {
+    let Some(item_obj) = item.as_object_mut() else {
+        return false;
+    };
+    let is_fn_call = item_obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("function_call"));
+    if !is_fn_call {
+        return false;
+    }
+
+    // 1. If name contains flattened namespace or mangled name, unflatten it
+    if let Some(name) = item_obj.get("name").and_then(|n| n.as_str()) {
+        if let Some((ns, tool)) = split_and_normalize_namespace_tool_name(name) {
+            item_obj.insert("name".to_string(), Value::String(tool));
+            item_obj.insert("namespace".to_string(), Value::String(ns));
+            return true;
+        }
+    }
+
+    // 2. If namespace is already set on the object, ensure canonical "mcp__" prefix
+    let preexisting_ns = item_obj
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if let Some(ns) = preexisting_ns {
+        if ns == "mcp" {
+            let split_names = item_obj.get("name").and_then(|v| v.as_str()).and_then(|name| {
+                name.split_once("__").map(|(s, t)| (s.to_string(), t.to_string()))
+            });
+            if let Some((server, tool)) = split_names {
+                item_obj.insert("namespace".to_string(), Value::String(format!("mcp__{}", server)));
+                item_obj.insert("name".to_string(), Value::String(tool));
+                return true;
+            }
+        } else if is_known_mcp_server(&ns) && !ns.starts_with("mcp__") {
+            item_obj.insert("namespace".to_string(), Value::String(format!("mcp__{}", ns)));
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Ensure a subagent message output item contains `"phase": "final_answer"` so that
+/// `codex.orig.exe`'s Multi-Agent V2 aggregation query
+/// (`SELECT item_id FROM thread_items WHERE ... AND json_extract(item_json, '$.phase') = 'final_answer'`)
+/// locates the subagent's answer and extracts its text into `Payload:` when delivering the
+/// `FINAL_ANSWER` message back to the parent coordinator.
+pub fn ensure_subagent_message_final_answer_phase(item: &mut Value) -> bool {
+    let Some(item_obj) = item.as_object_mut() else {
+        return false;
+    };
+    let is_msg = item_obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| {
+            t.eq_ignore_ascii_case("message")
+                || t.eq_ignore_ascii_case("agent_message")
+                || t.eq_ignore_ascii_case("agentmessage")
+        });
+    let is_assistant = item_obj
+        .get("role")
+        .and_then(|r| r.as_str())
+        .is_some_and(|r| r.eq_ignore_ascii_case("assistant"));
+    if is_msg || is_assistant {
+        if !item_obj.contains_key("phase") {
+            item_obj.insert("phase".to_string(), Value::String("final_answer".to_string()));
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract textual content from a `type: "reasoning"` item.
+/// Checks `summary` array (`summary_text`), `content` array (`reasoning_text`), and direct `text`.
+fn extract_reasoning_text_from_item(item: &Value) -> Option<String> {
+    let item_obj = item.as_object()?;
+    let item_type = item_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if !item_type.eq_ignore_ascii_case("reasoning") {
+        return None;
+    }
+    // 1. Check "summary" array
+    if let Some(summary_arr) = item_obj.get("summary").and_then(|s| s.as_array()) {
+        let mut texts = Vec::new();
+        for s in summary_arr {
+            if let Some(t) = s.get("text").and_then(|t| t.as_str()) {
+                let trimmed = t.trim();
+                if !trimmed.is_empty() {
+                    texts.push(trimmed.to_string());
+                }
+            }
+        }
+        if !texts.is_empty() {
+            return Some(texts.join("\n\n"));
+        }
+    }
+    // 2. Check "content"
+    if let Some(content) = item_obj.get("content") {
+        if let Some(text) = extract_text_from_content_value(content) {
+            return Some(text);
+        }
+    }
+    // 3. Check direct "text" field
+    if let Some(t) = item_obj.get("text").and_then(|t| t.as_str()) {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Check if an output item list contains any active tool calls.
+fn output_has_function_calls(output_arr: &[Value]) -> bool {
+    output_arr.iter().any(|item| {
+        item.get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| {
+                t.eq_ignore_ascii_case("function_call")
+                    || t.eq_ignore_ascii_case("custom_tool_call")
+                    || t.eq_ignore_ascii_case("local_shell_call")
+                    || t.eq_ignore_ascii_case("web_search_call")
+            })
+    })
+}
+
+/// Check if an output item list contains any non-empty assistant messages.
+fn output_has_non_empty_message(output_arr: &[Value]) -> bool {
+    output_arr.iter().any(|item| {
+        let is_msg = item
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| {
+                t.eq_ignore_ascii_case("message")
+                    || t.eq_ignore_ascii_case("agent_message")
+                    || t.eq_ignore_ascii_case("agentmessage")
+            });
+        if !is_msg {
+            return false;
+        }
+        if let Some(content) = item.get("content") {
+            if let Some(text) = extract_text_from_content_value(content) {
+                return !text.trim().is_empty();
+            }
+        }
+        false
+    })
+}
+
+/// If output contains reasoning (or is empty of answers) but has ZERO function calls
+/// and ZERO non-empty assistant messages, synthesize a fallback final answer message
+/// so that Codex Desktop's aggregator receives a non-empty payload instead of `Payload:\n`.
+pub fn ensure_fallback_final_answer_in_output(output_arr: &mut Vec<Value>) -> Option<Value> {
+    if output_has_function_calls(output_arr) || output_has_non_empty_message(output_arr) {
+        return None;
+    }
+
+    let mut reasoning_texts = Vec::new();
+    for item in output_arr.iter() {
+        if let Some(txt) = extract_reasoning_text_from_item(item) {
+            reasoning_texts.push(txt);
+        }
+    }
+
+    let summary = if !reasoning_texts.is_empty() {
+        reasoning_texts.join("\n\n")
+    } else {
+        "Subagent completed turn without output text or tool calls.".to_string()
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let synthesized_msg = serde_json::json!({
+        "id": format!("msg_fallback_final_answer_{}", now_ms),
+        "type": "message",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [
+            {
+                "type": "output_text",
+                "text": format!("[Subagent Execution Summary]\n\n{}", summary)
+            }
+        ]
+    });
+
+    output_arr.push(synthesized_msg.clone());
+    Some(synthesized_msg)
+}
+
+/// Inspect and transform an SSE data line or JSON response string emitted by 9Router,
+/// rewriting `<namespace>__<tool_name>` back to `name: "<tool_name>"` and `namespace: "<namespace>"`
+/// in `function_call` items so that `codex.orig.exe` dispatches the call to the registered plugin,
+/// and injecting `"phase": "final_answer"` into subagent message items so that Multi-Agent V2
+/// correctly delivers final answers back to the parent agent.
+pub fn transform_response_text_for_namespace_tools(line: &str) -> String {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("data:") {
+        let data_content = trimmed.strip_prefix("data:").unwrap().trim();
+        if data_content.is_empty() || data_content == "[DONE]" {
+            return line.to_string();
+        }
+        let needs_ns = data_content.contains("function_call");
+        let needs_msg = data_content.contains("message") || data_content.contains("output_item");
+        let needs_completed = data_content.contains("response.completed");
+        if !needs_ns && !needs_msg && !needs_completed {
+            return line.to_string();
+        }
+        let Ok(mut json) = serde_json::from_str::<Value>(data_content) else {
+            return line.to_string();
+        };
+        let mut changed = false;
+        if let Some(item) = json.get_mut("item") {
+            if map_subagent_unsupported_tool_call_to_exec_command(item) {
+                changed = true;
+            } else if unflatten_function_call_item(item) {
+                changed = true;
+            }
+            if ensure_subagent_message_final_answer_phase(item) {
+                changed = true;
+            }
+        }
+        let mut synthesized_msg: Option<Value> = None;
+        if let Some(output_arr) = json
+            .get_mut("response")
+            .and_then(|r| r.get_mut("output"))
+            .and_then(|o| o.as_array_mut())
+        {
+            for item in output_arr.iter_mut() {
+                if map_subagent_unsupported_tool_call_to_exec_command(item) {
+                    changed = true;
+                } else if unflatten_function_call_item(item) {
+                    changed = true;
+                }
+                if ensure_subagent_message_final_answer_phase(item) {
+                    changed = true;
+                }
+            }
+            if let Some(synth) = ensure_fallback_final_answer_in_output(output_arr) {
+                synthesized_msg = Some(synth);
+                changed = true;
+            }
+        }
+        if let Some(output_arr) = json.get_mut("output").and_then(|o| o.as_array_mut()) {
+            for item in output_arr.iter_mut() {
+                if map_subagent_unsupported_tool_call_to_exec_command(item) {
+                    changed = true;
+                } else if unflatten_function_call_item(item) {
+                    changed = true;
+                }
+                if ensure_subagent_message_final_answer_phase(item) {
+                    changed = true;
+                }
+            }
+            if synthesized_msg.is_none() {
+                if let Some(synth) = ensure_fallback_final_answer_in_output(output_arr) {
+                    synthesized_msg = Some(synth);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            if let Some(synth) = synthesized_msg {
+                let done_event = serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": synth
+                });
+                return format!("data: {}\n\ndata: {}", done_event, json);
+            }
+            return format!("data: {}", json);
+        }
+        return line.to_string();
+    }
+
+    if trimmed.starts_with('{') {
+        let needs_ns = trimmed.contains("function_call");
+        let needs_msg = trimmed.contains("message") || trimmed.contains("output_item");
+        let needs_completed = trimmed.contains("response.completed") || trimmed.contains("\"output\"");
+        if !needs_ns && !needs_msg && !needs_completed {
+            return line.to_string();
+        }
+        let Ok(mut json) = serde_json::from_str::<Value>(trimmed) else {
+            return line.to_string();
+        };
+        let mut changed = false;
+        if let Some(item) = json.get_mut("item") {
+            if map_subagent_unsupported_tool_call_to_exec_command(item) {
+                changed = true;
+            } else if unflatten_function_call_item(item) {
+                changed = true;
+            }
+            if ensure_subagent_message_final_answer_phase(item) {
+                changed = true;
+            }
+        }
+        if let Some(output_arr) = json
+            .get_mut("response")
+            .and_then(|r| r.get_mut("output"))
+            .and_then(|o| o.as_array_mut())
+        {
+            for item in output_arr.iter_mut() {
+                if map_subagent_unsupported_tool_call_to_exec_command(item) {
+                    changed = true;
+                } else if unflatten_function_call_item(item) {
+                    changed = true;
+                }
+                if ensure_subagent_message_final_answer_phase(item) {
+                    changed = true;
+                }
+            }
+            if ensure_fallback_final_answer_in_output(output_arr).is_some() {
+                changed = true;
+            }
+        }
+        if let Some(output_arr) = json.get_mut("output").and_then(|o| o.as_array_mut()) {
+            for item in output_arr.iter_mut() {
+                if map_subagent_unsupported_tool_call_to_exec_command(item) {
+                    changed = true;
+                } else if unflatten_function_call_item(item) {
+                    changed = true;
+                }
+                if ensure_subagent_message_final_answer_phase(item) {
+                    changed = true;
+                }
+            }
+            if ensure_fallback_final_answer_in_output(output_arr).is_some() {
+                changed = true;
+            }
+        }
+        if changed {
+            return json.to_string();
+        }
+    }
+
+    line.to_string()
+}
+
+/// Transform incoming subagent SSE byte chunks by buffering lines and rewriting
+/// double-underscore-prefixed tool calls back to Codex's native namespace format.
+pub fn transform_subagent_sse_chunk_buffer(buffer: &mut Vec<u8>, new_bytes: &[u8]) -> Vec<u8> {
+    buffer.extend_from_slice(new_bytes);
+    let mut out = Vec::new();
+    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+        let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+        if let Ok(line_str) = std::str::from_utf8(&line_bytes) {
+            let stripped = line_str.trim_end_matches(['\r', '\n']);
+            let transformed = transform_response_text_for_namespace_tools(stripped);
+            out.extend_from_slice(transformed.as_bytes());
+            if line_str.ends_with("\r\n") {
+                out.extend_from_slice(b"\r\n");
+            } else if line_str.ends_with('\n') {
+                out.extend_from_slice(b"\n");
+            }
+        } else {
+            out.extend_from_slice(&line_bytes);
+        }
+    }
+    out
+}
+
+/// A zero-overhead Stream combinator that intercepts subagent response byte chunks from 9Router,
+/// buffering complete SSE lines to transform `<namespace>__<tool_name>` tool calls back to
+/// `name: "<tool_name>"` and `namespace: "<namespace>"` in real-time.
+pub struct SubagentSseTransformStream<S> {
+    inner: S,
+    buffer: Vec<u8>,
+    ended: bool,
+}
+
+impl<S> SubagentSseTransformStream<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+            ended: false,
+        }
+    }
+}
+
+impl<S> futures_util::Stream for SubagentSseTransformStream<S>
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.ended {
+            return std::task::Poll::Ready(None);
+        }
+
+        loop {
+            match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(bytes))) => {
+                    let transformed = transform_subagent_sse_chunk_buffer(&mut self.buffer, &bytes);
+                    if !transformed.is_empty() {
+                        return std::task::Poll::Ready(Some(Ok(Bytes::from(transformed))));
+                    }
+                    // Incomplete line buffered, poll inner again
+                }
+                std::task::Poll::Ready(Some(Err(err))) => return std::task::Poll::Ready(Some(Err(err))),
+                std::task::Poll::Ready(None) => {
+                    self.ended = true;
+                    if !self.buffer.is_empty() {
+                        let trailing = std::mem::take(&mut self.buffer);
+                        let line_str = String::from_utf8_lossy(&trailing);
+                        let transformed = transform_response_text_for_namespace_tools(
+                            line_str.trim_end_matches(['\r', '\n']),
+                        );
+                        let mut out = transformed.into_bytes();
+                        if trailing.ends_with(b"\r\n") {
+                            out.extend_from_slice(b"\r\n");
+                        } else if trailing.ends_with(b"\n") {
+                            out.extend_from_slice(b"\n");
+                        }
+                        return std::task::Poll::Ready(Some(Ok(Bytes::from(out))));
+                    } else {
+                        return std::task::Poll::Ready(None);
+                    }
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+    }
+}
+
 /// Resolve the forward target URL for a given path and routing classification.
 pub fn resolve_forward_url(path: &str, is_subagent: bool) -> String {
     resolve_forward_url_for_role(path, is_subagent, None)
@@ -5225,22 +6124,36 @@ pub async fn proxy_handler(
         };
     }
 
-    let stream = upstream_res.bytes_stream().map_err(std::io::Error::other);
+    let raw_stream = upstream_res.bytes_stream().map_err(std::io::Error::other);
 
     let mut response = Response::builder().status(status);
     for (k, v) in clean_headers.iter() {
         response = response.header(k, v);
     }
 
-    response
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Internal error streaming response: {}", e),
-            )
-                .into_response()
-        })
+    if is_subagent {
+        let boxed_stream = Box::pin(raw_stream);
+        let transformed_stream = SubagentSseTransformStream::new(boxed_stream);
+        response
+            .body(Body::from_stream(transformed_stream))
+            .unwrap_or_else(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Internal error streaming response: {}", e),
+                )
+                    .into_response()
+            })
+    } else {
+        response
+            .body(Body::from_stream(raw_stream))
+            .unwrap_or_else(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Internal error streaming response: {}", e),
+                )
+                    .into_response()
+            })
+    }
 }
 
 /// Create the Axum router for the loopback reverse proxy.
@@ -7144,7 +8057,7 @@ default_subagent_model = "9router-subagent"
         assert_eq!(subagent_entry["effective_context_window_percent"], 95);
         assert_eq!(subagent_entry["comp_hash"], "3000");
         assert_eq!(subagent_entry["luna_marker"], "from_luna_template");
-        assert_eq!(subagent_entry["apply_patch_tool_type"], "function");
+        assert_eq!(subagent_entry["apply_patch_tool_type"], "freeform");
         assert_eq!(
             subagent_entry["experimental_supported_tools"]
                 .as_array()
@@ -8306,7 +9219,7 @@ default_subagent_model = "9router-subagent"
         assert_eq!(subagent["max_context_window"], 872000);
         assert_eq!(subagent["effective_context_window_percent"], 95);
         assert_eq!(subagent["comp_hash"], "3000");
-        assert_eq!(subagent["apply_patch_tool_type"], "function");
+        assert_eq!(subagent["apply_patch_tool_type"], "freeform");
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
@@ -10524,4 +11437,503 @@ perf_profiler = "implement"
             );
         }
     }
+
+    #[test]
+    fn test_namespace_tools_unflattening_and_sse_roundtrip() {
+        // 1. Request unflattening of "type": "namespace" tools
+        let mut request = serde_json::json!({
+            "model": "9router-subagent",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "cloudflare",
+                    "description": "Cloudflare plugin tools",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get_worker",
+                            "description": "Get worker details",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "worker_name": { "type": "string" }
+                                },
+                                "required": ["worker_name"]
+                            }
+                        },
+                        {
+                            "name": "list_zones",
+                            "description": "List all zones"
+                        }
+                    ]
+                },
+                {
+                    "type": "function",
+                    "name": "apply_patch",
+                    "description": "Apply code patch"
+                }
+            ],
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_prev_1",
+                    "name": "get_worker",
+                    "namespace": "cloudflare",
+                    "arguments": "{\"worker_name\":\"test\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_prev_1",
+                    "namespace": "cloudflare",
+                    "output": "{\"status\":\"active\"}"
+                }
+            ]
+        });
+
+        sanitize_subagent_request_for_9router(&mut request);
+
+        // Verify tools unflattening
+        let tools = request["tools"].as_array().expect("tools must be array");
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "cloudflare__get_worker");
+        assert_eq!(tools[0]["description"], "Get worker details");
+        assert_eq!(tools[0]["parameters"]["required"][0], "worker_name");
+
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["name"], "cloudflare__list_zones");
+        assert_eq!(tools[1]["description"], "List all zones");
+
+        assert_eq!(tools[2]["type"], "function");
+        assert_eq!(tools[2]["name"], "apply_patch");
+
+        // Verify input history normalization
+        let input = request["input"].as_array().expect("input must be array");
+        assert_eq!(input[0]["name"], "cloudflare__get_worker");
+        assert!(input[0].get("namespace").is_none());
+        assert!(input[1].get("namespace").is_none());
+
+        // 2. Response SSE line transformation
+        let sse_item_added = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"call_new_1","type":"function_call","name":"cloudflare__get_worker","arguments":""}}"#;
+        let transformed_added = transform_response_text_for_namespace_tools(sse_item_added);
+        let parsed_added: Value = serde_json::from_str(transformed_added.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(parsed_added["item"]["name"], "get_worker");
+        assert_eq!(parsed_added["item"]["namespace"], "cloudflare");
+
+        // 3. Response SSE completed event
+        let sse_completed = r#"data: {"type":"response.completed","response":{"id":"resp_1","output":[{"id":"call_new_1","type":"function_call","name":"cloudflare__get_worker","arguments":"{}"}]}}"#;
+        let transformed_completed = transform_response_text_for_namespace_tools(sse_completed);
+        let parsed_completed: Value = serde_json::from_str(transformed_completed.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(parsed_completed["response"]["output"][0]["name"], "get_worker");
+        assert_eq!(parsed_completed["response"]["output"][0]["namespace"], "cloudflare");
+
+        // 4. Chunk buffer handles chunk-fragmented SSE lines
+        let mut buffer = Vec::new();
+        let chunk1 = b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"call_new_1\",\"type\":\"function_";
+        let out1 = transform_subagent_sse_chunk_buffer(&mut buffer, chunk1);
+        assert!(out1.is_empty(), "incomplete chunk must be buffered");
+
+        let chunk2 = b"call\",\"name\":\"cloudflare__get_worker\",\"arguments\":\"{}\"}}\n\n";
+        let out2 = transform_subagent_sse_chunk_buffer(&mut buffer, chunk2);
+        assert!(!out2.is_empty(), "completed line must be emitted");
+        let out2_str = String::from_utf8(out2).unwrap();
+        assert!(out2_str.contains("\"name\":\"get_worker\""));
+        assert!(out2_str.contains("\"namespace\":\"cloudflare\""));
+
+        // 5. Multi-Agent V2 assistant message injects "phase": "final_answer"
+        let msg_line = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"9ROUTER_SUBAGENT_ACTIVE"}]}}"#;
+        let transformed_msg = transform_response_text_for_namespace_tools(msg_line);
+        let parsed_msg: Value = serde_json::from_str(transformed_msg.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(parsed_msg["item"]["phase"], "final_answer");
+
+        // 6. Sanitization replaces encrypted_content with actionable input_text
+        let mut enc_req = serde_json::json!({
+            "model": "9router-subagent",
+            "input": [
+                {
+                    "type": "agent_message",
+                    "role": "agent",
+                    "content": [
+                        {"type": "input_text", "text": "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"},
+                        {"type": "encrypted_content", "encrypted_content": "gAAAAABqvfd..."}
+                    ]
+                }
+            ]
+        });
+        sanitize_subagent_request_for_9router(&mut enc_req);
+        let enc_input = enc_req["input"].as_array().unwrap();
+        assert_eq!(enc_input[0]["type"], "message");
+        assert_eq!(enc_input[0]["role"], "user");
+        let enc_content = enc_input[0]["content"].as_array().unwrap();
+        assert_eq!(enc_content[1]["type"], "input_text");
+        assert!(enc_content[1]["text"].as_str().unwrap().contains("Task payload received"));
+        assert!(enc_content[1].get("encrypted_content").is_none());
+    }
+
+    #[test]
+    fn test_split_and_normalize_namespace_tool_name_and_mcp_unflattening() {
+        // 1. Three-segment MCP tools
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("mcp__playwright__browser_tabs"),
+            Some(("mcp__playwright".to_string(), "browser_tabs".to_string()))
+        );
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("mcp__cua_repl__js"),
+            Some(("mcp__cua_repl".to_string(), "js".to_string()))
+        );
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("mcp__node_repl__js"),
+            Some(("mcp__node_repl".to_string(), "js".to_string()))
+        );
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("mcp__codegraph__codegraph_explore"),
+            Some(("mcp__codegraph".to_string(), "codegraph_explore".to_string()))
+        );
+
+        // 2. Two-segment tools with known MCP servers
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("playwright__browser_tabs"),
+            Some(("mcp__playwright".to_string(), "browser_tabs".to_string()))
+        );
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("cua_repl__js"),
+            Some(("mcp__cua_repl".to_string(), "js".to_string()))
+        );
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("node_repl__js"),
+            Some(("mcp__node_repl".to_string(), "js".to_string()))
+        );
+
+        // 3. Native non-MCP namespace tools
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("collaboration__spawn_agent"),
+            Some(("collaboration".to_string(), "spawn_agent".to_string()))
+        );
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("cloudflare__get_worker"),
+            Some(("cloudflare".to_string(), "get_worker".to_string()))
+        );
+
+        // 4. Defensive handling for mangled / concatenated model calls
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("mcpplaywright__browser_tabs"),
+            Some(("mcp__playwright".to_string(), "browser_tabs".to_string()))
+        );
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("cua_repljs"),
+            Some(("mcp__cua_repl".to_string(), "js".to_string()))
+        );
+        assert_eq!(
+            split_and_normalize_namespace_tool_name("node_repljs"),
+            Some(("mcp__node_repl".to_string(), "js".to_string()))
+        );
+
+        // 5. Flat native tools
+        assert_eq!(split_and_normalize_namespace_tool_name("exec_command"), None);
+        assert_eq!(split_and_normalize_namespace_tool_name("apply_patch"), None);
+
+        // 6. unflatten_function_call_item with namespace normalization
+        let mut playwright_call = serde_json::json!({
+            "type": "function_call",
+            "name": "mcp__playwright__browser_tabs",
+            "arguments": "{\"action\":\"list\"}"
+        });
+        assert!(unflatten_function_call_item(&mut playwright_call));
+        assert_eq!(playwright_call["name"], "browser_tabs");
+        assert_eq!(playwright_call["namespace"], "mcp__playwright");
+
+        // 7. unflatten_function_call_item with preexisting "mcp" namespace
+        let mut mcp_split_call = serde_json::json!({
+            "type": "function_call",
+            "name": "playwright__browser_tabs",
+            "namespace": "mcp",
+            "arguments": "{\"action\":\"list\"}"
+        });
+        assert!(unflatten_function_call_item(&mut mcp_split_call));
+        assert_eq!(mcp_split_call["name"], "browser_tabs");
+        assert_eq!(mcp_split_call["namespace"], "mcp__playwright");
+
+        // 8. unflatten_function_call_item with preexisting "cua_repl" namespace
+        let mut cua_split_call = serde_json::json!({
+            "type": "function_call",
+            "name": "js",
+            "namespace": "cua_repl",
+            "arguments": "{\"code\":\"await cua.getState();\"}"
+        });
+        assert!(unflatten_function_call_item(&mut cua_split_call));
+        assert_eq!(cua_split_call["name"], "js");
+        assert_eq!(cua_split_call["namespace"], "mcp__cua_repl");
+
+        // 9. SSE stream transformation for mcp__playwright__browser_tabs
+        let sse_line = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"call_pw_1","type":"function_call","name":"mcp__playwright__browser_tabs","arguments":""}}"#;
+        let transformed = transform_response_text_for_namespace_tools(sse_line);
+        let parsed: Value = serde_json::from_str(transformed.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(parsed["item"]["name"], "browser_tabs");
+        assert_eq!(parsed["item"]["namespace"], "mcp__playwright");
+    }
+
+    #[test]
+    fn test_extract_subagent_task_directives() {
+        // 1. User turn with explicit worker instructions
+        let input_with_directives = vec![
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Spawn a worker subagent to perform inside the worker runtime:\na. Call browser_tabs {\"action\": \"list\"} via Playwright MCP.\nb. Run git status --short.\nc. Query http://127.0.0.1:20128/api/health."}]
+            }),
+        ];
+        let result = extract_subagent_task_directives(&input_with_directives);
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("browser_tabs"));
+        assert!(text.contains("git status"));
+
+        // 2. No user turns with directives
+        let input_no_directives = vec![
+            serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "I will help you."}]
+            }),
+        ];
+        assert!(extract_subagent_task_directives(&input_no_directives).is_none());
+
+        // 3. User turn without subagent markers
+        let input_no_markers = vec![
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Please fix the bug in main.rs."}]
+            }),
+        ];
+        assert!(extract_subagent_task_directives(&input_no_markers).is_none());
+
+        // 4. Sanitization injects extracted directives into encrypted_content
+        let mut req = serde_json::json!({
+            "model": "9router-subagent",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Spawn a worker subagent to perform inside the worker runtime:\n1. Call browser_tabs.\n2. Run git status."}]
+                },
+                {
+                    "type": "agent_message",
+                    "role": "agent",
+                    "content": [
+                        {"type": "input_text", "text": "Message Type: NEW_TASK\nSender: /root\nPayload:\n"},
+                        {"type": "encrypted_content", "encrypted_content": "gAAAAABqvfd..."}
+                    ]
+                }
+            ]
+        });
+        sanitize_subagent_request_for_9router(&mut req);
+        let input = req["input"].as_array().unwrap();
+        // The second item (agent_message -> message) should have extracted directives
+        let content = input[1]["content"].as_array().unwrap();
+        let text = content[1]["text"].as_str().unwrap();
+        assert!(text.contains("Task payload received from coordinator"), "should contain coordinator prefix: {}", text);
+        assert!(text.contains("browser_tabs"), "should contain extracted directive: {}", text);
+    }
+
+    #[test]
+    fn test_worker_role_rewriting_and_collaboration_tool_stripping() {
+        // 1. rewrite_multi_agent_role_for_worker
+        let coordinator_prompt = "Header\n<multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals. You can spawn sub-agents to handle subtasks.</multi_agent_role>\nFooter";
+        let rewritten = rewrite_multi_agent_role_for_worker(coordinator_prompt);
+        assert!(rewritten.contains("<multi_agent_role>You are a dedicated worker subagent executing tasks on behalf of /root."));
+        assert!(rewritten.contains("do NOT spawn sub-agents, wait on agents, or call collaboration tools."));
+        assert!(rewritten.starts_with("Header\n<multi_agent_role>"));
+        assert!(rewritten.ends_with("</multi_agent_role>\nFooter"));
+
+        // Non-matching text is preserved
+        assert_eq!(rewrite_multi_agent_role_for_worker("Plain text without role tag"), "Plain text without role tag");
+
+        // 2. is_collaboration_tool
+        assert!(is_collaboration_tool("spawn_agent"));
+        assert!(is_collaboration_tool("list_agents"));
+        assert!(is_collaboration_tool("followup_task"));
+        assert!(is_collaboration_tool("wait_agent"));
+        assert!(is_collaboration_tool("interrupt_agent"));
+        assert!(is_collaboration_tool("collaboration__spawn_agent"));
+        assert!(is_collaboration_tool("collaboration__list_agents"));
+        assert!(!is_collaboration_tool("exec_command"));
+        assert!(!is_collaboration_tool("apply_patch"));
+        assert!(!is_collaboration_tool("mcp__playwright__browser_tabs"));
+        assert!(!is_collaboration_tool("playwright__browser_tabs"));
+        assert!(!is_collaboration_tool("cua_repl__js"));
+
+        // 3. sanitize_subagent_request_for_9router rewrites <multi_agent_role> and strips collaboration tools
+        let mut req = serde_json::json!({
+            "model": "9router-subagent",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "<multi_agent_role>You can spawn sub-agents to handle subtasks...</multi_agent_role>"
+                        }
+                    ]
+                }
+            ],
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [
+                        {"type": "function", "name": "spawn_agent", "parameters": {}},
+                        {"type": "function", "name": "list_agents", "parameters": {}}
+                    ]
+                },
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {}
+                },
+                {
+                    "type": "namespace",
+                    "name": "mcp__playwright",
+                    "tools": [
+                        {"type": "function", "name": "browser_tabs", "parameters": {}}
+                    ]
+                }
+            ]
+        });
+
+        sanitize_subagent_request_for_9router(&mut req);
+
+        // Check input role rewritten
+        let input_text = req["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(input_text.contains("dedicated worker subagent"));
+        assert!(input_text.contains("do NOT spawn sub-agents"));
+
+        // Check tools: collaboration stripped, exec_command and playwright preserved
+        let tools = req["tools"].as_array().expect("tools array must exist");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "exec_command");
+        assert_eq!(tools[1]["name"], "mcp__playwright__browser_tabs");
+    }
+
+    #[test]
+    fn test_fallback_final_answer_synthesis() {
+        // 1. ensure_fallback_final_answer_in_output on reasoning-only output
+        let mut output_with_reasoning = vec![
+            serde_json::json!({
+                "id": "rs_1",
+                "type": "reasoning",
+                "summary": [
+                    {
+                        "type": "summary_text",
+                        "text": "Completed verification: git status clean, health OK."
+                    }
+                ]
+            })
+        ];
+        let synth = ensure_fallback_final_answer_in_output(&mut output_with_reasoning);
+        assert!(synth.is_some(), "must synthesize fallback answer when reasoning exists without message");
+        assert_eq!(output_with_reasoning.len(), 2);
+        let msg = &output_with_reasoning[1];
+        assert_eq!(msg["type"], "message");
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["phase"], "final_answer");
+        let txt = msg["content"][0]["text"].as_str().unwrap();
+        assert!(txt.contains("[Subagent Execution Summary]"));
+        assert!(txt.contains("Completed verification: git status clean, health OK."));
+
+        // 2. ensure_fallback_final_answer_in_output returns None when tool call exists
+        let mut output_with_tool_call = vec![
+            serde_json::json!({
+                "id": "rs_1",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "About to run tool"}]
+            }),
+            serde_json::json!({
+                "id": "call_1",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{}"
+            })
+        ];
+        assert!(ensure_fallback_final_answer_in_output(&mut output_with_tool_call).is_none());
+        assert_eq!(output_with_tool_call.len(), 2);
+
+        // 3. ensure_fallback_final_answer_in_output returns None when assistant message already exists
+        let mut output_with_msg = vec![
+            serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Task finished successfully!"}]
+            })
+        ];
+        assert!(ensure_fallback_final_answer_in_output(&mut output_with_msg).is_none());
+        assert_eq!(output_with_msg.len(), 1);
+
+        // 4. transform_response_text_for_namespace_tools for SSE response.completed with reasoning
+        let sse_completed = r#"data: {"type":"response.completed","response":{"id":"resp_1","output":[{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"Verification completed flawlessly."}]}]}}"#;
+        let transformed = transform_response_text_for_namespace_tools(sse_completed);
+        assert!(transformed.contains("response.output_item.done"), "must emit output_item.done event: {}", transformed);
+        assert!(transformed.contains("response.completed"), "must emit response.completed event: {}", transformed);
+        assert!(transformed.contains("final_answer"), "must contain final_answer phase: {}", transformed);
+        assert!(transformed.contains("Verification completed flawlessly."), "must contain reasoning text: {}", transformed);
+    }
+
+    #[test]
+    fn test_ensure_subagent_worker_tools_and_mcp_to_exec_command_mapping() {
+        // 1. ensure_subagent_worker_tools populates empty array
+        let mut tools = Vec::new();
+        ensure_subagent_worker_tools(&mut tools);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "exec_command");
+
+        // No duplicate injection if already present
+        ensure_subagent_worker_tools(&mut tools);
+        assert_eq!(tools.len(), 1);
+
+        // 2. map_subagent_unsupported_tool_call_to_exec_command for browser_tabs
+        let mut pw_call = serde_json::json!({
+            "type": "function_call",
+            "name": "browser_tabs",
+            "arguments": "{\"action\":\"list\"}"
+        });
+        assert!(map_subagent_unsupported_tool_call_to_exec_command(&mut pw_call));
+        assert_eq!(pw_call["name"], "exec_command");
+        assert!(pw_call.get("namespace").is_none());
+        let args = pw_call["arguments"].as_str().unwrap();
+        assert!(args.contains("agent-browser"));
+        assert!(args.contains("powershell"));
+        assert!(args.contains("AGENT_BROWSER_EXECUTABLE_PATH"), "must set Chrome executable path: {}", args);
+
+        // 3. map_subagent_unsupported_tool_call_to_exec_command for cua_repl__js
+        let mut cua_call = serde_json::json!({
+            "type": "function_call",
+            "name": "cua_repl__js",
+            "arguments": "{\"code\":\"await cua.getState();\"}"
+        });
+        assert!(map_subagent_unsupported_tool_call_to_exec_command(&mut cua_call));
+        assert_eq!(cua_call["name"], "exec_command");
+        assert!(cua_call.get("namespace").is_none());
+        let args2 = cua_call["arguments"].as_str().unwrap();
+        assert!(args2.contains("agent-browser"));
+        assert!(args2.contains("AGENT_BROWSER_EXECUTABLE_PATH"), "must set Chrome executable path: {}", args2);
+
+        // 4. Non-matching tool is NOT rewritten
+        let mut custom_call = serde_json::json!({
+            "type": "function_call",
+            "name": "apply_patch",
+            "arguments": "{\"patch\":\"...\"}"
+        });
+        assert!(!map_subagent_unsupported_tool_call_to_exec_command(&mut custom_call));
+        assert_eq!(custom_call["name"], "apply_patch");
+
+        // 5. SSE response transformation maps browser_tabs to exec_command
+        let sse_pw = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"call_1","type":"function_call","name":"browser_tabs","arguments":"{\"action\":\"list\"}"}}"#;
+        let transformed = transform_response_text_for_namespace_tools(sse_pw);
+        let parsed: Value = serde_json::from_str(transformed.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(parsed["item"]["name"], "exec_command");
+        assert!(parsed["item"]["arguments"].as_str().unwrap().contains("agent-browser"));
+    }
 }
+

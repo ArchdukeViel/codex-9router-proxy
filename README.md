@@ -68,7 +68,7 @@ When using the official OpenAI Codex Desktop App signed into a personal or Pro C
 
 ## 🖥️ Tested Environment & Version Compatibility Matrix
 
-`codex-9router-proxy` `v0.2.7` is developed and verified against the following environment:
+`codex-9router-proxy` `v0.2.8` is developed and verified against the following environment:
 
 | Component | Verified Version | Notes |
 | :--- | :--- | :--- |
@@ -201,6 +201,40 @@ reviewer = "ag/claude-opus-4-6-thinking"
 $env:CODEX_WORKER_MODEL = "ag/claude-sonnet-4-6"
 $env:CODEX_EXPLORER_MODEL = "ag/gemini-3.8-flash-high"
 ```
+
+---
+
+## 🛡️ Out-of-the-Box "Always-Allow" & Stealth Browser CDP Automation (v0.2.8)
+
+In stock Codex, subagents run under an automated `approval_policy = "never"`. When external tools (such as Playwright, CDP browser tabs, or external MCP servers) require human confirmation, subagents fail immediately with `"this session’s approval policy is never"`.
+
+`install.ps1` automatically configures non-blocking automation out of the box across any new machine or user:
+
+1. **Auto-Approve All Tools**:
+   ```toml
+   [apps._default]
+   default_tools_approval_mode = "approve"
+   ```
+2. **Autonomous Reviewer**:
+   ```toml
+   approvals_reviewer = "auto_review"
+   ```
+   Routes boundary actions to an autonomous internal subagent rather than interrupting workflows.
+3. **Full Browser CDP & History Control**:
+   ```toml
+   [browser_use]
+   allow_history_access = true
+
+   [browser_use.default_origin_policy]
+   access = "allow"
+   full_cdp_access = "allow"
+   downloads = "allow"
+   uploads = "allow"
+   ```
+4. **Native Chrome Extension Integration**:
+   Codex claims and inspects browser tabs natively via the ChatGPT extension host (`com.openai.codexextension`), providing seamless tab access without requiring port 9222 or triggering remote debugging confirmation modals.
+5. **Codex Plugin Namespace Bridging**:
+   Transparently converts Codex plugin `"type": "namespace"` containers into `<namespace>__<tool_name>` functions for 9Router and dynamically rewrites streaming responses back to native Codex events.
 
 ---
 
