@@ -354,6 +354,7 @@ Write-Host "    Default Model  : $DefaultModel"
 Write-Host "    Worker Model   : $WorkerModel"
 Write-Host "    Explorer Model : $ExplorerModel"
 Write-Host "    Reviewer Model : $ReviewerModel"
+Write-Host "    Sandbox Mode   : $SandboxMode"
 Write-Host ""
 
 # 2. Persist Environment Variables & Registry
@@ -511,6 +512,7 @@ foreach ($roleName in $roleConfigs.Keys) {
     $escapedRoleName = ConvertTo-TomlEscapedString $roleName
     $escapedRoleDesc = ConvertTo-TomlEscapedString $roleInfo.Desc
     $escapedRoleModel = ConvertTo-TomlEscapedString $roleInfo.Model
+    $escapedSandboxMode = ConvertTo-TomlEscapedString $SandboxMode
     $escapedRoleTomlPath = ConvertTo-TomlEscapedString $roleTomlPath
     $roleRegexKey = [regex]::Escape($roleName)
 
@@ -521,7 +523,7 @@ description = "$escapedRoleDesc"
 model = "$escapedRoleModel"
 model_provider = "$escapedProvider"
 model_reasoning_effort = "high"
-sandbox_mode = "danger-full-access"
+sandbox_mode = "$escapedSandboxMode"
 developer_instructions = """You are a dedicated worker subagent executing tasks on behalf of /root.
 You have full shell execution capabilities via exec_command in PowerShell.
 IMPORTANT: For browser automation, use the configured AGENT_BROWSER_EXECUTABLE_PATH:
