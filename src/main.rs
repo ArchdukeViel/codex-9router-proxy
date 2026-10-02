@@ -3240,6 +3240,13 @@ pub fn extract_subagent_task_directives(input_arr: &[Value]) -> Option<String> {
         "spawn subagent",
         "worker subagent",
         "delegate to",
+        "delegate a",
+        "delegate ",
+        "subagent",
+        "sub-agent",
+        "worker ",
+        "spawn ",
+        "task ",
     ];
     for item in input_arr.iter().rev() {
         let item_role = item
@@ -3258,6 +3265,22 @@ pub fn extract_subagent_task_directives(input_arr: &[Value]) -> Option<String> {
             if text_lower.contains(marker) {
                 return Some(text);
             }
+        }
+    }
+    // Fallback: return the last non-empty user message text even without explicit
+    // delegation markers so that encrypted payloads always receive the real prompt
+    // instead of a generic placeholder.
+    for item in input_arr.iter().rev() {
+        let item_role = item
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        if !item_role.eq_ignore_ascii_case("user") {
+            continue;
+        }
+        let text = extract_all_text_from_item(item);
+        if !text.is_empty() {
+            return Some(text);
         }
     }
     None
@@ -3759,9 +3782,8 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
     //      require custom_tool_call SSE responses which 9Router does not emit; when codex.orig.exe
     //      uses our injected model metadata with apply_patch_tool_type = "function", it sends
     //      "type": "function", "name": "apply_patch" which is preserved here and matches ToolPayload::Function).
-    let mut tools_became_empty = false;
     if let Some(tools_arr) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
-        let had_collaboration = tools_arr.iter().any(|tool| {
+        let _had_collaboration = tools_arr.iter().any(|tool| {
             let tool_type = tool.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let tool_name = tool
                 .get("name")
@@ -3847,29 +3869,24 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
             unflattened_tools.push(tool.clone());
         }
 
-        // When collaboration tools were stripped resulting in empty tools, or when task directives exist with empty tools, equip the subagent with worker tools
-        if (had_collaboration && unflattened_tools.is_empty())
-            || (extracted_directives.is_some() && unflattened_tools.is_empty())
-        {
-            ensure_subagent_worker_tools(&mut unflattened_tools);
-        }
+        // Always ensure subagent has exec_command worker tools, regardless of
+        // whether collaboration tools were present or directives were extracted.
+        // This prevents subagents from being forwarded with zero tools.
+        ensure_subagent_worker_tools(&mut unflattened_tools);
 
-        if unflattened_tools.is_empty() {
-            tools_became_empty = true;
-        } else {
-            for tool in unflattened_tools.iter_mut() {
-                if let Some(params) = tool.get_mut("parameters") {
-                    sanitize_tool_parameters_for_subagents(params);
-                } else if let Some(params) = tool.get_mut("function").and_then(|f| f.get_mut("parameters")) {
-                    sanitize_tool_parameters_for_subagents(params);
-                } else if let Some(params) = tool.get_mut("inputSchema") {
-                    sanitize_tool_parameters_for_subagents(params);
-                }
+        for tool in unflattened_tools.iter_mut() {
+            if let Some(params) = tool.get_mut("parameters") {
+                sanitize_tool_parameters_for_subagents(params);
+            } else if let Some(params) = tool.get_mut("function").and_then(|f| f.get_mut("parameters")) {
+                sanitize_tool_parameters_for_subagents(params);
+            } else if let Some(params) = tool.get_mut("inputSchema") {
+                sanitize_tool_parameters_for_subagents(params);
             }
-            *tools_arr = unflattened_tools;
-            obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
         }
-    } else if extracted_directives.is_some() {
+        *tools_arr = unflattened_tools;
+        obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+    } else {
+        // No "tools" key at all — always inject worker tools for subagent requests
         let mut worker_tools = Vec::new();
         ensure_subagent_worker_tools(&mut worker_tools);
         for tool in worker_tools.iter_mut() {
@@ -3879,10 +3896,6 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
         }
         obj.insert("tools".to_string(), Value::Array(worker_tools));
         obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
-    }
-    if tools_became_empty {
-        obj.remove("tools");
-        obj.remove("tool_choice");
     }
 
     // 3. Strip ChatGPT-internal top-level fields that 9Router / downstream providers do not accept.
@@ -10849,7 +10862,7 @@ auditor = "claude-3-7-sonnet-audit"
     }
 
     #[test]
-    fn test_sanitize_subagent_request_filters_tool_search_and_drops_empty_tools_array() {
+    fn test_sanitize_subagent_request_filters_tool_search_and_injects_exec_command() {
         let mut req = serde_json::json!({
             "model": "9router-subagent",
             "tool_choice": "auto",
@@ -10863,14 +10876,11 @@ auditor = "claude-3-7-sonnet-audit"
             ]
         });
         sanitize_subagent_request_for_9router(&mut req);
-        assert!(
-            req.get("tools").is_none(),
-            "empty tools array must be removed after filtering incompatible tools"
-        );
-        assert!(
-            req.get("tool_choice").is_none(),
-            "tool_choice must be removed when tools array becomes empty"
-        );
+        // After filtering incompatible tools, exec_command is unconditionally injected
+        let tools = req["tools"].as_array().expect("tools array must exist with exec_command");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "exec_command");
+        assert_eq!(req["tool_choice"], "auto");
 
         let mut req_with_valid_tool = serde_json::json!({
             "model": "9router-subagent",
@@ -10882,8 +10892,10 @@ auditor = "claude-3-7-sonnet-audit"
         });
         sanitize_subagent_request_for_9router(&mut req_with_valid_tool);
         let remaining_tools = req_with_valid_tool["tools"].as_array().unwrap();
-        assert_eq!(remaining_tools.len(), 1);
-        assert_eq!(remaining_tools[0]["name"], "apply_patch");
+        // apply_patch preserved + exec_command injected
+        assert_eq!(remaining_tools.len(), 2);
+        assert!(remaining_tools.iter().any(|t| t["name"] == "apply_patch"));
+        assert!(remaining_tools.iter().any(|t| t["name"] == "exec_command"));
         assert_eq!(req_with_valid_tool["tool_choice"], "auto");
     }
 
@@ -11767,7 +11779,7 @@ perf_profiler = "implement"
 
         // Verify tools unflattening
         let tools = request["tools"].as_array().expect("tools must be array");
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["name"], "cloudflare__get_worker");
         assert_eq!(tools[0]["description"], "Get worker details");
@@ -11779,6 +11791,9 @@ perf_profiler = "implement"
 
         assert_eq!(tools[2]["type"], "function");
         assert_eq!(tools[2]["name"], "apply_patch");
+
+        // exec_command unconditionally injected
+        assert_eq!(tools[3]["name"], "exec_command");
 
         // Verify input history normalization
         let input = request["input"].as_array().expect("input must be array");
@@ -11971,7 +11986,7 @@ perf_profiler = "implement"
         ];
         assert!(extract_subagent_task_directives(&input_no_directives).is_none());
 
-        // 3. User turn without subagent markers
+        // 3. User turn without explicit subagent markers — fallback returns last user text
         let input_no_markers = vec![
             serde_json::json!({
                 "type": "message",
@@ -11979,7 +11994,9 @@ perf_profiler = "implement"
                 "content": [{"type": "input_text", "text": "Please fix the bug in main.rs."}]
             }),
         ];
-        assert!(extract_subagent_task_directives(&input_no_markers).is_none());
+        let fallback = extract_subagent_task_directives(&input_no_markers);
+        assert!(fallback.is_some(), "fallback should return last user message");
+        assert!(fallback.unwrap().contains("fix the bug"));
 
         // 4. Sanitization injects extracted directives into encrypted_content
         let mut req = serde_json::json!({
