@@ -876,6 +876,28 @@ Get-Process -ErrorAction SilentlyContinue | Where-Object {
 }
 Start-Sleep -Milliseconds 500
 
+function Test-StockCodexHealthy {
+    param([string]$ExePath)
+    if (-not (Test-Path $ExePath)) { return $false }
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $ExePath
+        $psi.Arguments = "--version"
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        if ($proc.WaitForExit(3000)) {
+            return ($proc.ExitCode -eq 0)
+        }
+        try { $proc.Kill() } catch {}
+        return $false
+    } catch {
+        return $false
+    }
+}
+
 function Safe-CopyExecutable {
     param(
         [string]$Source,
@@ -883,14 +905,24 @@ function Safe-CopyExecutable {
     )
     $destDir = Split-Path -Parent $Destination
     $fileName = Split-Path -Leaf $Destination
+    $srcTimeUtc = $null
+    if (Test-Path $Source) {
+        $srcTimeUtc = (Get-Item $Source).LastWriteTimeUtc
+    }
     if (-not (Test-Path $Destination)) {
         Copy-Item -Path $Source -Destination $Destination -Force
+        if ($srcTimeUtc -and (Test-Path $Destination)) {
+            (Get-Item $Destination).LastWriteTimeUtc = $srcTimeUtc
+        }
         return $true
     }
     $maxRetries = 5
     for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
         try {
             Copy-Item -Path $Source -Destination $Destination -Force -ErrorAction Stop
+            if ($srcTimeUtc -and (Test-Path $Destination)) {
+                (Get-Item $Destination).LastWriteTimeUtc = $srcTimeUtc
+            }
             return $true
         } catch {
             if ($attempt -lt $maxRetries) {
@@ -900,6 +932,9 @@ function Safe-CopyExecutable {
                 try {
                     Move-Item -Path $Destination -Destination $tempOld -Force -ErrorAction Stop
                     Copy-Item -Path $Source -Destination $Destination -Force -ErrorAction Stop
+                    if ($srcTimeUtc -and (Test-Path $Destination)) {
+                        (Get-Item $Destination).LastWriteTimeUtc = $srcTimeUtc
+                    }
                     return $true
                 } catch {
                     Write-Warning "Could not replace ${Destination}: $_"
@@ -1174,7 +1209,7 @@ if (Test-Path $customDir) {
 if (Test-Path $daemonReleases) {
     $stockCandidates += Get-ChildItem -Path "$daemonReleases\*\bin\codex.orig.exe", "$daemonReleases\*\bin\codex.exe" -File -ErrorAction SilentlyContinue
 }
-$bestStockItem = $stockCandidates | Where-Object { $_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc, Length -Descending | Select-Object -First 1
+$bestStockItem = $stockCandidates | Where-Object { $_.Length -gt 10000000 -and (Test-StockCodexHealthy $_.FullName) } | Sort-Object LastWriteTimeUtc, Length -Descending | Select-Object -First 1
 if ($bestStockItem) {
     $stockDir = $bestStockItem.DirectoryName
     foreach ($origName in @("codex-9router-subagents.orig.exe", "codex.orig.exe")) {
@@ -1304,22 +1339,57 @@ function Sync-Executable {
     if (-not (Test-Path `$Source)) { return `$false }
     `$destDir = Split-Path -Parent `$Destination
     `$fileName = Split-Path -Leaf `$Destination
+    `$srcTimeUtc = $null
+    if (Test-Path `$Source) {
+        `$srcTimeUtc = (Get-Item `$Source).LastWriteTimeUtc
+    }
     if (-not (Test-Path `$Destination)) {
         Copy-Item -Path `$Source -Destination `$Destination -Force
+        if (`$srcTimeUtc -and (Test-Path `$Destination)) {
+            (Get-Item `$Destination).LastWriteTimeUtc = `$srcTimeUtc
+        }
         return (Test-Path `$Destination)
     }
     try {
         Copy-Item -Path `$Source -Destination `$Destination -Force -ErrorAction Stop
+        if (`$srcTimeUtc -and (Test-Path `$Destination)) {
+            (Get-Item `$Destination).LastWriteTimeUtc = `$srcTimeUtc
+        }
         return `$true
     } catch {
         `$tempOld = Join-Path `$destDir "`$fileName.old.`$([Guid]::NewGuid().ToString('N').Substring(0,6))"
         try {
             Move-Item -Path `$Destination -Destination `$tempOld -Force -ErrorAction Stop
             Copy-Item -Path `$Source -Destination `$Destination -Force -ErrorAction Stop
+            if (`$srcTimeUtc -and (Test-Path `$Destination)) {
+                (Get-Item `$Destination).LastWriteTimeUtc = `$srcTimeUtc
+            }
             return `$true
         } catch {
             return `$false
         }
+    }
+}
+
+function Test-StockCodexHealthy {
+    param([string]`$ExePath)
+    if (-not (Test-Path `$ExePath)) { return `$false }
+    try {
+        `$psi = New-Object System.Diagnostics.ProcessStartInfo
+        `$psi.FileName = `$ExePath
+        `$psi.Arguments = '--version'
+        `$psi.UseShellExecute = `$false
+        `$psi.CreateNoWindow = `$true
+        `$psi.RedirectStandardOutput = `$true
+        `$psi.RedirectStandardError = `$true
+        `$proc = [System.Diagnostics.Process]::Start(`$psi)
+        if (`$proc.WaitForExit(3000)) {
+            return (`$proc.ExitCode -eq 0)
+        }
+        try { `$proc.Kill() } catch {}
+        return `$false
+    } catch {
+        return `$false
     }
 }
 
@@ -1446,7 +1516,7 @@ if (Test-Path `$customDir) {
 if (Test-Path `$daemonReleases) {
     `$allStockCandidates += Get-ChildItem -Path "`$daemonReleases\*\bin\codex.orig.exe", "`$daemonReleases\*\bin\codex.exe" -File
 }
-`$bestStock = `$allStockCandidates | Where-Object { `$_.Length -gt 10000000 } | Sort-Object LastWriteTimeUtc, Length -Descending | Select-Object -First 1
+`$bestStock = `$allStockCandidates | Where-Object { `$_.Length -gt 10000000 -and (Test-StockCodexHealthy `$_.FullName) } | Sort-Object LastWriteTimeUtc, Length -Descending | Select-Object -First 1
 if (`$bestStock) {
     foreach (`$origName in @('codex-9router-subagents.orig.exe', 'codex.orig.exe')) {
         `$origDst = Join-Path `$customDir `$origName

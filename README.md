@@ -68,7 +68,7 @@ When using the official OpenAI Codex Desktop App signed into a personal or Pro C
 
 ## 🖥️ Tested Environment & Version Compatibility Matrix
 
-`codex-9router-proxy` `v0.2.8` is developed and verified against the following environment:
+`codex-9router-proxy` `v0.2.9` is developed and verified against the following environment:
 
 | Component | Verified Version | Notes |
 | :--- | :--- | :--- |

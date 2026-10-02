@@ -1,3 +1,10 @@
+# v0.2.9 (2026-10-02)
+
+## Features
+- **Configurable & High Default Subagent Reasoning Depth (`apply_subagent_model_metadata_fields`)**: configure `9router-subagent` with `"default_reasoning_level": "high"` and register supported reasoning efforts (`low`, `medium`, `high`, `xhigh`, `max`) in `models_cache.json` and `/backend-api/codex/models` responses, providing deep reasoning effort by default while enabling reasoning level selection in Codex Desktop and CLI.
+- **Stock Binary Executable Health Validation & Timestamp Preservation (`is_healthy_codex_binary`, `preserve_file_mtime`, `Safe-CopyExecutable`)**: perform PE sanity checks (`MZ`) and execute `--version` to validate candidate stock Codex binaries before selection or synchronization, permanently preventing corrupted or crashing binaries (`0xc0000005`) from being propagated into `.orig.exe` locations; preserve source `LastWriteTimeUtc` timestamps across all file copies so cloned executables never appear newer than canonical Microsoft Store packages.
+- **Gemini & Vertex AI OpenAPI Tool Schema Sanitization (`sanitize_tool_parameters_for_subagents`)**: recursively sanitize tool schemas forwarded to 9Router, automatically injecting empty `properties` maps for bare `"type": "object"` definitions, `items` for bare arrays, and normalizing shorthand primitive property strings (e.g. `"headers": "object"`, `"count": "integer"`), resolving `[400]: INVALID_ARGUMENT: Schema "object"` errors from Google Gemini models.
+
 # v0.2.8 (2026-10-02)
 
 ## Features

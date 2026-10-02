@@ -1942,12 +1942,51 @@ pub const IDE_EXTENSION_ROOTS: [&str; 6] = [
     ".antigravity-ide\\extensions",
 ];
 
+/// Validate whether an executable path is a healthy, runnable stock Codex binary.
+/// Returns false if file is not a valid PE executable, crashes (e.g. 0xc0000005), or exits non-zero.
+pub fn is_healthy_codex_binary(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if let Ok(mut f) = fs::File::open(path) {
+        use std::io::Read;
+        let mut magic = [0u8; 2];
+        if f.read_exact(&mut magic).is_err() || &magic != b"MZ" {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    let mut cmd = Command::new(path);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.output() {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
+}
+
+fn preserve_file_mtime(src: &Path, dst: &Path) {
+    if let (Ok(src_meta), Ok(dst_file)) = (src.metadata(), fs::OpenOptions::new().write(true).open(dst)) {
+        if let Ok(src_mod) = src_meta.modified() {
+            let _ = dst_file.set_modified(src_mod);
+        }
+    }
+}
+
 /// Copy `src` to `dst`, renaming `dst` to `<filename>.old.<pid>` first if `dst` is locked in use.
 pub fn safe_copy_or_rename_locked(src: &Path, dst: &Path) -> io::Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
     if fs::copy(src, dst).is_ok() {
+        preserve_file_mtime(src, dst);
         return Ok(());
     }
     if dst.exists() {
@@ -1971,7 +2010,11 @@ pub fn safe_copy_or_rename_locked(src: &Path, dst: &Path) -> io::Result<()> {
             let _ = fs::rename(dst, &alt_old);
         }
     }
-    fs::copy(src, dst).map(|_| ())
+    let res = fs::copy(src, dst).map(|_| ());
+    if res.is_ok() {
+        preserve_file_mtime(src, dst);
+    }
+    res
 }
 
 /// Synchronize `custom\codex-9router-subagents.orig.exe`, `custom\codex.orig.exe`, and companion helper binaries
@@ -2037,6 +2080,9 @@ pub fn sync_custom_codex_binaries_from_candidates_with_min_size(
             if len <= min_stock_bytes {
                 continue;
             }
+            if len > 10_000_000 && !is_healthy_codex_binary(&candidate) {
+                continue;
+            }
             let modified = meta.modified().ok();
             let is_newer = match &best_stock {
                 None => true,
@@ -2057,6 +2103,9 @@ pub fn sync_custom_codex_binaries_from_candidates_with_min_size(
         if let Ok(meta) = candidate.metadata() {
             if meta.is_file() && meta.len() > min_stock_bytes {
                 let len = meta.len();
+                if len > 10_000_000 && !is_healthy_codex_binary(&candidate) {
+                    continue;
+                }
                 let modified = meta.modified().ok();
                 let is_newer = match &best_stock {
                     None => true,
@@ -2380,7 +2429,15 @@ pub fn pick_best_orig_candidate_across_dirs_with_min_size(
         .iter()
         .any(|(_, len, _)| *len > min_stock_bytes);
     if has_full_stock {
-        valid_candidates.retain(|(_, len, _)| *len > min_stock_bytes);
+        valid_candidates.retain(|(p, len, _)| {
+            if *len <= min_stock_bytes {
+                return false;
+            }
+            if *len > 10_000_000 && !is_healthy_codex_binary(p) {
+                return false;
+            }
+            true
+        });
     }
 
     valid_candidates.sort_by_key(|a| std::cmp::Reverse((a.2, a.1)));
@@ -3247,6 +3304,141 @@ fn is_collaboration_tool(name: &str) -> bool {
     lower.starts_with("collaboration__")
 }
 
+/// Recursively sanitize tool parameter schemas for maximum compatibility with upstream providers
+/// (especially Google Gemini / Vertex AI, OpenAI, and Claude).
+///
+/// Fixes:
+/// 1. Properties whose value is a primitive string rather than a Schema object (e.g. `"headers": "object"`
+///    or `"value": "object"`), which causes Google Cloud AI Platform to reject the payload with:
+///    `Invalid value at '...properties[...].value' (type.googleapis.com/google.cloud.aiplatform.master.Schema), "object"`.
+/// 2. Bare `"type": "object"` schemas that lack a `"properties"` map (injects `"properties": {}`).
+/// 3. `"type": "array"` schemas that lack an `"items"` schema (injects `"items": {"type": "string"}`).
+/// 4. Array-typed `type` fields (e.g. `["string", "null"]`) by picking the first non-null type.
+pub fn sanitize_tool_parameters_for_subagents(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+
+    // 1. If "type" is an array (e.g. ["string", "null"]), reduce to first non-null type
+    if let Some(type_arr) = obj.get("type").and_then(|t| t.as_array()) {
+        let first_non_null = type_arr
+            .iter()
+            .find(|item| item.as_str().is_some_and(|s| s != "null"))
+            .and_then(|item| item.as_str())
+            .unwrap_or("string");
+        obj.insert("type".to_string(), Value::String(first_non_null.to_string()));
+    }
+
+    // 2. Infer "type": "object" if properties are present and type is missing
+    if obj.contains_key("properties") && !obj.contains_key("type") {
+        obj.insert("type".to_string(), Value::String("object".to_string()));
+    }
+
+    // 3. If type is "object", ensure "properties" is a valid map (not missing, not null, not primitive)
+    let is_object_type = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("object"));
+
+    if is_object_type {
+        let needs_new_properties = match obj.get("properties") {
+            None | Some(Value::Null) => true,
+            Some(v) if !v.is_object() => true,
+            _ => false,
+        };
+        if needs_new_properties {
+            obj.insert("properties".to_string(), serde_json::json!({}));
+        }
+    }
+
+    // 4. If type is "array", ensure "items" is present
+    let is_array_type = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("array"));
+
+    if is_array_type {
+        let needs_new_items = match obj.get("items") {
+            None | Some(Value::Null) => true,
+            Some(v) if !v.is_object() => true,
+            _ => false,
+        };
+        if needs_new_items {
+            obj.insert(
+                "items".to_string(),
+                serde_json::json!({ "type": "string" }),
+            );
+        }
+    }
+
+    // 5. Recurse and sanitize all properties in "properties"
+    if let Some(props_map) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        for (_prop_name, prop_val) in props_map.iter_mut() {
+            if let Some(str_val) = prop_val.as_str() {
+                let norm = str_val.to_ascii_lowercase();
+                let replacement = match norm.as_str() {
+                    "object" | "dict" | "map" => {
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {}
+                        })
+                    }
+                    "array" | "list" => {
+                        serde_json::json!({
+                            "type": "array",
+                            "items": { "type": "string" }
+                        })
+                    }
+                    "string" | "str" => {
+                        serde_json::json!({ "type": "string" })
+                    }
+                    "number" | "float" => {
+                        serde_json::json!({ "type": "number" })
+                    }
+                    "integer" | "int" => {
+                        serde_json::json!({ "type": "integer" })
+                    }
+                    "boolean" | "bool" => {
+                        serde_json::json!({ "type": "boolean" })
+                    }
+                    _ => {
+                        serde_json::json!({ "type": "string" })
+                    }
+                };
+                *prop_val = replacement;
+            } else if prop_val.is_object() {
+                sanitize_tool_parameters_for_subagents(prop_val);
+            } else {
+                *prop_val = serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                });
+            }
+        }
+    }
+
+    // 6. Recurse into "items" if present
+    if let Some(items_val) = obj.get_mut("items") {
+        if items_val.is_object() {
+            sanitize_tool_parameters_for_subagents(items_val);
+        } else if let Some(str_val) = items_val.as_str() {
+            let norm = str_val.to_ascii_lowercase();
+            *items_val = serde_json::json!({ "type": norm });
+        }
+    }
+
+    // 7. Recurse into "anyOf", "oneOf", "allOf"
+    for combinator in ["anyOf", "oneOf", "allOf"] {
+        if let Some(arr) = obj.get_mut(combinator).and_then(|v| v.as_array_mut()) {
+            for item in arr.iter_mut() {
+                if item.is_object() {
+                    sanitize_tool_parameters_for_subagents(item);
+                }
+            }
+        }
+    }
+}
+
 /// Ensure a subagent has the required worker execution tools (`exec_command`).
 pub fn ensure_subagent_worker_tools(tools_arr: &mut Vec<Value>) {
     let has_exec = tools_arr.iter().any(|t| {
@@ -3665,12 +3857,26 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
         if unflattened_tools.is_empty() {
             tools_became_empty = true;
         } else {
+            for tool in unflattened_tools.iter_mut() {
+                if let Some(params) = tool.get_mut("parameters") {
+                    sanitize_tool_parameters_for_subagents(params);
+                } else if let Some(params) = tool.get_mut("function").and_then(|f| f.get_mut("parameters")) {
+                    sanitize_tool_parameters_for_subagents(params);
+                } else if let Some(params) = tool.get_mut("inputSchema") {
+                    sanitize_tool_parameters_for_subagents(params);
+                }
+            }
             *tools_arr = unflattened_tools;
             obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
         }
     } else if extracted_directives.is_some() {
         let mut worker_tools = Vec::new();
         ensure_subagent_worker_tools(&mut worker_tools);
+        for tool in worker_tools.iter_mut() {
+            if let Some(params) = tool.get_mut("parameters") {
+                sanitize_tool_parameters_for_subagents(params);
+            }
+        }
         obj.insert("tools".to_string(), Value::Array(worker_tools));
         obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
     }
@@ -3861,6 +4067,20 @@ fn apply_subagent_model_metadata_fields(
     entry_obj.insert(
         "experimental_supported_tools".to_string(),
         serde_json::json!([]),
+    );
+    entry_obj.insert(
+        "default_reasoning_level".to_string(),
+        Value::String("high".to_string()),
+    );
+    entry_obj.insert(
+        "supported_reasoning_levels".to_string(),
+        serde_json::json!([
+            {"effort": "low", "description": "Fast responses"},
+            {"effort": "medium", "description": "Balanced reasoning"},
+            {"effort": "high", "description": "Deep reasoning"},
+            {"effort": "xhigh", "description": "Extra high reasoning depth"},
+            {"effort": "max", "description": "Maximum reasoning depth"}
+        ]),
     );
 
     // codex.orig.exe (model-provider/src/models_endpoint.rs) rejects any ModelInfo entry missing
@@ -8003,6 +8223,58 @@ default_subagent_model = "9router-subagent"
     }
 
     #[test]
+    fn test_sanitize_tool_parameters_for_subagents_fixes_bare_objects_and_primitive_strings() {
+        let mut params = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "args": {
+                    "type": "object",
+                    "description": "Arbitrary args"
+                },
+                "headers": "object",
+                "count": "integer",
+                "enabled": "boolean",
+                "tags": {
+                    "type": "array"
+                },
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "payload": "object",
+                        "inner_bare": {
+                            "type": "object"
+                        }
+                    }
+                }
+            }
+        });
+
+        sanitize_tool_parameters_for_subagents(&mut params);
+
+        assert_eq!(params["properties"]["args"]["type"], "object");
+        assert!(params["properties"]["args"]["properties"].is_object());
+
+        assert_eq!(params["properties"]["headers"]["type"], "object");
+        assert!(params["properties"]["headers"]["properties"].is_object());
+        assert_eq!(params["properties"]["count"]["type"], "integer");
+        assert_eq!(params["properties"]["enabled"]["type"], "boolean");
+
+        assert_eq!(params["properties"]["tags"]["type"], "array");
+        assert_eq!(params["properties"]["tags"]["items"]["type"], "string");
+
+        assert_eq!(
+            params["properties"]["nested"]["properties"]["payload"]["type"],
+            "object"
+        );
+        assert!(params["properties"]["nested"]["properties"]["payload"]["properties"].is_object());
+        assert_eq!(
+            params["properties"]["nested"]["properties"]["inner_bare"]["type"],
+            "object"
+        );
+        assert!(params["properties"]["nested"]["properties"]["inner_bare"]["properties"].is_object());
+    }
+
+    #[test]
     fn test_inject_subagent_models_metadata() {
         let upstream_models = serde_json::json!({
             "models": [
@@ -8065,6 +8337,7 @@ default_subagent_model = "9router-subagent"
                 .len(),
             0
         );
+        assert_eq!(subagent_entry["default_reasoning_level"], "high");
 
         let implement_entry = arr
             .iter()
