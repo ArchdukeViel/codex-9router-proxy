@@ -3331,18 +3331,87 @@ fn is_collaboration_tool(name: &str) -> bool {
 /// (especially Google Gemini / Vertex AI, OpenAI, and Claude).
 ///
 /// Fixes:
-/// 1. Properties whose value is a primitive string rather than a Schema object (e.g. `"headers": "object"`
+/// 1. Flattens `anyOf` / `oneOf` / `allOf` unions into a concrete, non-null schema variant,
+///    preventing Google Cloud AI Platform (Vertex AI) from failing on unsupported union types.
+/// 2. Properties whose value is a primitive string rather than a Schema object (e.g. `"headers": "object"`
 ///    or `"value": "object"`), which causes Google Cloud AI Platform to reject the payload with:
 ///    `Invalid value at '...properties[...].value' (type.googleapis.com/google.cloud.aiplatform.master.Schema), "object"`.
-/// 2. Bare `"type": "object"` schemas that lack a `"properties"` map (injects `"properties": {}`).
-/// 3. `"type": "array"` schemas that lack an `"items"` schema (injects `"items": {"type": "string"}`).
-/// 4. Array-typed `type` fields (e.g. `["string", "null"]`) by picking the first non-null type.
+/// 3. Bare `"type": "object"` schemas that lack a `"properties"` map (injects `"properties": {}`).
+/// 4. `"type": "array"` schemas that lack an `"items"` schema (injects `"items": {"type": "string"}`).
+/// 5. Array-typed `type` fields (e.g. `["string", "null"]`) by picking the first non-null type.
+/// 6. Strips unsupported JSON Schema keywords like `$schema`, `additionalProperties`, etc. that
+///    provoke strict protobuf validation errors on Vertex AI.
 pub fn sanitize_tool_parameters_for_subagents(value: &mut Value) {
     let Some(obj) = value.as_object_mut() else {
         return;
     };
 
-    // 1. If "type" is an array (e.g. ["string", "null"]), reduce to first non-null type
+    // 1. Strip unsupported JSON Schema meta/validation keywords that Vertex AI protobuf rejects
+    for unsupported in [
+        "$schema",
+        "additionalProperties",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "patternProperties",
+        "definitions",
+        "$defs",
+    ] {
+        obj.remove(unsupported);
+    }
+
+    // 2. Resolve and flatten `anyOf` / `oneOf` into a single concrete schema
+    //    Vertex AI Schema proto strictly does not support union combinators.
+    for combinator in ["anyOf", "oneOf"] {
+        if let Some(variants) = obj.remove(combinator).and_then(|v| v.as_array().cloned()) {
+            let chosen = variants.into_iter().find(|var| {
+                if let Some(var_obj) = var.as_object() {
+                    let var_type = var_obj.get("type").and_then(|t| t.as_str());
+                    var_type != Some("null")
+                } else {
+                    false
+                }
+            });
+
+            if let Some(Value::Object(chosen_map)) = chosen {
+                let mut chosen_val = Value::Object(chosen_map);
+                sanitize_tool_parameters_for_subagents(&mut chosen_val);
+                if let Value::Object(sanitized_chosen) = chosen_val {
+                    for (k, v) in sanitized_chosen {
+                        if !obj.contains_key(&k)
+                            || k == "type"
+                            || k == "properties"
+                            || k == "items"
+                            || k == "enum"
+                        {
+                            obj.insert(k, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(all_of_arr) = obj.remove("allOf").and_then(|v| v.as_array().cloned()) {
+        for mut item in all_of_arr {
+            if item.is_object() {
+                sanitize_tool_parameters_for_subagents(&mut item);
+                if let Value::Object(item_map) = item {
+                    for (k, v) in item_map {
+                        if !obj.contains_key(&k)
+                            || k == "type"
+                            || k == "properties"
+                            || k == "items"
+                        {
+                            obj.insert(k, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. If "type" is an array (e.g. ["string", "null"]), reduce to first non-null type
     if let Some(type_arr) = obj.get("type").and_then(|t| t.as_array()) {
         let first_non_null = type_arr
             .iter()
@@ -3352,16 +3421,59 @@ pub fn sanitize_tool_parameters_for_subagents(value: &mut Value) {
         obj.insert("type".to_string(), Value::String(first_non_null.to_string()));
     }
 
-    // 2. Infer "type": "object" if properties are present and type is missing
-    if obj.contains_key("properties") && !obj.contains_key("type") {
-        obj.insert("type".to_string(), Value::String("object".to_string()));
+    // 4. Infer "type" if missing
+    if !obj.contains_key("type") {
+        if obj.contains_key("properties") {
+            obj.insert("type".to_string(), Value::String("object".to_string()));
+        } else if obj.contains_key("items") {
+            obj.insert("type".to_string(), Value::String("array".to_string()));
+        } else if obj.contains_key("enum") {
+            obj.insert("type".to_string(), Value::String("string".to_string()));
+        } else {
+            let desc = obj
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if desc.contains("object")
+                || desc.contains("dict")
+                || desc.contains("map")
+                || desc.contains("json")
+                || desc.contains("payload")
+                || desc.contains("config")
+                || desc.contains("metadata")
+            {
+                obj.insert("type".to_string(), Value::String("object".to_string()));
+                obj.insert("properties".to_string(), serde_json::json!({}));
+            } else {
+                obj.insert("type".to_string(), Value::String("string".to_string()));
+            }
+        }
     }
 
-    // 3. If type is "object", ensure "properties" is a valid map (not missing, not null, not primitive)
+    // Normalize type string to lowercase standard
+    if let Some(t_str) = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_ascii_lowercase())
+    {
+        let normalized = match t_str.as_str() {
+            "object" | "dict" | "map" => "object",
+            "array" | "list" => "array",
+            "string" | "str" => "string",
+            "number" | "float" => "number",
+            "integer" | "int" => "integer",
+            "boolean" | "bool" => "boolean",
+            _ => "string",
+        };
+        obj.insert("type".to_string(), Value::String(normalized.to_string()));
+    }
+
+    // 5. If type is "object", ensure "properties" is a valid map (not missing, not null, not primitive)
     let is_object_type = obj
         .get("type")
         .and_then(|t| t.as_str())
-        .is_some_and(|t| t.eq_ignore_ascii_case("object"));
+        .is_some_and(|t| t == "object");
 
     if is_object_type {
         let needs_new_properties = match obj.get("properties") {
@@ -3374,11 +3486,11 @@ pub fn sanitize_tool_parameters_for_subagents(value: &mut Value) {
         }
     }
 
-    // 4. If type is "array", ensure "items" is present
+    // 6. If type is "array", ensure "items" is present and valid
     let is_array_type = obj
         .get("type")
         .and_then(|t| t.as_str())
-        .is_some_and(|t| t.eq_ignore_ascii_case("array"));
+        .is_some_and(|t| t == "array");
 
     if is_array_type {
         let needs_new_items = match obj.get("items") {
@@ -3394,7 +3506,7 @@ pub fn sanitize_tool_parameters_for_subagents(value: &mut Value) {
         }
     }
 
-    // 5. Recurse and sanitize all properties in "properties"
+    // 7. Recurse and sanitize all properties in "properties"
     if let Some(props_map) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
         for (_prop_name, prop_val) in props_map.iter_mut() {
             if let Some(str_val) = prop_val.as_str() {
@@ -3440,24 +3552,13 @@ pub fn sanitize_tool_parameters_for_subagents(value: &mut Value) {
         }
     }
 
-    // 6. Recurse into "items" if present
+    // 8. Recurse into "items" if present
     if let Some(items_val) = obj.get_mut("items") {
         if items_val.is_object() {
             sanitize_tool_parameters_for_subagents(items_val);
         } else if let Some(str_val) = items_val.as_str() {
             let norm = str_val.to_ascii_lowercase();
             *items_val = serde_json::json!({ "type": norm });
-        }
-    }
-
-    // 7. Recurse into "anyOf", "oneOf", "allOf"
-    for combinator in ["anyOf", "oneOf", "allOf"] {
-        if let Some(arr) = obj.get_mut(combinator).and_then(|v| v.as_array_mut()) {
-            for item in arr.iter_mut() {
-                if item.is_object() {
-                    sanitize_tool_parameters_for_subagents(item);
-                }
-            }
         }
     }
 }
@@ -3877,9 +3978,20 @@ pub fn sanitize_subagent_request_for_9router(json: &mut Value) {
         for tool in unflattened_tools.iter_mut() {
             if let Some(params) = tool.get_mut("parameters") {
                 sanitize_tool_parameters_for_subagents(params);
-            } else if let Some(params) = tool.get_mut("function").and_then(|f| f.get_mut("parameters")) {
+            }
+            if let Some(params) = tool.get_mut("function").and_then(|f| f.get_mut("parameters")) {
                 sanitize_tool_parameters_for_subagents(params);
-            } else if let Some(params) = tool.get_mut("inputSchema") {
+            }
+            if let Some(params) = tool.get_mut("inputSchema") {
+                sanitize_tool_parameters_for_subagents(params);
+            }
+            if let Some(params) = tool.get_mut("input_schema") {
+                sanitize_tool_parameters_for_subagents(params);
+            }
+            if let Some(params) = tool.get_mut("function").and_then(|f| f.get_mut("inputSchema")) {
+                sanitize_tool_parameters_for_subagents(params);
+            }
+            if let Some(params) = tool.get_mut("function").and_then(|f| f.get_mut("input_schema")) {
                 sanitize_tool_parameters_for_subagents(params);
             }
         }
@@ -7782,9 +7894,22 @@ pub fn is_lightweight_cli_invocation(args: &[String]) -> bool {
                 | "app"
                 | "generate-ts"
                 | "generate-json-schema"
+                | "exec-server"
+                | "cloud"
+                | "agents"
+                | "queue"
+                | "remote-control"
+                | "doctor"
+                | "help"
         ) {
             return true;
         }
+    }
+    if pre_sep
+        .iter()
+        .any(|&a| matches!(a, "exec-server" | "cloud" | "remote-control"))
+    {
+        return true;
     }
     if pre_sep.contains(&"daemon")
         && pre_sep
@@ -8285,6 +8410,144 @@ default_subagent_model = "9router-subagent"
             "object"
         );
         assert!(params["properties"]["nested"]["properties"]["inner_bare"]["properties"].is_object());
+    }
+
+    #[test]
+    fn test_sanitize_tool_parameters_flattens_anyof_nullable_unions() {
+        let mut params = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "detector_category": {
+                    "anyOf": [
+                        {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "description": "Filter by detector category"
+                },
+                "status": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                }
+            }
+        });
+
+        sanitize_tool_parameters_for_subagents(&mut params);
+
+        // anyOf must be completely removed
+        assert!(params["properties"]["detector_category"].get("anyOf").is_none());
+        assert_eq!(params["properties"]["detector_category"]["type"], "array");
+        assert_eq!(params["properties"]["detector_category"]["items"]["type"], "string");
+        assert_eq!(
+            params["properties"]["detector_category"]["description"],
+            "Filter by detector category"
+        );
+
+        assert!(params["properties"]["status"].get("anyOf").is_none());
+        assert_eq!(params["properties"]["status"]["type"], "string");
+    }
+
+    #[test]
+    fn test_sanitize_tool_parameters_handles_gitguardian_and_nested_properties() {
+        // Simulates count_incidents and list_incidents structure:
+        // parameters -> properties.params (index 0) -> properties.detector_category (index 5)
+        let mut params = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {
+                "params": {
+                    "additionalProperties": false,
+                    "type": "object",
+                    "properties": {
+                        "analyzer_status": {
+                            "anyOf": [
+                                { "type": "array", "items": { "type": "string" } },
+                                { "type": "null" }
+                            ]
+                        },
+                        "assignee_id": {
+                            "anyOf": [
+                                { "type": "integer" },
+                                { "type": "null" }
+                            ]
+                        },
+                        "custom_tags": {
+                            "anyOf": [
+                                { "type": "array", "items": { "type": "integer" } },
+                                { "type": "null" }
+                            ]
+                        },
+                        "date_after": {
+                            "anyOf": [
+                                { "type": "string" },
+                                { "type": "null" }
+                            ]
+                        },
+                        "date_before": {
+                            "anyOf": [
+                                { "type": "string" },
+                                { "type": "null" }
+                            ]
+                        },
+                        "detector_category": {
+                            "anyOf": [
+                                { "type": "array", "items": { "type": "string" } },
+                                { "type": "null" }
+                            ],
+                            "default": null,
+                            "description": "Filter by detector category"
+                        },
+                        "bare_object_prop": "object",
+                        "untyped_dict": {
+                            "description": "Arbitrary metadata map"
+                        }
+                    }
+                }
+            }
+        });
+
+        sanitize_tool_parameters_for_subagents(&mut params);
+
+        // Check unsupported keywords stripped at top level and nested
+        assert!(params.get("$schema").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert!(params["properties"]["params"].get("additionalProperties").is_none());
+
+        // Check params is an object
+        assert_eq!(params["properties"]["params"]["type"], "object");
+        let sub_props = &params["properties"]["params"]["properties"];
+        assert!(sub_props.is_object());
+
+        // Check detector_category (nested index 5) is a valid Schema object, NOT a bare string
+        let det_cat = &sub_props["detector_category"];
+        assert!(det_cat.is_object());
+        assert_eq!(det_cat["type"], "array");
+        assert_eq!(det_cat["items"]["type"], "string");
+        assert!(det_cat.get("anyOf").is_none());
+
+        // Check bare_object_prop was converted from "object" string to Schema object
+        let bare = &sub_props["bare_object_prop"];
+        assert!(bare.is_object());
+        assert_eq!(bare["type"], "object");
+        assert!(bare["properties"].is_object());
+
+        // Check untyped_dict was given valid type and properties
+        let untyped = &sub_props["untyped_dict"];
+        assert!(untyped.is_object());
+        assert_eq!(untyped["type"], "object");
+        assert!(untyped["properties"].is_object());
     }
 
     #[test]
@@ -10044,6 +10307,15 @@ default_subagent_model = "9router-subagent"
             "daemon".to_string(),
             "stop".to_string()
         ]));
+        assert!(is_lightweight_cli_invocation(&["exec-server".to_string()]));
+        assert!(is_lightweight_cli_invocation(&[
+            "exec-server".to_string(),
+            "--remote".to_string(),
+            "https://codex-cloud-environments.chatgpt.com/api".to_string(),
+            "--environment-id".to_string(),
+            "ccarenv_b64_test".to_string(),
+        ]));
+        assert!(is_lightweight_cli_invocation(&["cloud".to_string()]));
     }
 
     #[test]
@@ -11045,6 +11317,13 @@ auditor = "claude-3-7-sonnet-audit"
             "app",
             "generate-ts",
             "generate-json-schema",
+            "exec-server",
+            "cloud",
+            "agents",
+            "queue",
+            "remote-control",
+            "doctor",
+            "help",
         ] {
             assert!(
                 is_lightweight_cli_invocation(&[sub.to_string()]),

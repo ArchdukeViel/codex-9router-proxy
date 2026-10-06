@@ -1,3 +1,11 @@
+# v0.2.10 (2026-10-06)
+
+## Features
+- **Comprehensive Google Cloud Vertex AI & Gemini Schema Sanitizer (`sanitize_tool_parameters_for_subagents`)**: overhaul tool schema transformation for subagent payloads destined for 9Router and Google Cloud Vertex AI / Gemini (`type.googleapis.com/google.cloud.aiplatform.master.Schema`). Automatically flattens `anyOf`, `oneOf`, and `allOf` nullable unions into the first concrete variant, strips unsupported protobuf schema keywords (`$schema`, `additionalProperties`, `minItems`, `maxItems`, `definitions`, `$defs`), infers missing types from structure, and deep-recursively converts bare primitive type strings into fully formed Schema objects, permanently preventing `INVALID_ARGUMENT: Schema "object"` (HTTP 400) errors.
+- **Codex Cloud Environments & `exec-server` Direct Passthrough (`is_lightweight_cli_invocation`)**: add `exec-server`, `cloud`, `remote-control`, `agents`, `queue`, `doctor`, and `help` to the list of bypassed CLI subcommands and add wildcard detection so background execution server processes never receive injected loopback `chatgpt_base_url` or self-signed loopback CA certificates. Enables standalone Noise/WebSocket cloud environment connectivity to `https://codex-cloud-environments.chatgpt.com/api` and resolves `Reconnecting 5/5` / `failed to load workspace requirements` failures in Codex Desktop.
+- **TOML Configuration Sanitization & `approval_mode` Auto-Normalization (`install.ps1`)**: automatically detect and normalize invalid tool-level `approval_mode = "never"` and `default_tools_approval_mode = "never"` entries to `"auto"` (matching Serde `AppToolApproval` enum variants `'auto'`, `'prompt'`, `'writes'`, `'approve'`), safely purge conflicting `[approval_policy.granular]` table declarations when `approval_policy` is defined as a string, and ensure Windows file path backslashes in generated role manifests are properly escaped.
+- **Product Requirements Document (`docs/PRD.md`)**: document full system architecture, singleflight streaming coalescing, rate-limit smoothing, multi-surface hooks, and failover behavior.
+
 # v0.2.9 (2026-10-02)
 
 ## Features

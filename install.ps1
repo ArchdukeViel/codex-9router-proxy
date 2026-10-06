@@ -49,6 +49,8 @@ param(
     [string]$WorkerModel,
     [string]$ExplorerModel,
     [string]$ReviewerModel,
+    [ValidateSet("read-only", "workspace-write", "danger-full-access")]
+    [string]$SandboxMode = "danger-full-access",
     [ValidateSet("9router", "ollama", "lmstudio", "openrouter", "vllm", "litellm")]
     [string]$Preset,
     [switch]$Doctor,
@@ -527,7 +529,7 @@ sandbox_mode = "$escapedSandboxMode"
 developer_instructions = """You are a dedicated worker subagent executing tasks on behalf of /root.
 You have full shell execution capabilities via exec_command in PowerShell.
 IMPORTANT: For browser automation, use the configured AGENT_BROWSER_EXECUTABLE_PATH:
-  if (-not `$env:AGENT_BROWSER_EXECUTABLE_PATH) { `$env:AGENT_BROWSER_EXECUTABLE_PATH = @((Join-Path `$env:ProgramFiles 'Google\Chrome\Application\chrome.exe'), (Join-Path `${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'), (Join-Path `$env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe'), (Join-Path `${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'), (Join-Path `$env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')) | Where-Object { Test-Path `$_ } | Select-Object -First 1 }
+  if (-not `$env:AGENT_BROWSER_EXECUTABLE_PATH) { `$env:AGENT_BROWSER_EXECUTABLE_PATH = @((Join-Path `$env:ProgramFiles 'Google\\Chrome\\Application\\chrome.exe'), (Join-Path `${env:ProgramFiles(x86)} 'Google\\Chrome\\Application\\chrome.exe'), (Join-Path `$env:LOCALAPPDATA 'Google\\Chrome\\Application\\chrome.exe'), (Join-Path `${env:ProgramFiles(x86)} 'Microsoft\\Edge\\Application\\msedge.exe'), (Join-Path `$env:ProgramFiles 'Microsoft\\Edge\\Application\\msedge.exe')) | Where-Object { Test-Path `$_ } | Select-Object -First 1 }
 - To perform browser checks, use agent-browser CLI via exec_command:
   agent-browser open https://example.com && agent-browser get title
 - Alternatively, use Node.js Playwright with channel chrome:
@@ -571,20 +573,16 @@ if ($configContent -match $patternApps) {
     $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $appsDefaultSection.Trim() + "`r`n"
 }
 
-$granularSection = @"
-[approval_policy.granular]
-mcp_elicitations = false
-rules = false
-sandbox_approval = false
-skill_approval = false
-request_permissions = false
-"@
-$patternGranular = "(?ms)\[approval_policy\.granular\].*?(?=\r?\n\[|\z)"
+# Remove legacy/conflicting [approval_policy.granular] section if present (violates TOML syntax when approval_policy is defined as a string)
+$patternGranular = "(?ms)\r?\n?\[approval_policy\.granular\].*?(?=\r?\n\[|\z)"
 if ($configContent -match $patternGranular) {
-    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternGranular, { $granularSection.Trim() })
-} else {
-    $configContent = $configContent.TrimEnd() + "`r`n`r`n" + $granularSection.Trim() + "`r`n"
+    $configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, $patternGranular, "")
 }
+
+# Fix invalid tool approval_mode = "never" -> "auto" (expected one of 'auto', 'prompt', 'writes', 'approve')
+$configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, '(?m)^approval_mode\s*=\s*"never"', 'approval_mode = "auto"')
+$configContent = [System.Text.RegularExpressions.Regex]::Replace($configContent, '(?m)^default_tools_approval_mode\s*=\s*"never"', 'default_tools_approval_mode = "auto"')
+
 
 $browserUseSection = @"
 [browser_use]
